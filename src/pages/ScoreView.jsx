@@ -1891,5 +1891,5 @@ const dismissalsByBatter = useMemo(() => {
         </div>
       ) : null}
     </div>
-  );
-}
+  ); 
+} 
