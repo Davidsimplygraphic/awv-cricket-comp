@@ -234,6 +234,11 @@ export default function Fixtures() {
       let displayStatus = rawStatus;
       const raw = String(rawStatus).toLowerCase();
 
+      // If a match is marked completed but there are no balls yet, treat it as scheduled (stale flag).
+      if (raw === "completed" && !hasAnyBalls) displayStatus = "scheduled";
+      // If marked completed but innings data does not suggest a decision yet, treat as live.
+      if (raw === "completed" && hasAnyBalls && !inningsSuggestCompleted) displayStatus = "live";
+
       if (raw !== "completed" && inningsSuggestCompleted) displayStatus = "completed";
       else if ((raw === "scheduled" || !raw) && hasAnyBalls) displayStatus = "live";
       else if (raw === "playing") displayStatus = "live";
@@ -498,6 +503,20 @@ export default function Fixtures() {
                           }}
                         >
                           Open scorer
+                        </Link>
+                      ) : null}
+
+                      {f.fixtureId ? (
+                        <Link
+                          to={`/match/${f.fixtureId}`}
+                          style={{
+                            color: "#93c5fd",
+                            textDecoration: "underline",
+                            fontWeight: 900,
+                            fontSize: 12,
+                          }}
+                        >
+                          Open spectator
                         </Link>
                       ) : null}
 

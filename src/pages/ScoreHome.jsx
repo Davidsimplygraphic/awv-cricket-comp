@@ -24,10 +24,14 @@ export default function ScoreHome() {
   const [editTeamA, setEditTeamA] = useState("");
   const [editTeamB, setEditTeamB] = useState("");
   const [editOvers, setEditOvers] = useState(20);
-  const [editStatus, setEditStatus] = useState("draft");
+  const [editStatus, setEditStatus] = useState("scheduled");
   const [saving, setSaving] = useState(false);
 
-  const statusOptions = useMemo(() => ["draft", "live", "completed"], []);
+  // Match statuses used across the app:
+  // - scheduled: not started
+  // - live: in progress
+  // - completed: finished
+  const statusOptions = useMemo(() => ["scheduled", "live", "completed"], []);
 
   const load = async () => {
     setLoading(true);
@@ -129,7 +133,7 @@ export default function ScoreHome() {
         team_a_id: newTeamA,
         team_b_id: newTeamB,
         overs_limit: overs,
-        status: "draft",
+        status: "scheduled",
         scorer_user_id: user.id,
       })
       .select(
@@ -174,7 +178,7 @@ export default function ScoreHome() {
     setEditTeamA(match.team_a_id || "");
     setEditTeamB(match.team_b_id || "");
     setEditOvers(match.overs_limit || 20);
-    setEditStatus(match.status || "draft");
+    setEditStatus(match.status || "scheduled");
   };
 
   const cancelEdit = () => {
@@ -182,7 +186,7 @@ export default function ScoreHome() {
     setEditTeamA("");
     setEditTeamB("");
     setEditOvers(20);
-    setEditStatus("draft");
+    setEditStatus("scheduled");
   };
 
   const saveEdit = async () => {
@@ -293,6 +297,62 @@ export default function ScoreHome() {
     if (editingId === match.id) cancelEdit();
   };
 
+
+  // -------------------------
+  // RESET (scorer-only utility)
+  // -------------------------
+  const resetMatch = async (match) => {
+    setErr("");
+    setInfo("");
+
+    const label = `${formatTeam(match.team_a)} vs ${formatTeam(match.team_b)}`;
+
+    // eslint-disable-next-line no-restricted-globals
+    if (!confirm(`Reset match: ${label}?
+
+This will delete ALL balls + innings for this match, clear any selected playing XIs (match_squads), and set the match back to SCHEDULED.`)) return;
+
+    setBusyId(match.id);
+
+    // 1) delete balls
+    const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
+    if (delBalls.error) {
+      setBusyId("");
+      setErr(`Reset balls error: ${delBalls.error.message}`);
+      return;
+    }
+
+    // 2) delete innings
+    const delInnings = await supabase.from("innings").delete().eq("match_id", match.id);
+    if (delInnings.error) {
+      setBusyId("");
+      setErr(`Reset innings error: ${delInnings.error.message}`);
+      return;
+    }
+
+    // 3) clear selected squads (optional)
+    const fid = match.fixture_id || match.id;
+    if (fid) {
+      const delSq = await supabase.from("match_squads").delete().eq("fixture_id", fid);
+      // Don't hard-fail if RLS blocks this table in your setup
+      if (delSq.error) console.warn("Reset: match_squads delete blocked", delSq.error.message);
+    }
+
+    // 4) reset match status
+    const upd = await supabase.from("matches").update({ status: "scheduled", wicket_cap: null }).eq("id", match.id);
+    if (upd.error) {
+      setBusyId("");
+      setErr(`Reset match error: ${upd.error.message}`);
+      return;
+    }
+
+    setBusyId("");
+    setInfo("Match reset ✅");
+
+    // Reload list
+    load();
+  };
+
   if (loading) return <div>Loading...</div>;
 
   return (
@@ -385,6 +445,12 @@ export default function ScoreHome() {
                     <div style={{ marginTop: 8, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
                       <Link to={`/score/${m.fixture_id || m.id}`}>Open scorer</Link>
                       <Link to={`/match/${m.fixture_id || m.id}`}>Open spectator</Link>
+
+                      {user?.id && m.scorer_user_id === user.id ? (
+                        <button onClick={() => resetMatch(m)} disabled={creating || saving || isBusy} style={{ color: "#b91c1c" }}>
+                          {isBusy ? "Working..." : "Reset"}
+                        </button>
+                      ) : null}
 
                       <button onClick={() => startEdit(m)} disabled={creating || saving || isBusy}>
                         Edit

@@ -203,6 +203,8 @@ export default function ScoreView() {
 
   const [strikerId, setStrikerId] = useState("");
   const [nonStrikerId, setNonStrikerId] = useState("");
+  const [strikerTurn, setStrikerTurn] = useState(1);
+  const [nonStrikerTurn, setNonStrikerTurn] = useState(1);
   const [bowlerId, setBowlerId] = useState("");
 
   const [needsNextBowler, setNeedsNextBowler] = useState(false);
@@ -363,6 +365,77 @@ export default function ScoreView() {
     })();
   }, [match?.id, match?.status, innings?.id, balls?.length]);
 
+// Safety: if a match was previously marked completed but no balls have been scored yet (or innings 2 isn't actually decided),
+// force it back to scheduled so Fixtures / Results doesn't show "COMPLETED" incorrectly.
+useEffect(() => {
+  if (!match?.id) return;
+  const status = String(match.status || "").toLowerCase();
+  if (status !== "completed") return;
+
+  const anyBalls = (balls || []).length > 0;
+  const i2HasMeaningful =
+    (innings2LegalForResult || 0) > 0 || (innings2RunsForResult || 0) > 0 || !!innings2RowForResult?.completed;
+
+  // If the match isn't actually decided yet, treat it as LIVE (stale completed flag).
+  const maxLegal = toInt(match?.overs_limit, 20) * 6;
+  const targetToWin = toInt(innings1Runs, 0) + 1;
+  const chaseReached = (innings2RunsForResult || 0) >= targetToWin;
+  const innings2Exhausted =
+    !!innings2RowForResult?.completed || (innings2LegalForResult || 0) >= maxLegal || (innings2WktsForResult || 0) >= wicketCap;
+  const decided = chaseReached || innings2Exhausted;
+
+  // If no scoring yet (and innings 2 not decided), this is almost certainly a stale "completed" flag.
+  if (!anyBalls && !i2HasMeaningful) {
+    (async () => {
+      const upd = await supabase
+        .from("matches")
+        .update({ status: "scheduled" })
+        .eq("id", match.id)
+        .select(
+          `
+          *,
+          team_a:teams!matches_team_a_id_fkey(id,name,short_name),
+          team_b:teams!matches_team_b_id_fkey(id,name,short_name)
+          `
+        )
+        .maybeSingle();
+      if (!upd.error && upd.data) setMatch(upd.data);
+    })();
+    return;
+  }
+
+  // If there are balls, but the chase isn't decided yet, it should not be completed.
+  if (anyBalls && !decided) {
+    (async () => {
+      const upd = await supabase
+        .from("matches")
+        .update({ status: "live" })
+        .eq("id", match.id)
+        .select(
+          `
+          *,
+          team_a:teams!matches_team_a_id_fkey(id,name,short_name),
+          team_b:teams!matches_team_b_id_fkey(id,name,short_name)
+          `
+        )
+        .maybeSingle();
+      if (!upd.error && upd.data) setMatch(upd.data);
+    })();
+  }
+}, [
+  match?.id,
+  match?.status,
+  match?.overs_limit,
+  balls?.length,
+  wicketCap,
+  innings1Runs,
+  innings2RowForResult?.completed,
+  innings2RunsForResult,
+  innings2WktsForResult,
+  innings2LegalForResult,
+]);
+
+
   // ✅ FIX: dismissal counts MUST use dismissed_player_id (not striker_id)
 const dismissalsByBatter = useMemo(() => {
   const map = new Map();
@@ -377,7 +450,22 @@ const dismissalsByBatter = useMemo(() => {
   return map;
 }, [balls]);
 
-  // Load the single match row for this fixture_id
+  
+// Bat-twice rule helper:
+// batting_turn is tracked per STRIKER appearance in balls.batting_turn (1 = first time batting in this innings, 2 = second, etc.)
+const getTurnFor = (playerId) => (playerId ? (dismissalsByBatter.get(playerId) || 0) + 1 : 1);
+
+const setStrikerSelection = (playerId) => {
+  setStrikerId(playerId || "");
+  setStrikerTurn(getTurnFor(playerId));
+};
+
+const setNonStrikerSelection = (playerId) => {
+  setNonStrikerId(playerId || "");
+  setNonStrikerTurn(getTurnFor(playerId));
+};
+
+// Load the single match row for this fixture_id
   useEffect(() => {
     let alive = true;
 
@@ -424,6 +512,8 @@ const dismissalsByBatter = useMemo(() => {
       setMatch(m.data);
       setMatchId(m.data.id);
       setInningsNo(1);
+      setStrikerTurn(1);
+      setNonStrikerTurn(1);
 
       // Use the real fixture_id when available for anything keyed by fixture_id (match_squads, fixtures grouping, etc.)
       setCanonicalFixtureId(m.data.fixture_id || m.data.id);
@@ -514,8 +604,8 @@ const dismissalsByBatter = useMemo(() => {
       setErr("");
       setInfo("");
 
-      setStrikerId("");
-      setNonStrikerId("");
+      setStrikerSelection("");
+      setNonStrikerSelection("");
       setBowlerId("");
       setNeedsNextBowler(false);
       setNeedsWicketModal(false);
@@ -564,14 +654,23 @@ const dismissalsByBatter = useMemo(() => {
       const sorted = sortBallsByPosition(b.data || []);
       setBalls(sorted);
 
+      // Safety: if an innings was left "completed" from a previous run but has no balls,
+      // automatically reopen it so scoring can start immediately.
+      if (inn.data?.completed && sorted.length === 0) {
+        const reopen = await supabase.from("innings").update({ completed: false }).eq("id", inn.data.id).select("*").single();
+        if (!reopen.error && reopen.data) {
+          setInnings(reopen.data);
+        }
+      }
+
       if (inningsNo === 2 && inn.data?.completed && sorted.length === 0) {
         setInfo("Innings 2 is marked completed but has no balls. Click ‘Reopen innings’ to start scoring.");
       }
 
       if (sorted.length) {
         const last = sorted[sorted.length - 1];
-        if (last.striker_id) setStrikerId(last.striker_id);
-        if (last.non_striker_id) setNonStrikerId(last.non_striker_id);
+        if (last.striker_id) setStrikerSelection(last.striker_id);
+        if (last.non_striker_id) setNonStrikerSelection(last.non_striker_id);
         if (last.bowler_id) setBowlerId(last.bowler_id);
       }
 
@@ -614,40 +713,90 @@ const dismissalsByBatter = useMemo(() => {
     return order;
   }, [balls, strikerId, nonStrikerId]);
 
-  // Batting scorecard rows (combined across multiple stints in the innings)
-  const battingScorecardRows = useMemo(() => {
-    const rows = [];
-    battingOrderIds.forEach((id) => {
-      const p = battingPlayers.find((x) => x.id === id);
-      if (!p) return;
+  
+// Batting scorecard rows:
+// - Show EACH batting stint separately using balls.batting_turn (1st time batting, 2nd time, etc.)
+// - This makes the scorer view behave correctly when a player bats again: their stint score starts at 0.
+const battingScorecardRows = useMemo(() => {
+  const rows = [];
 
-      const facedAsStriker = balls.filter((b) => b.striker_id === id);
-      const ballsFaced = facedAsStriker.filter((b) => b.extra_type !== "wide").length;
-      const runs = facedAsStriker.reduce((acc, b) => acc + (b.runs_off_bat || 0), 0);
-      const fours = facedAsStriker.filter((b) => (b.runs_off_bat || 0) === 4).length;
-      const sixes = facedAsStriker.filter((b) => (b.runs_off_bat || 0) === 6).length;
-      const sr = ballsFaced > 0 ? ((runs / ballsFaced) * 100).toFixed(1) : "0.0";
+  const ordinal = (n) => {
+    const x = Number(n);
+    if (!Number.isFinite(x) || x <= 0) return "";
+    if (x === 1) return "";
+    if (x === 2) return " (2nd)";
+    if (x === 3) return " (3rd)";
+    return ` (${x}th)`;
+  };
 
-      const isAtCrease = id === strikerId || id === nonStrikerId;
-      const dismissals = dismissalsByBatter.get(id) || 0;
-      const status = isAtCrease ? "Not out" : dismissals > 0 ? `Out x${dismissals}` : ballsFaced > 0 ? "Not out" : "—";
+  // Determine which (player,turn) appearances exist in this innings.
+  const appearances = [];
+  const seen = new Set();
 
-      rows.push({
-        id,
-        name: p.name,
-        runs,
-        balls: ballsFaced,
-        fours,
-        sixes,
-        sr,
-        isAtCrease,
-        dismissals,
-        status,
-      });
+  const pushAppearance = (playerId, turn) => {
+    if (!playerId) return;
+    const t = toInt(turn, 1) || 1;
+    const key = `${playerId}:${t}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    appearances.push({ playerId, turn: t });
+  };
+
+  // Preserve natural order from balls + current crease.
+  balls.forEach((b) => {
+    pushAppearance(b.striker_id, b.batting_turn || 1);
+    // Note: non-striker turn is not stored on the ball; we'll infer their current turn from dismissals map if needed.
+    pushAppearance(b.non_striker_id, (dismissalsByBatter.get(b.non_striker_id) || 0) + 1);
+  });
+
+  // Ensure current crease stints are always included.
+  pushAppearance(strikerId, strikerTurn);
+  pushAppearance(nonStrikerId, nonStrikerTurn);
+
+  for (const ap of appearances) {
+    const p = battingPlayers.find((x) => x.id === ap.playerId);
+    if (!p) continue;
+
+    const facedAsStriker = balls.filter((b) => b.striker_id === ap.playerId && toInt(b.batting_turn, 1) === ap.turn);
+    const ballsFaced = facedAsStriker.filter((b) => b.extra_type !== "wide").length;
+    const runs = facedAsStriker.reduce((acc, b) => acc + (b.runs_off_bat || 0), 0);
+    const fours = facedAsStriker.filter((b) => (b.runs_off_bat || 0) === 4).length;
+    const sixes = facedAsStriker.filter((b) => (b.runs_off_bat || 0) === 6).length;
+    const sr = ballsFaced > 0 ? ((runs / ballsFaced) * 100).toFixed(1) : "0.0";
+
+    const atCreaseThisStint =
+      (ap.playerId === strikerId && ap.turn === strikerTurn) || (ap.playerId === nonStrikerId && ap.turn === nonStrikerTurn);
+
+    const dismissals = dismissalsByBatter.get(ap.playerId) || 0;
+    const stintOut = dismissals >= ap.turn && !atCreaseThisStint;
+
+    const status = atCreaseThisStint
+      ? "Not out"
+      : stintOut
+        ? "Out x1"
+        : ballsFaced > 0
+          ? "Not out"
+          : "—";
+
+    rows.push({
+      key: `${ap.playerId}:${ap.turn}`,
+      id: ap.playerId,
+      turn: ap.turn,
+      name: `${p.name}${ordinal(ap.turn)}`,
+      runs,
+      balls: ballsFaced,
+      fours,
+      sixes,
+      sr,
+      isAtCrease: atCreaseThisStint,
+      dismissals,
+      status,
     });
+  }
 
-    return rows.filter((r) => r.isAtCrease || r.balls > 0);
-  }, [battingOrderIds, battingPlayers, balls, strikerId, nonStrikerId, dismissalsByBatter]);
+  // Only show stints that have started or are currently at the crease.
+  return rows.filter((r) => r.isAtCrease || r.balls > 0);
+}, [battingPlayers, balls, strikerId, nonStrikerId, strikerTurn, nonStrikerTurn, dismissalsByBatter]);
 
   const canScore = () => {
     if (!innings?.id) return { ok: false, msg: "Innings not loaded." };
@@ -741,9 +890,9 @@ const dismissalsByBatter = useMemo(() => {
         }
       }
 
-      // ✅ batting_turn must increment for the ACTUAL dismissed player on wicket balls
-      const turnPlayerId = wicket ? (dismissed_player_id || strikerId) : strikerId;
-      const prevDismissals = (turnPlayerId && dismissalsByBatter.get(turnPlayerId)) || 0;
+      // batting_turn tracks the STRIKER's current batting stint in this innings (1 = first time batting, 2 = second, etc.)
+      // IMPORTANT: even if the NON-STRIKER is dismissed (run out), batting_turn still belongs to the striker's stint.
+      const prevDismissals = (strikerId && dismissalsByBatter.get(strikerId)) || 0;
       const batting_turn = prevDismissals + 1;
 
       const payload = {
@@ -796,8 +945,8 @@ const dismissalsByBatter = useMemo(() => {
         setInfo("Over complete — select a new bowler ✅");
       }
 
-      setStrikerId(s);
-      setNonStrikerId(ns);
+      setStrikerSelection(s);
+      setNonStrikerSelection(ns);
 
       if (!overFinishedAfter) setInfo("Saved ✅");
 
@@ -877,13 +1026,13 @@ const dismissalsByBatter = useMemo(() => {
       // End of over + wicket: apply "crossed?" + force new bowler
       if (crossedApplies) {
         // Survivor takes strike next over if crossed
-        setStrikerId(survivor);
+        setStrikerSelection(survivor);
         // Incoming becomes non-striker
-        setNonStrikerId(incomingBatterId);
+        setNonStrikerSelection(incomingBatterId);
       } else {
         // Incoming takes strike next over if not crossed (or if non-striker was dismissed)
-        setStrikerId(incomingBatterId);
-        setNonStrikerId(survivor);
+        setStrikerSelection(incomingBatterId);
+        setNonStrikerSelection(survivor);
       }
 
       setNeedsNextBowler(true);
@@ -896,16 +1045,16 @@ const dismissalsByBatter = useMemo(() => {
       if (outWasStriker) {
         if (crossedApplies) {
           // They crossed before the wicket fell -> survivor (former non-striker) is now on strike
-          setStrikerId(survivor);
-          setNonStrikerId(incomingBatterId);
+          setStrikerSelection(survivor);
+          setNonStrikerSelection(incomingBatterId);
         } else {
           // No crossing -> incoming is on strike, survivor stays non-striker
-          setStrikerId(incomingBatterId);
+          setStrikerSelection(incomingBatterId);
           // nonStriker stays as-is
         }
       } else {
         // Non-striker out -> incoming becomes non-striker, striker stays on strike
-        setNonStrikerId(incomingBatterId);
+        setNonStrikerSelection(incomingBatterId);
       }
     }
   };
@@ -1005,6 +1154,60 @@ const dismissalsByBatter = useMemo(() => {
       setInnings((prev) => (prev ? { ...prev, completed: true } : prev));
     })();
   }, [innings?.id, innings?.completed, oversDone, allOut, inningsNo, target, totalRuns]);
+
+  // Scorer-only: reset the match so you can test scoring again
+  const resetMatchData = async () => {
+    if (!match?.id) return;
+
+    const label = `${match?.team_a?.short_name || match?.team_a?.name || "Team A"} vs ${match?.team_b?.short_name || match?.team_b?.name || "Team B"}`;
+    const ok = window.confirm(
+      `Reset match data for: ${label}?
+
+This will delete ALL balls + innings for this match, clear any selected playing XIs (match_squads), and set the match back to SCHEDULED.
+
+You can then start scoring again from ball 1.`
+    );
+    if (!ok) return;
+
+    setSaving(true);
+    setErr("");
+    setInfo("");
+
+    // 1) delete balls
+    const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
+    if (delBalls.error) {
+      setErr(`Reset failed (balls): ${delBalls.error.message}`);
+      setSaving(false);
+      return;
+    }
+
+    // 2) delete innings
+    const delInn = await supabase.from("innings").delete().eq("match_id", match.id);
+    if (delInn.error) {
+      setErr(`Reset failed (innings): ${delInn.error.message}`);
+      setSaving(false);
+      return;
+    }
+
+    // 3) clear selected squads (optional but makes testing clean)
+    const fid = canonicalFixtureId || fixtureId;
+    if (fid) {
+      const delSq = await supabase.from("match_squads").delete().eq("fixture_id", fid);
+      // Don't hard-fail if RLS blocks this table in your setup
+      if (delSq.error) console.warn("Reset: match_squads delete blocked", delSq.error.message);
+    }
+
+    // 4) reset match status
+    const upd = await supabase.from("matches").update({ status: "scheduled", wicket_cap: null }).eq("id", match.id);
+    if (upd.error) {
+      setErr(`Reset failed (match): ${upd.error.message}`);
+      setSaving(false);
+      return;
+    }
+
+    // Reload to re-run the normal match startup flow
+    window.location.reload();
+  };
 
   // Bowling overview
   const bowlingOverviewRows = useMemo(() => {
@@ -1258,8 +1461,8 @@ const dismissalsByBatter = useMemo(() => {
                 colorScheme: "dark",
               }}
             >
-              <option value={1}>Innings 1</option>
-              <option value={2}>Innings 2</option>
+              <option value={1}>Innings 1 — {(match?.team_a?.short_name || match?.team_a?.name || "Team A")} batting</option>
+              <option value={2}>Innings 2 — {(match?.team_b?.short_name || match?.team_b?.name || "Team B")} batting</option>
             </select>
 
             {innings?.completed ? (
@@ -1269,6 +1472,23 @@ const dismissalsByBatter = useMemo(() => {
             )}
 
             <div style={{ marginLeft: "auto", display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <button
+                onClick={resetMatchData}
+                disabled={saving}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  background: "rgba(239, 68, 68, 0.14)",
+                  border: "1px solid rgba(239,68,68,0.30)",
+                  color: "#fecaca",
+                  fontWeight: 900,
+                  cursor: "pointer",
+                }}
+                title="Scorer only: wipe balls/innings and set match back to scheduled"
+              >
+                Reset match
+              </button>
+
               {innings?.completed ? (
                 <button onClick={reopenInnings} disabled={saving} style={modalBtnGhost}>
                   Reopen innings
@@ -1307,11 +1527,15 @@ const dismissalsByBatter = useMemo(() => {
           >
             <summary style={{ listStyle: "none", cursor: "pointer", padding: 12, fontWeight: 900, color: "rgba(232,238,252,0.85)" }}>
               At crease
+              <span style={{ marginLeft: 10, fontWeight: 700, fontSize: 12, color: "rgba(232,238,252,0.55)" }}>
+                (runs off bat • balls faced — wides don’t count)
+              </span>
             </summary>
 
             <div style={{ padding: 12, paddingTop: 0, display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 10 }}>
               {[{ id: strikerId, strike: true }, { id: nonStrikerId, strike: false }].map(({ id, strike }) => {
-                const row = battingScorecardRows.find((r) => r.id === id);
+                const turn = strike ? strikerTurn : nonStrikerTurn;
+                const row = battingScorecardRows.find((r) => r.id === id && r.turn === turn);
                 const name = row?.name || "Select batter";
                 const runs = row?.runs ?? 0;
                 const ballsF = row?.balls ?? 0;
@@ -1319,7 +1543,6 @@ const dismissalsByBatter = useMemo(() => {
                 const sixes = row?.sixes ?? 0;
                 const sr = row?.sr ?? "0.0";
                 const dismissals = row?.dismissals ?? 0;
-                const turn = (dismissalsByBatter.get(id) || 0) + (id ? 1 : 0);
 
                 return (
                   <div key={strike ? "striker" : "non"} style={{ padding: 12, borderRadius: 16, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(10,16,28,0.55)" }}>
@@ -1364,7 +1587,7 @@ const dismissalsByBatter = useMemo(() => {
                     <div style={{ marginTop: 10 }}>
                       <select
                         value={id || ""}
-                        onChange={(e) => (strike ? setStrikerId(e.target.value) : setNonStrikerId(e.target.value))}
+                        onChange={(e) => (strike ? setStrikerSelection(e.target.value) : setNonStrikerSelection(e.target.value))}
                         onFocus={(e) => e.target.scrollIntoView({ block: "center", behavior: "smooth" })} style={selectStyle}
                       >
                         <option value="">Select…</option>

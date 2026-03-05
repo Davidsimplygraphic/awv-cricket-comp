@@ -22,24 +22,26 @@ function sortBalls(balls) {
     .sort((a, b) => (toInt(a.over_no, 0) - toInt(b.over_no, 0)) || (toInt(a.delivery_in_over, 0) - toInt(b.delivery_in_over, 0)) || 0);
 }
 
-function buildBattingStats(balls, playerId) {
+function buildBattingStats(balls, playerId, turn = 1) {
   let r = 0;
   let b = 0;
   let fours = 0;
   let sixes = 0;
-  let outs = 0;
+  let totalDismissals = 0;
 
   for (const x of balls || []) {
-    if (x.striker_id === playerId) {
+    if (x.striker_id === playerId && toInt(x.batting_turn, 1) === toInt(turn, 1)) {
       r += toInt(x.runs_off_bat, 0);
       if (x?.legal_ball !== false) b += 1;
       if (toInt(x.runs_off_bat, 0) === 4) fours += 1;
       if (toInt(x.runs_off_bat, 0) === 6) sixes += 1;
     }
     if (x.wicket && x.dismissed_player_id === playerId) {
-      outs += 1;
+      totalDismissals += 1;
     }
   }
+
+  const outs = totalDismissals >= toInt(turn, 1) ? 1 : 0;
 
   const sr = b ? (r / b) * 100 : 0;
   return { r, b, fours, sixes, sr, outs };
@@ -72,25 +74,35 @@ export default function ScorecardTables({ title, balls, playersById, theme = "da
     return { runs, wkts, legal, oversText: oversTextFromLegal(legal) };
   }, [sorted]);
 
-  const batters = useMemo(() => {
-    const seen = new Set();
-    const list = [];
-    for (const b of sorted || []) {
-      if (b.striker_id && !seen.has(b.striker_id)) {
-        seen.add(b.striker_id);
-        list.push(b.striker_id);
-      }
-      if (b.non_striker_id && !seen.has(b.non_striker_id)) {
-        seen.add(b.non_striker_id);
-        list.push(b.non_striker_id);
-      }
-      if (b.dismissed_player_id && !seen.has(b.dismissed_player_id)) {
-        seen.add(b.dismissed_player_id);
-        list.push(b.dismissed_player_id);
-      }
+  
+const batters = useMemo(() => {
+  // Build unique (playerId, turn) appearances from striker balls.
+  const seen = new Set();
+  const list = [];
+
+  const push = (playerId, turn) => {
+    if (!playerId) return;
+    const t = toInt(turn, 1) || 1;
+    const key = `${playerId}:${t}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    list.push({ playerId, turn: t });
+  };
+
+  for (const b of sorted || []) {
+    if (b.striker_id) push(b.striker_id, b.batting_turn || 1);
+
+    // Also ensure dismissed players appear (stint inferred from dismissal count).
+    if (b.wicket && b.dismissed_player_id) {
+      // If they were dismissed on this innings, their dismissal number implies the stint that ended.
+      const dismissalsSoFar =
+        (sorted || []).filter((x) => x.wicket && x.dismissed_player_id === b.dismissed_player_id).length;
+      push(b.dismissed_player_id, dismissalsSoFar || 1);
     }
-    return list;
-  }, [sorted]);
+  }
+
+  return list;
+}, [sorted]);
 
   const bowlers = useMemo(() => {
     const seen = new Set();
@@ -186,13 +198,14 @@ export default function ScorecardTables({ title, balls, playersById, theme = "da
           </thead>
           <tbody>
             {batters.length ? (
-              batters.map((id) => {
-                const p = playersById?.[id];
-                const name = p?.name || "Unknown";
-                const s = buildBattingStats(sorted, id);
+              batters.map((ap) => {
+                const p = playersById?.[ap.playerId];
+                const baseName = p?.name || "Unknown";
+                const name = ap.turn > 1 ? `${baseName} (${ap.turn === 2 ? "2nd" : ap.turn === 3 ? "3rd" : `${ap.turn}th`})` : baseName;
+                const s = buildBattingStats(sorted, ap.playerId, ap.turn);
                 const out = s.outs > 0;
                 return (
-                  <tr key={id}>
+                  <tr key={`${ap.playerId}:${ap.turn}`}>
                     <td style={{ ...tdStyle, fontWeight: 900 }}>{name}</td>
                     <td style={{ ...tdStyle, textAlign: "right" }}>{s.r}</td>
                     <td style={{ ...tdStyle, textAlign: "right" }}>{s.b}</td>

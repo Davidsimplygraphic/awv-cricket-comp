@@ -81,7 +81,7 @@ export default function MatchCentre() {
   const [inningsByNo, setInningsByNo] = useState({}); // {1: row, 2: row}
   const [ballsByInnings, setBallsByInnings] = useState({}); // {inningsId: balls[]}
 
-  const [activeTab, setActiveTab] = useState("scorecard"); // scorecard | partnership | worm | ball
+  const [activeTab, setActiveTab] = useState("scorecard"); // scorecard | partnership | worm
   const [activeInnings, setActiveInnings] = useState(1); // 1 or 2
 
   // Load players + match + innings + balls
@@ -285,7 +285,7 @@ export default function MatchCentre() {
 
   const teamA = match?.team_a || null;
   const teamB = match?.team_b || null;
-  const matchTitle = `${teamA?.short_name || teamA?.name || "Team A"} vs ${teamB?.short_name || teamB?.name || "Team B"}`;
+  const matchTitle = `${teamA?.name || teamA?.short_name || "Team A"} vs ${teamB?.name || teamB?.short_name || "Team B"}`;
 
   const teamById = useMemo(() => {
     const m = new Map();
@@ -424,8 +424,7 @@ const activeBalls = useMemo(() => {
             { key: "scorecard", label: "Scorecard" },
             { key: "partnership", label: "Partnership" },
             { key: "worm", label: "Worm" },
-            { key: "ball", label: "Ball-by-ball" },
-          ].map((t) => (
+            ].map((t) => (
             <button
               key={t.key}
               onClick={() => setActiveTab(t.key)}
@@ -511,19 +510,7 @@ const activeBalls = useMemo(() => {
               <WormGraph innings1Balls={inn1Balls} innings2Balls={inn2Balls} target={inn1 ? inn1.runs + 1 : null} theme="light" maxOvers={toInt(match?.overs_limit, 20)} />
             </div>
           </div>
-        ) : null}
-
-        {activeTab === "ball" ? (
-          <div style={{ borderRadius: 16, border: "1px solid #E5E7EB", overflow: "hidden" }}>
-            <div style={{ padding: 12, background: "#F8FAFC", borderBottom: "1px solid #E5E7EB", fontWeight: 1000 }}>
-              Ball-by-ball — {activeInnings === 1 ? teamA?.name : teamB?.name}
-            </div>
-            <div style={{ padding: 12 }}>
-              <BallByBall balls={activeBalls} theme="light" />
-            </div>
-          </div>
-        ) : null}
-      </div>
+        ) : null}</div>
     </div>
   );
 }

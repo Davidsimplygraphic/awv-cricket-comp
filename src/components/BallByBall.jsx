@@ -23,14 +23,20 @@ export default function BallByBall({ balls }) {
         const value = b.wicket ? "W" : String(total);
 
         let bg = "rgba(255,255,255,0.06)";
-        let fg = "white";
+        let fg = "#000";
+        let border = "1px solid rgba(0,0,0,0.10)";
 
-        if (b.wicket) bg = "#c7003f";
-        else if (total === 4) bg = "#15dbf9";
-        else if (total === 6) bg = "#24d657";
-
-        // If the bg is one of the bright colours, text should be dark for contrast
-        if (bg === "#15dbf9" || bg === "#24d657") fg = "#0B1220";
+        if (b.wicket) {
+          bg = "#c7003f";
+          fg = "white";
+          border = "1px solid rgba(0,0,0,0.20)";
+        } else if (total === 4) {
+          bg = "#15dbf9";
+          fg = "#0B1220";
+        } else if (total === 6) {
+          bg = "#24d657";
+          fg = "#0B1220";
+        }
 
         return (
           <div
@@ -47,7 +53,7 @@ export default function BallByBall({ balls }) {
               fontSize: 13,
               background: bg,
               color: fg,
-              border: "1px solid rgba(255,255,255,0.10)",
+              border: border,
             }}
           >
             {value}
