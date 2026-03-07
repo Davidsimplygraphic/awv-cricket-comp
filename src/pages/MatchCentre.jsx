@@ -6,69 +6,13 @@ import Partnerships from "../components/Partnerships";
 import WormGraph from "../components/WormGraph";
 import BallByBall from "../components/BallByBall";
 import ScorecardTables from "../components/ScorecardTables";
-
-function toInt(n, fallback = 0) {
-  const x = Number(n);
-  return Number.isFinite(x) ? x : fallback;
-}
-
-function sumRuns(balls) {
-  return (balls || []).reduce((acc, b) => acc + toInt(b.runs_off_bat, 0) + toInt(b.extra_runs, 0), 0);
-}
-
-function sumWkts(balls) {
-  return (balls || []).reduce((acc, b) => acc + (b.wicket ? 1 : 0), 0);
-}
-
-function legalBallsCount(balls) {
-  // Treat NULL as legal (legacy rows); only explicit false is illegal
-  return (balls || []).reduce((acc, b) => acc + (b?.legal_ball !== false ? 1 : 0), 0);
-}
-
-function oversTextFromLegal(legalBalls) {
-  const overs = Math.floor(legalBalls / 6);
-  const ballsInOver = legalBalls % 6;
-  return `${overs}.${ballsInOver}`;
-}
-
-function sortBalls(balls) {
-  return (balls || [])
-    .slice()
-    .sort(
-      (a, b) =>
-        (toInt(a.over_no, 0) - toInt(b.over_no, 0)) ||
-        (toInt(a.delivery_in_over, 0) - toInt(b.delivery_in_over, 0)) ||
-        0
-    );
-}
-
-function buildResultText({ matchStatus, inn1Team, inn2Team, inn1, inn2, wicketCap, oversLimit }) {
-  const s = String(matchStatus || "").toLowerCase();
-  if (s !== "completed") return "";
-  if (!inn1 || !inn2) return "";
-
-  const hasI1 = (inn1.balls || []).length > 0 || inn1.completed;
-  const hasI2 = (inn2.balls || []).length > 0 || inn2.completed;
-  if (!hasI1 || !hasI2) return "";
-
-  const i1Runs = inn1.runs;
-  const i2Runs = inn2.runs;
-  const target = i1Runs + 1;
-
-  if (i2Runs >= target) {
-    const wktsRemaining = Math.max(0, toInt(wicketCap, 10) - inn2.wkts);
-    const maxLegal = toInt(oversLimit, 20) * 6;
-    const ballsRemaining = Math.max(0, maxLegal - toInt(inn2.legalBalls, 0));
-    return `${inn2Team?.name || inn2Team?.short_name || "Team 2"} won by ${wktsRemaining} wicket${wktsRemaining === 1 ? "" : "s"} with ${ballsRemaining} ball${ballsRemaining === 1 ? "" : "s"} remaining`;
-  }
-
-  if (i1Runs > i2Runs) {
-    const runsBy = i1Runs - i2Runs;
-    return `${inn1Team?.name || inn1Team?.short_name || "Team 1"} won by ${runsBy} run${runsBy === 1 ? "" : "s"}`;
-  }
-
-  return "Match tied";
-}
+import {
+  buildCompletedResultText,
+  buildInningsTotals,
+  deriveMatchDisplayStatus,
+  sortBallsByPosition,
+  toInt,
+} from "../lib/scoring";
 
 export default function MatchCentre() {
   const { fixtureId } = useParams();
@@ -171,7 +115,7 @@ export default function MatchCentre() {
           setLoading(false);
           return;
         }
-        ballsMap[r.id] = sortBalls(b.data || []);
+        ballsMap[r.id] = sortBallsByPosition(b.data || []);
       }
       setBallsByInnings(ballsMap);
 
@@ -211,7 +155,7 @@ export default function MatchCentre() {
               .order("over_no", { ascending: true })
               .order("delivery_in_over", { ascending: true });
             if (!b.error) {
-              setBallsByInnings((prev) => ({ ...prev, [inningsId]: sortBalls(b.data || []) }));
+              setBallsByInnings((prev) => ({ ...prev, [inningsId]: sortBallsByPosition(b.data || []) }));
             }
           }
         )
@@ -258,29 +202,11 @@ export default function MatchCentre() {
   const inn2Balls = inn2Row ? ballsByInnings?.[inn2Row.id] || [] : [];
 
   const inn1 = useMemo(() => {
-    if (!inn1Row) return null;
-    const legal = legalBallsCount(inn1Balls);
-    return {
-      completed: !!inn1Row.completed,
-      runs: sumRuns(inn1Balls),
-      wkts: sumWkts(inn1Balls),
-      legalBalls: legal,
-      overs: oversTextFromLegal(legal),
-      balls: inn1Balls,
-    };
+    return inn1Row ? buildInningsTotals(inn1Row, inn1Balls) : null;
   }, [inn1Row, inn1Balls]);
 
   const inn2 = useMemo(() => {
-    if (!inn2Row) return null;
-    const legal = legalBallsCount(inn2Balls);
-    return {
-      completed: !!inn2Row.completed,
-      runs: sumRuns(inn2Balls),
-      wkts: sumWkts(inn2Balls),
-      legalBalls: legal,
-      overs: oversTextFromLegal(legal),
-      balls: inn2Balls,
-    };
+    return inn2Row ? buildInningsTotals(inn2Row, inn2Balls) : null;
   }, [inn2Row, inn2Balls]);
 
   const teamA = match?.team_a || null;
@@ -298,40 +224,26 @@ export default function MatchCentre() {
   const inn2Team = inn2Row?.batting_team_id ? teamById.get(inn2Row.batting_team_id) : teamB;
 
   const derivedStatus = useMemo(() => {
-    const raw = String(match?.status || "").toLowerCase();
-    if (raw === "completed") return "completed";
-    const anyBalls = (inn1Balls?.length || 0) + (inn2Balls?.length || 0) > 0;
-    if (!anyBalls) return raw || "scheduled";
-
-    // If innings suggest completion (chase done OR innings 2 exhausted), treat as completed.
-    const oversLimit = toInt(match?.overs_limit, 20);
-    const wicketCap = toInt(match?.wicket_cap, 10);
-    const maxLegal = oversLimit * 6;
-
-    const i1Runs = inn1 ? inn1.runs : 0;
-    const i2Runs = inn2 ? inn2.runs : 0;
-    const i2Legal = inn2 ? toInt(inn2.legalBalls, 0) : 0;
-    const i2Wkts = inn2 ? toInt(inn2.wkts, 0) : 0;
-
-    const chaseCompleted = !!inn1 && !!inn2 && i2Runs >= i1Runs + 1;
-    const inn2Exhausted = !!inn2 && (i2Legal >= maxLegal || i2Wkts >= wicketCap || !!inn2.completed);
-    const inningsSuggestCompleted = !!inn1 && !!inn2 && (chaseCompleted || inn2Exhausted);
-
-    if (inningsSuggestCompleted) return "completed";
-    return "live";
-  }, [match?.status, match?.overs_limit, match?.wicket_cap, inn1, inn2, inn1Balls, inn2Balls]);
+    return deriveMatchDisplayStatus({
+      matchStatus: match?.status,
+      innings1Row: inn1Row,
+      innings2Row: inn2Row,
+      innings1Balls: inn1Balls,
+      innings2Balls: inn2Balls,
+      oversLimit: match?.overs_limit,
+      wicketCap: match?.wicket_cap,
+    });
+  }, [match?.status, match?.overs_limit, match?.wicket_cap, inn1Row, inn2Row, inn1Balls, inn2Balls]);
 
   const resultText = useMemo(() => {
-    return buildResultText({
+    return buildCompletedResultText({
       matchStatus: derivedStatus,
-      inn1Team,
-      inn2Team,
-      inn1,
-      inn2,
-      wicketCap: match?.wicket_cap,
-      oversLimit: match?.overs_limit,
+      innings1Team: inn1Team,
+      innings2Team: inn2Team,
+      innings1: inn1,
+      innings2: inn2,
     });
-  }, [derivedStatus, match?.wicket_cap, match?.overs_limit, inn1Team, inn2Team, inn1, inn2]);
+  }, [derivedStatus, inn1Team, inn2Team, inn1, inn2]);
 
 const activeBalls = useMemo(() => {
     if (activeInnings === 2) return inn2Balls;

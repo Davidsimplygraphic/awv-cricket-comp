@@ -6,36 +6,14 @@ import BallByBall from "../components/BallByBall";
 import Partnerships from "../components/Partnerships";
 import WormGraph from "../components/WormGraph";
 import ScorecardTables from "../components/ScorecardTables";
-
-function toInt(n, fallback = 0) {
-  const x = Number(n);
-  return Number.isFinite(x) ? x : fallback;
-}
-
-function sortBalls(balls) {
-  return (balls || [])
-    .slice()
-    .sort((a, b) => (a.over_no - b.over_no) || (a.delivery_in_over - b.delivery_in_over) || 0);
-}
-
-function sumRuns(balls) {
-  return (balls || []).reduce((acc, b) => acc + toInt(b.runs_off_bat, 0) + toInt(b.extra_runs, 0), 0);
-}
-
-function sumWkts(balls) {
-  return (balls || []).reduce((acc, b) => acc + (b.wicket ? 1 : 0), 0);
-}
-
-function legalBallsCount(balls) {
-  // Treat NULL as legal (legacy rows); only explicit false is illegal
-  return (balls || []).filter((b) => b.legal_ball !== false).length;
-}
-
-function oversTextFromLegal(legalBalls) {
-  const overs = Math.floor(legalBalls / 6);
-  const ballsInOver = legalBalls % 6;
-  return `${overs}.${ballsInOver}`;
-}
+import {
+  buildCompletedResultText,
+  buildInningsTotals,
+  deriveMatchDisplayStatus,
+  oversTextFromLegal,
+  sortBallsByPosition,
+  toInt,
+} from "../lib/scoring";
 
 function playerName(playersById, playerId) {
   if (!playerId) return null;
@@ -184,7 +162,7 @@ export default function SpectatorView() {
           .order("over_no", { ascending: true })
           .order("delivery_in_over", { ascending: true });
 
-        if (!b.error) ballsMap[r.id] = sortBalls(b.data || []);
+        if (!b.error) ballsMap[r.id] = sortBallsByPosition(b.data || []);
       }
       setBallsByInnings(ballsMap);
 
@@ -226,7 +204,7 @@ export default function SpectatorView() {
               .order("over_no", { ascending: true })
               .order("delivery_in_over", { ascending: true });
 
-            if (!b.error) setBallsByInnings((prev) => ({ ...prev, [inningsId]: sortBalls(b.data || []) }));
+            if (!b.error) setBallsByInnings((prev) => ({ ...prev, [inningsId]: sortBallsByPosition(b.data || []) }));
           }
         )
         .subscribe()
@@ -295,38 +273,53 @@ export default function SpectatorView() {
   const activeBalls = activeRow ? (ballsByInnings?.[activeRow.id] || []) : [];
 
   const oversLimit = toInt(match?.overs_limit, 20);
-  const wicketCap = toInt(match?.wicket_cap, 0);
+  const wicketCap = toInt(match?.wicket_cap, 10);
 
   const innings1Totals = useMemo(() => {
-    const legal = legalBallsCount(inn1Balls);
-    return { runs: sumRuns(inn1Balls), wkts: sumWkts(inn1Balls), legal };
-  }, [inn1Balls]);
+    return buildInningsTotals(inn1Row, inn1Balls);
+  }, [inn1Row, inn1Balls]);
 
   const innings2Totals = useMemo(() => {
-    const legal = legalBallsCount(inn2Balls);
-    return { runs: sumRuns(inn2Balls), wkts: sumWkts(inn2Balls), legal };
-  }, [inn2Balls]);
+    return buildInningsTotals(inn2Row, inn2Balls);
+  }, [inn2Row, inn2Balls]);
 
   const activeTotals = useMemo(() => {
-    const legal = legalBallsCount(activeBalls);
-    return { runs: sumRuns(activeBalls), wkts: sumWkts(activeBalls), legal };
-  }, [activeBalls]);
+    return buildInningsTotals(activeRow, activeBalls);
+  }, [activeRow, activeBalls]);
 
-  const oversText = oversTextFromLegal(activeTotals.legal);
-  const crr = activeTotals.legal ? (activeTotals.runs / (activeTotals.legal / 6)) : 0;
+  const oversText = oversTextFromLegal(activeTotals.legalBalls);
+  const crr = activeTotals.legalBalls ? (activeTotals.runs / (activeTotals.legalBalls / 6)) : 0;
 
   const target = innings1Totals.runs + 1;
   const runsNeeded = Math.max(0, target - innings2Totals.runs);
-  const ballsRemaining = Math.max(0, oversLimit * 6 - innings2Totals.legal);
+  const ballsRemaining = Math.max(0, oversLimit * 6 - innings2Totals.legalBalls);
   const rrr = (ballsRemaining > 0) ? (runsNeeded / (ballsRemaining / 6)) : 0;
 
   const derivedStatus = useMemo(() => {
-    const raw = String(match?.status || "").toLowerCase();
+    return deriveMatchDisplayStatus({
+      matchStatus: match?.status,
+      innings1Row: inn1Row,
+      innings2Row: inn2Row,
+      innings1Balls: inn1Balls,
+      innings2Balls: inn2Balls,
+      oversLimit: match?.overs_limit,
+      wicketCap: match?.wicket_cap,
+    });
+  }, [match?.status, match?.overs_limit, match?.wicket_cap, inn1Row, inn2Row, inn1Balls, inn2Balls]);
 
-    // If DB says completed but 2nd innings has not started and there are balls in innings1, show "live"
-    if (raw === "completed" && inn2Balls.length === 0 && inn1Balls.length > 0) return "live";
-    return raw || "scheduled";
-  }, [match?.status, inn1Balls.length, inn2Balls.length]);
+  const resultText = useMemo(() => {
+    const teamById = new Map();
+    if (teamA?.id) teamById.set(teamA.id, teamA);
+    if (teamB?.id) teamById.set(teamB.id, teamB);
+
+    return buildCompletedResultText({
+      matchStatus: derivedStatus,
+      innings1Team: inn1Row?.batting_team_id ? teamById.get(inn1Row.batting_team_id) : teamA,
+      innings2Team: inn2Row?.batting_team_id ? teamById.get(inn2Row.batting_team_id) : teamB,
+      innings1: innings1Totals,
+      innings2: innings2Totals,
+    });
+  }, [derivedStatus, teamA, teamB, inn1Row, inn2Row, innings1Totals, innings2Totals]);
 
   // Latest ball for striker/non-striker/bowler
   const lastBall = activeBalls.length ? activeBalls[activeBalls.length - 1] : null;
@@ -428,6 +421,12 @@ export default function SpectatorView() {
               )}
             </div>
           </div>
+
+          {resultText ? (
+            <div style={{ marginTop: 10, fontSize: 13, fontWeight: 900, color: "rgba(255,228,176,0.95)" }}>
+              {resultText}
+            </div>
+          ) : null}
 
           {/* Innings toggle */}
           <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>

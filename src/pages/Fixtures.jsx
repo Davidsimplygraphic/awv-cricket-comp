@@ -1,30 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "../lib/supabase";
-
-function toInt(n, fallback = 0) {
-  const x = Number(n);
-  return Number.isFinite(x) ? x : fallback;
-}
-
-function sumRuns(balls) {
-  return (balls || []).reduce((acc, b) => acc + toInt(b.runs_off_bat, 0) + toInt(b.extra_runs, 0), 0);
-}
-
-function sumWkts(balls) {
-  return (balls || []).reduce((acc, b) => acc + (b.wicket ? 1 : 0), 0);
-}
-
-function legalBallsCount(balls) {
-  // Treat NULL as legal (legacy rows); only explicit false is illegal
-  return (balls || []).reduce((acc, b) => acc + (b?.legal_ball !== false ? 1 : 0), 0);
-}
-
-function oversTextFromLegal(legalBalls) {
-  const overs = Math.floor(legalBalls / 6);
-  const ballsInOver = legalBalls % 6;
-  return `${overs}.${ballsInOver}`;
-}
+import {
+  buildCompletedResultText,
+  buildInningsTotals,
+  deriveMatchDisplayStatus,
+  toInt,
+} from "../lib/scoring";
 
 function statusBadge(status) {
   const s = String(status || "").toLowerCase();
@@ -47,32 +29,6 @@ function formatTime(ts) {
   if (!ts) return "";
   const d = new Date(ts);
   return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-}
-
-function buildResultText({ matchStatus, inn1Team, inn2Team, inn1, inn2, wicketCap }) {
-  const s = String(matchStatus || "").toLowerCase();
-  if (s !== "completed") return "";
-
-  if (!inn1 || !inn2) return "";
-
-  // Only show a result once both innings have at least started (some balls) OR are completed.
-  const hasI1 = (inn1.balls || []).length > 0 || inn1.completed;
-  const hasI2 = (inn2.balls || []).length > 0 || inn2.completed;
-  if (!hasI1 || !hasI2) return "";
-
-  const i1Runs = inn1.runs;
-  const i2Runs = inn2.runs;
-
-  if (i2Runs > i1Runs) {
-    const wktsRemaining = Math.max(0, toInt(wicketCap, 10) - inn2.wkts);
-    const ballsRemaining = Math.max(0, toInt(inn2.maxLegal, 0) - toInt(inn2.legalBalls, 0));
-    return `${inn2Team?.name || inn2Team?.short_name || "Team 2"} won by ${wktsRemaining} wicket${wktsRemaining === 1 ? "" : "s"} with ${ballsRemaining} ball${ballsRemaining === 1 ? "" : "s"} remaining`;
-  }
-  if (i1Runs > i2Runs) {
-    const runsBy = i1Runs - i2Runs;
-    return `${inn1Team?.name || inn1Team?.short_name || "Team 1"} won by ${runsBy} run${runsBy === 1 ? "" : "s"}`;
-  }
-  return "Match tied";
 }
 
 export default function Fixtures() {
@@ -214,67 +170,25 @@ export default function Fixtures() {
       const inn1Balls = inn1Row ? ballsByInnings.get(inn1Row.id) || [] : [];
       const inn2Balls = inn2Row ? ballsByInnings.get(inn2Row.id) || [] : [];
 
-      // Derive a reliable display status (some older scorer flows may not persist matches.status)
-      const hasAnyBalls = (inn1Balls?.length || 0) + (inn2Balls?.length || 0) > 0;
-      const rawStatus = m.status || "";
-
-      const oversLimit = toInt(m.overs_limit, 20);
-      const wicketCap = toInt(m.wicket_cap, 10);
-      const maxLegal = oversLimit * 6;
-
-      const inn1RunsTmp = inn1Row ? sumRuns(inn1Balls) : 0;
-      const inn2RunsTmp = inn2Row ? sumRuns(inn2Balls) : 0;
-      const inn2LegalTmp = inn2Row ? legalBallsCount(inn2Balls) : 0;
-      const inn2WktsTmp = inn2Row ? sumWkts(inn2Balls) : 0;
-
-      const chaseCompleted = !!inn1Row && !!inn2Row && inn2RunsTmp > inn1RunsTmp;
-      const inn2Exhausted = !!inn2Row && (inn2LegalTmp >= maxLegal || inn2WktsTmp >= wicketCap || !!inn2Row.completed);
-      const inningsSuggestCompleted = !!inn1Row && !!inn2Row && (!!inn1Row.completed || (inn1Balls?.length || 0) > 0) && (chaseCompleted || inn2Exhausted || !!inn2Row.completed);
-
-      let displayStatus = rawStatus;
-      const raw = String(rawStatus).toLowerCase();
-
-      // If a match is marked completed but there are no balls yet, treat it as scheduled (stale flag).
-      if (raw === "completed" && !hasAnyBalls) displayStatus = "scheduled";
-      // If marked completed but innings data does not suggest a decision yet, treat as live.
-      if (raw === "completed" && hasAnyBalls && !inningsSuggestCompleted) displayStatus = "live";
-
-      if (raw !== "completed" && inningsSuggestCompleted) displayStatus = "completed";
-      else if ((raw === "scheduled" || !raw) && hasAnyBalls) displayStatus = "live";
-      else if (raw === "playing") displayStatus = "live";
-
-      const inn1 = inn1Row
-        ? {
-            inningsId: inn1Row.id,
-            completed: !!inn1Row.completed,
-            runs: sumRuns(inn1Balls),
-            wkts: sumWkts(inn1Balls),
-            overs: oversTextFromLegal(legalBallsCount(inn1Balls)),
-            balls: inn1Balls,
-          }
-        : null;
-
-      const inn2 = inn2Row
-        ? {
-            inningsId: inn2Row.id,
-            completed: !!inn2Row.completed,
-            runs: sumRuns(inn2Balls),
-            wkts: sumWkts(inn2Balls),
-            legalBalls: legalBallsCount(inn2Balls),
-            maxLegal: toInt(m.overs_limit, 20) * 6,
-            overs: oversTextFromLegal(legalBallsCount(inn2Balls)),
-            balls: inn2Balls,
-          }
-        : null;
-
-      const resultText = buildResultText({
-        // Use the derived status so cards that *look* completed also show a result.
-        matchStatus: displayStatus,
-        inn1Team,
-        inn2Team,
-        inn1,
-        inn2,
+      const displayStatus = deriveMatchDisplayStatus({
+        matchStatus: m.status,
+        innings1Row: inn1Row,
+        innings2Row: inn2Row,
+        innings1Balls: inn1Balls,
+        innings2Balls: inn2Balls,
+        oversLimit: m.overs_limit,
         wicketCap: m.wicket_cap,
+      });
+
+      const inn1 = inn1Row ? buildInningsTotals(inn1Row, inn1Balls) : null;
+      const inn2 = inn2Row ? buildInningsTotals(inn2Row, inn2Balls) : null;
+
+      const resultText = buildCompletedResultText({
+        matchStatus: displayStatus,
+        innings1Team: inn1Team,
+        innings2Team: inn2Team,
+        innings1: inn1,
+        innings2: inn2,
       });
 
       out.push({

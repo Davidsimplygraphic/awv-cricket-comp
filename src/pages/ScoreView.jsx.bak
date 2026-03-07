@@ -1,18 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { supabase } from "../lib/supabase";
-import {
-  clearLegacyPendingBallQueues,
-  describeScorerDevice,
-  getOrCreateScorerSessionId,
-  readLegacyPendingBallQueues,
-  readPendingEvents,
-  readScoringSnapshot,
-  readScorerState,
-  writePendingEvents,
-  writeScoringSnapshot,
-  writeScorerState,
-} from "../lib/scoringPersistence";
 
 function toInt(n, fallback = 0) {
   const x = Number(n);
@@ -183,23 +171,6 @@ async function loadSquadPlayers({ fixtureId, teamId }) {
   return { data: p2.data || [], error: null };
 }
 
-function createEventId(prefix = "event") {
-  if (typeof crypto !== "undefined" && crypto?.randomUUID) {
-    return `${prefix}-${crypto.randomUUID()}`;
-  }
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function isNetworkLikeError(error) {
-  const message = String(error?.message || error || "");
-  return /network|fetch|offline|failed to fetch|load failed|timeout/i.test(message);
-}
-
-function isMissingRpcError(error) {
-  const message = String(error?.message || error || "");
-  return /function|rpc|does not exist|could not find/i.test(message);
-}
-
 export default function ScoreView() {
   const { fixtureId } = useParams();
 
@@ -210,8 +181,6 @@ export default function ScoreView() {
 
   const [user, setUser] = useState({ id: "dev" });
   const [match, setMatch] = useState(null);
-  const [clientSessionId] = useState(() => getOrCreateScorerSessionId(fixtureId || "unknown"));
-  const [deviceLabel] = useState(() => describeScorerDevice());
 
   const [inningsNo, setInningsNo] = useState(1);
   const [innings, setInnings] = useState(null);
@@ -265,14 +234,6 @@ export default function ScoreView() {
   const [info, setInfo] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
-  const [pendingEvents, setPendingEvents] = useState([]);
-  const [isFlushingQueue, setIsFlushingQueue] = useState(false);
-  const [lockReady, setLockReady] = useState(false);
-  const [scoringLocked, setScoringLocked] = useState(false);
-  const [activeScorerSession, setActiveScorerSession] = useState(null);
-  const [lockFeatureAvailable, setLockFeatureAvailable] = useState(true);
-  const [takingControl, setTakingControl] = useState(false);
 
   // CURRENT innings totals
   const totalRuns = useMemo(() => sumRuns(balls), [balls]);
@@ -353,27 +314,20 @@ export default function ScoreView() {
     const team1Name = inn1BatTeam?.name || inn1BatTeam?.short_name || "Team 1";
     const team2Name = inn2BatTeam?.name || inn2BatTeam?.short_name || "Team 2";
 
+    if (i2Runs >= targetToWin) {
+      const wktsRemaining = Math.max(0, wicketCap - i2Wkts);
+      return `RESULT: ${team2Name} won by ${wktsRemaining} wicket${wktsRemaining === 1 ? "" : "s"} with ${ballsRem} ball${ballsRem === 1 ? "" : "s"} remaining.`;
+    }
+
     const innings2Exhausted =
       !!innings2RowForResult?.completed || i2Legal >= maxLegal || i2Wkts >= wicketCap;
 
-    if (!innings2Exhausted) {
-      if (i2Runs > i1Runs) {
-        const leadBy = i2Runs - i1Runs;
-        return `LIVE: ${team2Name} is ahead by ${leadBy} run${leadBy === 1 ? "" : "s"} with ${ballsRem} ball${ballsRem === 1 ? "" : "s"} remaining.`;
-      }
-
-      const runsNeeded = Math.max(0, targetToWin - i2Runs);
-      return `LIVE: ${team2Name} needs ${runsNeeded} run${runsNeeded === 1 ? "" : "s"} from ${ballsRem} ball${ballsRem === 1 ? "" : "s"}.`;
+    if (innings2Exhausted && i2Runs < targetToWin) {
+      const runsBy = targetToWin - i2Runs;
+      return `RESULT: ${team1Name} won by ${runsBy} run${runsBy === 1 ? "" : "s"}.`;
     }
 
-    if (i2Runs === i1Runs) return "RESULT: Match tied.";
-    if (i2Runs > i1Runs) {
-      const margin = i2Runs - i1Runs;
-      return `RESULT: ${team2Name} won by ${margin} run${margin === 1 ? "" : "s"}.`;
-    }
-
-    const runsBy = i1Runs - i2Runs;
-    return `RESULT: ${team1Name} won by ${runsBy} run${runsBy === 1 ? "" : "s"}.`;
+    return "";
   }, [
     match,
     inningsNo,
@@ -425,9 +379,10 @@ useEffect(() => {
   // If the match isn't actually decided yet, treat it as LIVE (stale completed flag).
   const maxLegal = toInt(match?.overs_limit, 20) * 6;
   const targetToWin = toInt(innings1Runs, 0) + 1;
+  const chaseReached = (innings2RunsForResult || 0) >= targetToWin;
   const innings2Exhausted =
     !!innings2RowForResult?.completed || (innings2LegalForResult || 0) >= maxLegal || (innings2WktsForResult || 0) >= wicketCap;
-  const decided = innings2Exhausted;
+  const decided = chaseReached || innings2Exhausted;
 
   // If no scoring yet (and innings 2 not decided), this is almost certainly a stale "completed" flag.
   if (!anyBalls && !i2HasMeaningful) {
@@ -719,33 +674,12 @@ const setNonStrikerSelection = (playerId) => {
         if (last.bowler_id) setBowlerId(last.bowler_id);
       }
 
-      const storedScorerState = readScorerState(matchId, inn.data.id);
-      if (storedScorerState) {
-        if (storedScorerState.strikerId) setStrikerSelection(storedScorerState.strikerId);
-        if (storedScorerState.nonStrikerId) setNonStrikerSelection(storedScorerState.nonStrikerId);
-        if (typeof storedScorerState.strikerTurn === "number") setStrikerTurn(storedScorerState.strikerTurn);
-        if (typeof storedScorerState.nonStrikerTurn === "number") setNonStrikerTurn(storedScorerState.nonStrikerTurn);
-        if (storedScorerState.bowlerId !== undefined) setBowlerId(storedScorerState.bowlerId || "");
-        setNeedsNextBowler(!!storedScorerState.needsNextBowler);
-      }
-
       channel = supabase
         .channel(`balls-live-score-${matchId}-${inn.data.id}`)
         .on(
           "postgres_changes",
-          { event: "*", schema: "public", table: "balls", filter: `innings_id=eq.${inn.data.id}` },
-          (payload) => {
-            if (payload.eventType === "DELETE") {
-              setBalls((prev) => prev.filter((ball) => ball.id !== payload.old?.id));
-              return;
-            }
-
-            if (!payload.new) return;
-            setBalls((prev) => {
-              const next = prev.filter((ball) => ball.id !== payload.new.id);
-              return sortBallsByPosition([...next, payload.new]);
-            });
-          }
+          { event: "INSERT", schema: "public", table: "balls", filter: `innings_id=eq.${inn.data.id}` },
+          (payload) => setBalls((prev) => sortBallsByPosition([...prev, payload.new]))
         )
         .subscribe();
 
@@ -756,41 +690,6 @@ const setNonStrikerSelection = (playerId) => {
       if (channel) supabase.removeChannel(channel);
     };
   }, [match, matchId, inningsNo, fixtureId, canonicalFixtureId, innings1Row]);
-
-  useEffect(() => {
-    if (!innings) return;
-
-    const runs = sumRuns(balls);
-    const wkts = sumWkts(balls);
-    const legal = legalBallsCount(balls);
-
-    if (innings.innings_no === 1) {
-      setInnings1Row(innings);
-      setInnings1Runs(runs);
-      setInnings1Wkts(wkts);
-      setInnings1Legal(legal);
-      return;
-    }
-
-    if (innings.innings_no === 2) {
-      setInnings2RowForResult(innings);
-      setInnings2RunsForResult(runs);
-      setInnings2WktsForResult(wkts);
-      setInnings2LegalForResult(legal);
-    }
-  }, [balls, innings]);
-
-  useEffect(() => {
-    if (!matchId || !innings?.id) return;
-    writeScorerState(matchId, innings.id, {
-      strikerId,
-      nonStrikerId,
-      strikerTurn,
-      nonStrikerTurn,
-      bowlerId,
-      needsNextBowler,
-    });
-  }, [bowlerId, innings?.id, matchId, needsNextBowler, nonStrikerId, nonStrikerTurn, strikerId, strikerTurn]);
 
   // Batting order (for scorecard)
   const battingOrderIds = useMemo(() => {
@@ -901,6 +800,10 @@ const battingScorecardRows = useMemo(() => {
 
   const canScore = () => {
     if (!innings?.id) return { ok: false, msg: "Innings not loaded." };
+
+    if (inningsNo === 2 && target !== null && totalRuns >= target) {
+      return { ok: false, msg: "Target reached. Match complete." };
+    }
 
     if (inningsComplete) return { ok: false, msg: "Innings complete." };
     if (saving) return { ok: false, msg: "Saving…" };
@@ -1205,9 +1108,11 @@ const battingScorecardRows = useMemo(() => {
     const i2Legal = toInt(innings2LegalForResult, 0);
     const maxLegal = toInt(match?.overs_limit, 20) * 6;
 
+    const targetToWin = i1Runs + 1;
+    const chaseReached = i2Runs >= targetToWin;
     const innings2Exhausted =
       !!innings2RowForResult?.completed || i2Legal >= maxLegal || i2Wkts >= wicketCap;
-    const decided = innings2Exhausted;
+    const decided = chaseReached || innings2Exhausted;
     if (!decided) return;
 
     (async () => {
@@ -1241,7 +1146,8 @@ const battingScorecardRows = useMemo(() => {
   useEffect(() => {
     if (!innings?.id) return;
     if (innings?.completed) return;
-    if (!oversDone && !allOut) return;
+    const chaseReached = inningsNo === 2 && target !== null && totalRuns >= target;
+    if (!oversDone && !allOut && !chaseReached) return;
 
     (async () => {
       await supabase.from("innings").update({ completed: true }).eq("id", innings.id);
