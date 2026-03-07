@@ -7,31 +7,17 @@ function toInt(n, fallback = 0) {
   return Number.isFinite(x) ? x : fallback;
 }
 
-const ADMIN_EXTRA_TYPE_RETIRED_HURT = "retiredhurt";
-
-function isAdministrativeBall(ball) {
-  return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
-}
-
-function isCompetitiveBall(ball) {
-  return !isAdministrativeBall(ball);
-}
-
 function sumRuns(balls) {
-  return balls.reduce((acc, b) => (isAdministrativeBall(b) ? acc : acc + (b.runs_off_bat || 0) + (b.extra_runs || 0)), 0);
+  return balls.reduce((acc, b) => acc + (b.runs_off_bat || 0) + (b.extra_runs || 0), 0);
 }
 
 function sumWkts(balls) {
-  return balls.reduce((acc, b) => {
-    if (!b?.wicket) return acc;
-    if (isAdministrativeBall(b) || b?.dismissal_kind === "retired hurt") return acc;
-    return acc + 1;
-  }, 0);
+  return balls.reduce((acc, b) => acc + (b.wicket ? 1 : 0), 0);
 }
 
 function legalBallsCount(balls) {
   // Treat NULL as legal (legacy rows); only explicit false is illegal
-  return balls.filter((b) => !isAdministrativeBall(b) && b.legal_ball !== false).length;
+  return balls.filter((b) => b.legal_ball !== false).length;
 }
 
 function oversTextFromLegal(legalBalls) {
@@ -41,7 +27,7 @@ function oversTextFromLegal(legalBalls) {
 }
 
 function getOverBalls(balls, overNo) {
-  return balls.filter((b) => toInt(b.over_no, 0) === overNo && !isAdministrativeBall(b));
+  return balls.filter((b) => toInt(b.over_no, 0) === overNo);
 }
 
 /**
@@ -68,15 +54,13 @@ function isOverFinished(counts) {
 }
 
 function computeNextPosition(balls) {
-  const competitiveBalls = (balls || []).filter((b) => !isAdministrativeBall(b));
-
-  if (!competitiveBalls.length) {
+  if (!balls.length) {
     return { over_no: 0, delivery_in_over: 1, counts: { deliveries: 0, legal: 0, hasIllegal: false }, newOver: true };
   }
 
-  const last = competitiveBalls[competitiveBalls.length - 1];
+  const last = balls[balls.length - 1];
   const overNo = toInt(last.over_no, 0);
-  const counts = getOverCounts(competitiveBalls, overNo);
+  const counts = getOverCounts(balls, overNo);
 
   if (isOverFinished(counts)) {
     return {
@@ -107,31 +91,9 @@ function sortBallsByPosition(balls) {
     const oa = toInt(a.over_no, 0);
     const ob = toInt(b.over_no, 0);
     if (oa !== ob) return oa - ob;
-
-    const da = toInt(a.delivery_in_over, 0);
-    const db = toInt(b.delivery_in_over, 0);
-    if (da !== db) return da - db;
-
-    const aAdmin = isAdministrativeBall(a) ? 1 : 0;
-    const bAdmin = isAdministrativeBall(b) ? 1 : 0;
-    if (aAdmin !== bAdmin) return aAdmin - bAdmin;
-
-    const aCreated = a?.created_at ? new Date(a.created_at).getTime() : 0;
-    const bCreated = b?.created_at ? new Date(b.created_at).getTime() : 0;
-    if (aCreated !== bCreated) return aCreated - bCreated;
-
-    return String(a?.id || a?.local_temp_id || "").localeCompare(String(b?.id || b?.local_temp_id || ""));
+    return toInt(a.delivery_in_over, 0) - toInt(b.delivery_in_over, 0);
   });
   return copy;
-}
-
-function mergeBallIntoList(prev, nextBall) {
-  const withoutTemp = (prev || []).filter((b) => {
-    if (nextBall?.local_temp_id && b?.local_temp_id === nextBall.local_temp_id) return false;
-    if (nextBall?.id && b?.id === nextBall.id) return false;
-    return true;
-  });
-  return sortBallsByPosition([...withoutTemp, nextBall]);
 }
 
 function countLegalBallsBowledBy(balls, bowlerId) {
@@ -209,57 +171,6 @@ async function loadSquadPlayers({ fixtureId, teamId }) {
   return { data: p2.data || [], error: null };
 }
 
-function getPendingQueueKey(matchId, inningsId) {
-  return `awv_pending_balls_${matchId || "unknown"}_${inningsId || "unknown"}`;
-}
-
-function readPendingQueue(matchId, inningsId) {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(getPendingQueueKey(matchId, inningsId));
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function writePendingQueue(matchId, inningsId, queue) {
-  if (typeof window === "undefined") return;
-  const key = getPendingQueueKey(matchId, inningsId);
-  if (!queue?.length) {
-    window.localStorage.removeItem(key);
-    return;
-  }
-  window.localStorage.setItem(key, JSON.stringify(queue));
-}
-
-
-function getScorerStateKey(matchId, inningsId) {
-  return `awv_scorer_state_${matchId || "unknown"}_${inningsId || "unknown"}`;
-}
-
-function readScorerState(matchId, inningsId) {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = window.localStorage.getItem(getScorerStateKey(matchId, inningsId));
-    const parsed = raw ? JSON.parse(raw) : null;
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeScorerState(matchId, inningsId, state) {
-  if (typeof window === "undefined" || !matchId || !inningsId) return;
-  const key = getScorerStateKey(matchId, inningsId);
-  if (!state) {
-    window.localStorage.removeItem(key);
-    return;
-  }
-  window.localStorage.setItem(key, JSON.stringify(state));
-}
-
 export default function ScoreView() {
   const { fixtureId } = useParams();
 
@@ -323,9 +234,6 @@ export default function ScoreView() {
   const [info, setInfo] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
-  const [pendingBalls, setPendingBalls] = useState([]);
-  const [isFlushingQueue, setIsFlushingQueue] = useState(false);
 
   // CURRENT innings totals
   const totalRuns = useMemo(() => sumRuns(balls), [balls]);
@@ -356,8 +264,8 @@ export default function ScoreView() {
   const nextPos = useMemo(() => computeNextPosition(balls), [balls]);
 
   const lastOverBowlerId = useMemo(() => {
-    const competitive = [...balls].reverse().find((b) => !isAdministrativeBall(b));
-    return competitive?.bowler_id || "";
+    if (!balls.length) return "";
+    return balls[balls.length - 1]?.bowler_id || "";
   }, [balls]);
 
   const currentRR = useMemo(() => {
@@ -406,26 +314,20 @@ export default function ScoreView() {
     const team1Name = inn1BatTeam?.name || inn1BatTeam?.short_name || "Team 1";
     const team2Name = inn2BatTeam?.name || inn2BatTeam?.short_name || "Team 2";
 
+    if (i2Runs >= targetToWin) {
+      const wktsRemaining = Math.max(0, wicketCap - i2Wkts);
+      return `RESULT: ${team2Name} won by ${wktsRemaining} wicket${wktsRemaining === 1 ? "" : "s"} with ${ballsRem} ball${ballsRem === 1 ? "" : "s"} remaining.`;
+    }
+
     const innings2Exhausted =
       !!innings2RowForResult?.completed || i2Legal >= maxLegal || i2Wkts >= wicketCap;
 
-    if (!innings2Exhausted) {
-      if (i2Runs >= targetToWin) {
-        const leadBy = i2Runs - i1Runs;
-        return `LIVE: ${team2Name} is ahead by ${leadBy} run${leadBy === 1 ? "" : "s"} with ${ballsRem} ball${ballsRem === 1 ? "" : "s"} remaining.`;
-      }
-
-      const runsNeeded = Math.max(0, targetToWin - i2Runs);
-      return `LIVE: ${team2Name} needs ${runsNeeded} run${runsNeeded === 1 ? "" : "s"} from ${ballsRem} ball${ballsRem === 1 ? "" : "s"}.`;
+    if (innings2Exhausted && i2Runs < targetToWin) {
+      const runsBy = targetToWin - i2Runs;
+      return `RESULT: ${team1Name} won by ${runsBy} run${runsBy === 1 ? "" : "s"}.`;
     }
 
-    if (i2Runs >= targetToWin) {
-      const margin = Math.max(0, i2Runs - i1Runs);
-      return `RESULT: ${team2Name} won by ${margin} run${margin === 1 ? "" : "s"}.`;
-    }
-
-    const runsBy = targetToWin - i2Runs;
-    return `RESULT: ${team1Name} won by ${runsBy} run${runsBy === 1 ? "" : "s"}.`;
+    return "";
   }, [
     match,
     inningsNo,
@@ -477,9 +379,10 @@ useEffect(() => {
   // If the match isn't actually decided yet, treat it as LIVE (stale completed flag).
   const maxLegal = toInt(match?.overs_limit, 20) * 6;
   const targetToWin = toInt(innings1Runs, 0) + 1;
+  const chaseReached = (innings2RunsForResult || 0) >= targetToWin;
   const innings2Exhausted =
     !!innings2RowForResult?.completed || (innings2LegalForResult || 0) >= maxLegal || (innings2WktsForResult || 0) >= wicketCap;
-  const decided = innings2Exhausted;
+  const decided = chaseReached || innings2Exhausted;
 
   // If no scoring yet (and innings 2 not decided), this is almost certainly a stale "completed" flag.
   if (!anyBalls && !i2HasMeaningful) {
@@ -561,91 +464,6 @@ const setNonStrikerSelection = (playerId) => {
   setNonStrikerId(playerId || "");
   setNonStrikerTurn(getTurnFor(playerId));
 };
-
-  useEffect(() => {
-    const goOnline = () => setIsOnline(true);
-    const goOffline = () => setIsOnline(false);
-
-    window.addEventListener("online", goOnline);
-    window.addEventListener("offline", goOffline);
-
-    return () => {
-      window.removeEventListener("online", goOnline);
-      window.removeEventListener("offline", goOffline);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!matchId || !innings?.id) return;
-    writePendingQueue(matchId, innings.id, pendingBalls);
-  }, [matchId, innings?.id, pendingBalls]);
-
-  useEffect(() => {
-    if (!matchId || !innings?.id) return;
-    writeScorerState(matchId, innings.id, {
-      strikerId,
-      nonStrikerId,
-      strikerTurn,
-      nonStrikerTurn,
-      bowlerId,
-      inningsNo,
-      needsNextBowler,
-      updated_at: new Date().toISOString(),
-    });
-  }, [
-    matchId,
-    innings?.id,
-    inningsNo,
-    strikerId,
-    nonStrikerId,
-    strikerTurn,
-    nonStrikerTurn,
-    bowlerId,
-    needsNextBowler,
-  ]);
-
-  const flushPendingQueue = async () => {
-    if (!isOnline || !matchId || !innings?.id) return;
-    if (isFlushingQueue) return;
-
-    const queue = readPendingQueue(matchId, innings.id);
-    if (!queue.length) {
-      setPendingBalls([]);
-      return;
-    }
-
-    setIsFlushingQueue(true);
-    try {
-      let localQueue = [...queue];
-      for (const item of queue) {
-        const { data, error } = await supabase.from("balls").insert(item.payload).select("*").single();
-        if (error) {
-          if (String(error.message || "").toLowerCase().includes("network")) {
-            setIsOnline(false);
-            break;
-          }
-          setErr(`Queued ball failed to sync: ${error.message}`);
-          break;
-        }
-
-        localQueue = localQueue.filter((q) => q.local_temp_id !== item.local_temp_id);
-        writePendingQueue(matchId, innings.id, localQueue);
-        setPendingBalls(localQueue);
-        setBalls((prev) => mergeBallIntoList(prev, { ...data, local_temp_id: item.local_temp_id, _pending: false }));
-      }
-
-      if (!localQueue.length) {
-        setInfo("Pending balls synced ✅");
-      }
-    } finally {
-      setIsFlushingQueue(false);
-    }
-  };
-
-  useEffect(() => {
-    if (!isOnline) return;
-    flushPendingQueue();
-  }, [isOnline, matchId, innings?.id]);
 
 // Load the single match row for this fixture_id
   useEffect(() => {
@@ -833,18 +651,7 @@ const setNonStrikerSelection = (playerId) => {
         return;
       }
 
-      const serverSorted = sortBallsByPosition(b.data || []);
-      const storedPending = readPendingQueue(matchId, inn.data.id);
-      setPendingBalls(storedPending);
-
-      let sorted = serverSorted;
-      if (storedPending.length) {
-        sorted = sortBallsByPosition([
-          ...serverSorted,
-          ...storedPending.map((item) => ({ ...item.payload, local_temp_id: item.local_temp_id, _pending: true })),
-        ]);
-      }
-
+      const sorted = sortBallsByPosition(b.data || []);
       setBalls(sorted);
 
       // Safety: if an innings was left "completed" from a previous run but has no balls,
@@ -862,20 +669,9 @@ const setNonStrikerSelection = (playerId) => {
 
       if (sorted.length) {
         const last = sorted[sorted.length - 1];
-        const lastCompetitive = [...sorted].reverse().find((ball) => !isAdministrativeBall(ball));
         if (last.striker_id) setStrikerSelection(last.striker_id);
         if (last.non_striker_id) setNonStrikerSelection(last.non_striker_id);
-        if (lastCompetitive?.bowler_id) setBowlerId(lastCompetitive.bowler_id);
-      }
-
-      const storedScorerState = readScorerState(matchId, inn.data.id);
-      if (storedScorerState) {
-        if (storedScorerState.strikerId) setStrikerSelection(storedScorerState.strikerId);
-        if (storedScorerState.nonStrikerId) setNonStrikerSelection(storedScorerState.nonStrikerId);
-        if (typeof storedScorerState.strikerTurn === "number") setStrikerTurn(storedScorerState.strikerTurn);
-        if (typeof storedScorerState.nonStrikerTurn === "number") setNonStrikerTurn(storedScorerState.nonStrikerTurn);
-        if (storedScorerState.bowlerId !== undefined) setBowlerId(storedScorerState.bowlerId || "");
-        setNeedsNextBowler(!!storedScorerState.needsNextBowler);
+        if (last.bowler_id) setBowlerId(last.bowler_id);
       }
 
       channel = supabase
@@ -883,7 +679,7 @@ const setNonStrikerSelection = (playerId) => {
         .on(
           "postgres_changes",
           { event: "INSERT", schema: "public", table: "balls", filter: `innings_id=eq.${inn.data.id}` },
-          (payload) => setBalls((prev) => mergeBallIntoList(prev, payload.new))
+          (payload) => setBalls((prev) => sortBallsByPosition([...prev, payload.new]))
         )
         .subscribe();
 
@@ -1004,8 +800,10 @@ const battingScorecardRows = useMemo(() => {
 
   const canScore = () => {
     if (!innings?.id) return { ok: false, msg: "Innings not loaded." };
-    if (!lockReady) return { ok: false, msg: "Waiting for scorer lock…" };
-    if (scoringLocked) return { ok: false, msg: "Another scorer session currently holds this match. Use override to take control." };
+
+    if (inningsNo === 2 && target !== null && totalRuns >= target) {
+      return { ok: false, msg: "Target reached. Match complete." };
+    }
 
     if (inningsComplete) return { ok: false, msg: "Innings complete." };
     if (saving) return { ok: false, msg: "Saving…" };
@@ -1026,8 +824,8 @@ const battingScorecardRows = useMemo(() => {
       }
     } else {
       // Mid-over: bowler cannot change
-      const lastCompetitive = [...balls].reverse().find((b) => !isAdministrativeBall(b));
-      if (lastCompetitive?.bowler_id && bowlerId !== lastCompetitive.bowler_id) {
+      const last = balls[balls.length - 1];
+      if (last?.bowler_id && bowlerId !== last.bowler_id) {
         return { ok: false, msg: "Bowler cannot change mid-over." };
       }
     }
@@ -1041,14 +839,7 @@ const battingScorecardRows = useMemo(() => {
     extra_runs = null,
     wicket = false,
     dismissal_kind = null,
-    dismissed_player_id = null,
-    administrative = false,
-    striker_override = null,
-    non_striker_override = null,
-    bowler_override = undefined,
-    batting_turn_override = null,
-    over_no_override = null,
-    delivery_in_over_override = null,
+    dismissed_player_id = null, // ✅ NEW
   }) => {
     setErr("");
     setInfo("");
@@ -1056,27 +847,21 @@ const battingScorecardRows = useMemo(() => {
     const ok = canScore();
     if (!ok.ok) {
       setErr(ok.msg);
-      return { overFinishedAfter: false, queued: false };
+      return { overFinishedAfter: false };
     }
 
     setSaving(true);
 
     try {
       const pos = computeNextPosition(balls);
-      const targetOverNo = over_no_override ?? pos.over_no;
-      const targetDeliveryInOver = delivery_in_over_override ?? pos.delivery_in_over;
 
-      const overCountsBefore = getOverCounts(balls, targetOverNo);
+      const overCountsBefore = getOverCounts(balls, pos.over_no);
       const overAlreadyHadIllegal = !!overCountsBefore?.hasIllegal;
 
       let extra_runs_calc = 0;
       let legal_ball = true;
 
-      if (administrative && extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT) {
-        extra_runs_calc = 0;
-        legal_ball = false;
-        runs_off_bat = 0;
-      } else if (extra_type === "wide") {
+      if (extra_type === "wide") {
         extra_runs_calc = Math.max(2, toInt(extra_runs ?? 2, 2));
         runs_off_bat = 0;
         legal_ball = overAlreadyHadIllegal ? true : false;
@@ -1092,100 +877,80 @@ const battingScorecardRows = useMemo(() => {
         legal_ball = true;
       }
 
-      if (!administrative && legal_ball && legalBalls + 1 > maxLegal) {
+      if (legal_ball && legalBalls + 1 > maxLegal) {
         setErr(`Cannot add: overs limit reached (${oversLimit} overs).`);
-        return { overFinishedAfter: false, queued: false };
+        return { overFinishedAfter: false };
       }
 
-      if (!administrative && legal_ball) {
+      if (legal_ball) {
         const legalBowled = countLegalBallsBowledBy(balls, bowlerId);
         if (legalBowled + 1 > 24) {
           setErr("That bowler would exceed 4 overs (24 legal balls). Choose another bowler.");
-          return { overFinishedAfter: false, queued: false };
+          return { overFinishedAfter: false };
         }
       }
 
+      // batting_turn tracks the STRIKER's current batting stint in this innings (1 = first time batting, 2 = second, etc.)
+      // IMPORTANT: even if the NON-STRIKER is dismissed (run out), batting_turn still belongs to the striker's stint.
       const prevDismissals = (strikerId && dismissalsByBatter.get(strikerId)) || 0;
-      const batting_turn = batting_turn_override ?? (prevDismissals + 1);
+      const batting_turn = prevDismissals + 1;
 
       const payload = {
-        match_id: matchId,
-        innings_id: innings.id,
-        over_no: targetOverNo,
-        delivery_in_over: targetDeliveryInOver,
-        legal_ball,
-        runs_off_bat: toInt(runs_off_bat, 0),
-        extra_type,
-        extra_runs: extra_runs_calc,
-        wicket,
-        dismissal_kind: wicket ? dismissal_kind : null,
-        dismissed_player_id: wicket ? (dismissed_player_id || strikerId) : null,
-        striker_id: striker_override ?? strikerId,
-        non_striker_id: non_striker_override ?? nonStrikerId,
-        bowler_id: bowler_override === undefined ? bowlerId : bowler_override,
-        batting_turn,
-      };
+  match_id: matchId,
+  innings_id: innings.id,
+  over_no: pos.over_no,
+  delivery_in_over: pos.delivery_in_over,
+  legal_ball,
+  runs_off_bat: toInt(runs_off_bat, 0),
+  extra_type,
+  extra_runs: extra_runs_calc,
+  wicket,
+  dismissal_kind: wicket ? dismissal_kind : null,
 
-      const total_runs_on_ball = (payload.runs_off_bat || 0) + (payload.extra_runs || 0);
-      const localTempId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      let persistedBall = null;
-      let queued = false;
+  // ✅ CRITICAL FIX: store the ACTUAL dismissed player (can be striker OR non-striker)
+  dismissed_player_id: wicket ? (dismissed_player_id || strikerId) : null,
 
-      if (!isOnline) {
-        queued = true;
-      } else {
-        const { data, error } = await supabase.from("balls").insert(payload).select("*").single();
-        if (error) {
-          const message = String(error.message || "");
-          const looksOffline = /network|fetch|offline|failed/i.test(message);
-          if (looksOffline) {
-            queued = true;
-            setIsOnline(false);
-          } else {
-            setErr(`Insert error: ${error.message}`);
-            return { overFinishedAfter: false, queued: false };
-          }
-        } else {
-          persistedBall = data;
-        }
+  striker_id: strikerId,
+  non_striker_id: nonStrikerId,
+  bowler_id: bowlerId,
+  batting_turn,
+};
+
+      const { data, error } = await supabase.from("balls").insert(payload).select("*").single();
+
+      if (error) {
+        setErr(`Insert error: ${error.message}`);
+        return { overFinishedAfter: false };
       }
 
-      const savedBall = persistedBall || { ...payload, local_temp_id: localTempId, _pending: true };
-
-      if (queued) {
-        const baseQueue = readPendingQueue(matchId, innings.id);
-        const nextQueue = [...baseQueue, { local_temp_id: localTempId, payload }];
-        setPendingBalls(nextQueue);
-        writePendingQueue(matchId, innings.id, nextQueue);
-        setInfo("Saved offline — will sync when signal returns ✅");
-      }
-
-      const nextBalls = mergeBallIntoList(balls, savedBall);
+      const nextBalls = sortBallsByPosition([...balls, data]);
       setBalls(nextBalls);
 
-      let s = striker_override ?? strikerId;
-      let ns = non_striker_override ?? nonStrikerId;
+      const total_runs_on_ball = (payload.runs_off_bat || 0) + (payload.extra_runs || 0);
 
-      if (!payload.wicket && !administrative && total_runs_on_ball % 2 === 1) {
+      let s = strikerId;
+      let ns = nonStrikerId;
+
+      if (!payload.wicket && total_runs_on_ball % 2 === 1) {
         [s, ns] = [ns, s];
       }
 
       const overCountsAfter = getOverCounts(nextBalls, payload.over_no);
-      const overFinishedAfter = !administrative && isOverFinished(overCountsAfter);
+      const overFinishedAfter = isOverFinished(overCountsAfter);
 
-      if (!payload.wicket && !administrative && overFinishedAfter && !inningsComplete) {
+      if (!payload.wicket && overFinishedAfter && !inningsComplete) {
         [s, ns] = [ns, s];
         setNeedsNextBowler(true);
         setBowlerId("");
-        setInfo(queued ? "Saved offline — over complete, pick the next bowler when signal returns or continue scoring ✅" : "Over complete — select a new bowler ✅");
+        setInfo("Over complete — select a new bowler ✅");
       }
 
       setStrikerSelection(s);
       setNonStrikerSelection(ns);
 
-      if (!overFinishedAfter && !queued) setInfo("Saved ✅");
+      if (!overFinishedAfter) setInfo("Saved ✅");
 
-      return { overFinishedAfter, queued };
+      return { overFinishedAfter };
     } finally {
       setSaving(false);
     }
@@ -1216,53 +981,6 @@ const battingScorecardRows = useMemo(() => {
     setDismissedPlayerId(strikerId || "");
 
     setNeedsWicketModal(true);
-  };
-
-  const addRetiredHurt = async () => {
-    setErr("");
-    setInfo("");
-
-    const ok = canScore();
-    if (!ok.ok) {
-      setErr(ok.msg);
-      return;
-    }
-
-    if (!dismissedPlayerId) {
-      setErr("Select who is retired hurt (striker/non-striker).");
-      return;
-    }
-    if (!incomingBatterId) {
-      setErr("Select the replacement batter.");
-      return;
-    }
-
-    const outWasStriker = dismissedPlayerId === strikerId;
-    const nextStriker = outWasStriker ? incomingBatterId : strikerId;
-    const nextNonStriker = outWasStriker ? nonStrikerId : incomingBatterId;
-    const nextTurn = getTurnFor(nextStriker);
-
-    await insertBall({
-      runs_off_bat: 0,
-      extra_type: ADMIN_EXTRA_TYPE_RETIRED_HURT,
-      extra_runs: 0,
-      wicket: true,
-      dismissal_kind: "retired hurt",
-      dismissed_player_id: dismissedPlayerId,
-      administrative: true,
-      striker_override: nextStriker,
-      non_striker_override: nextNonStriker,
-      bowler_override: null,
-      batting_turn_override: nextTurn,
-      over_no_override: nextPos.over_no,
-      delivery_in_over_override: nextPos.delivery_in_over,
-    });
-
-    setNeedsWicketModal(false);
-    setDismissalKind("bowled");
-    setDismissedPlayerId("");
-    setIncomingBatterId("");
-    setWicketCrossed(false);
   };
 
   // Incoming batters:
@@ -1343,10 +1061,6 @@ const battingScorecardRows = useMemo(() => {
 
   const endInnings = async () => {
     if (!innings?.id) return;
-    if (scoringLocked) {
-      setErr("Another scorer session currently holds this match. Use override to take control.");
-      return;
-    }
     setErr("");
     setInfo("");
     setSaving(true);
@@ -1368,10 +1082,6 @@ const battingScorecardRows = useMemo(() => {
 
   const reopenInnings = async () => {
     if (!innings?.id) return;
-    if (scoringLocked) {
-      setErr("Another scorer session currently holds this match. Use override to take control.");
-      return;
-    }
     setErr("");
     setInfo("");
     setSaving(true);
@@ -1398,9 +1108,12 @@ const battingScorecardRows = useMemo(() => {
     const i2Legal = toInt(innings2LegalForResult, 0);
     const maxLegal = toInt(match?.overs_limit, 20) * 6;
 
+    const targetToWin = i1Runs + 1;
+    const chaseReached = i2Runs >= targetToWin;
     const innings2Exhausted =
       !!innings2RowForResult?.completed || i2Legal >= maxLegal || i2Wkts >= wicketCap;
-    if (!innings2Exhausted) return;
+    const decided = chaseReached || innings2Exhausted;
+    if (!decided) return;
 
     (async () => {
       const upd = await supabase
@@ -1433,7 +1146,8 @@ const battingScorecardRows = useMemo(() => {
   useEffect(() => {
     if (!innings?.id) return;
     if (innings?.completed) return;
-    if (!oversDone && !allOut) return;
+    const chaseReached = inningsNo === 2 && target !== null && totalRuns >= target;
+    if (!oversDone && !allOut && !chaseReached) return;
 
     (async () => {
       await supabase.from("innings").update({ completed: true }).eq("id", innings.id);
@@ -1682,23 +1396,6 @@ You can then start scoring again from ball 1.`
             {info}
           </div>
         )}
-
-        <div
-          style={{
-            marginTop: 10,
-            padding: 10,
-            borderRadius: 12,
-            background: !isOnline ? "rgba(255, 179, 71, 0.10)" : pendingBalls.length ? "rgba(59,130,246,0.10)" : "rgba(255,255,255,0.04)",
-            border: !isOnline ? "1px solid rgba(255,179,71,0.28)" : pendingBalls.length ? "1px solid rgba(59,130,246,0.28)" : "1px solid rgba(255,255,255,0.10)",
-            color: !isOnline ? "#ffe4b0" : pendingBalls.length ? "#dbeafe" : "rgba(232,238,252,0.70)",
-          }}
-        >
-          {!isOnline
-            ? `Offline mode: balls save on this device and will sync automatically when signal returns. Pending sync: ${pendingBalls.length}.`
-            : pendingBalls.length
-            ? `Online again: ${pendingBalls.length} pending ball${pendingBalls.length === 1 ? "" : "s"} still syncing.`
-            : "Connection healthy: scoring is syncing live."}
-        </div>
 
         {/* Score header */}
         <div
@@ -2008,9 +1705,7 @@ You can then start scoring again from ball 1.`
             <div style={{ padding: 12, paddingTop: 0 }}>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                 {balls.slice(-18).reverse().map((b) => {
-                  const label = isAdministrativeBall(b)
-                    ? "RH"
-                    : b.extra_type
+                  const label = b.extra_type
                     ? b.extra_type === "wide"
                       ? `Wd(${b.extra_runs || 0})`
                       : b.extra_type === "noball"
@@ -2021,7 +1716,7 @@ You can then start scoring again from ball 1.`
                     : `${b.runs_off_bat || 0}`;
                   return (
                     <div
-                      key={b.id || b.local_temp_id}
+                      key={b.id}
                       title={`Over ${b.over_no}.${b.delivery_in_over}`}
                       style={{
                         width: 76,
@@ -2037,8 +1732,7 @@ You can then start scoring again from ball 1.`
                       <div style={{ marginTop: 4, fontSize: 11, color: "rgba(232,238,252,0.65)" }}>
                         {b.over_no}.{b.delivery_in_over}
                       </div>
-                      {b.wicket ? <div style={{ marginTop: 4, fontSize: 11, color: "#ffb3b3" }}>{isAdministrativeBall(b) ? "RH" : "W"}</div> : null}
-                      {b._pending ? <div style={{ marginTop: 4, fontSize: 10, color: "#ffe4b0" }}>Pending</div> : null}
+                      {b.wicket ? <div style={{ marginTop: 4, fontSize: 11, color: "#ffb3b3" }}>W</div> : null}
                       {b.batting_turn ? (
                         <div style={{ marginTop: 4, fontSize: 11, color: "rgba(232,238,252,0.65)" }}>T{b.batting_turn}</div>
                       ) : null}
@@ -2220,7 +1914,6 @@ You can then start scoring again from ball 1.`
                   <option value="run out">Run out</option>
                   <option value="stumped">Stumped</option>
                   <option value="hit wicket">Hit wicket</option>
-                  <option value="retired hurt">Retired hurt</option>
                 </select>
               </div>
 
@@ -2245,27 +1938,17 @@ You can then start scoring again from ball 1.`
                 </select>
               </div>
 
-              {dismissalKind !== "retired hurt" ? (
-                <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <input type="checkbox" checked={wicketCrossed} onChange={(e) => setWicketCrossed(e.target.checked)} />
-                  <span style={{ fontWeight: 900 }}>Batters crossed</span>
-                </label>
-              ) : (
-                <div style={{ fontSize: 12, color: "rgba(232,238,252,0.60)" }}>
-                  Retired hurt is recorded without consuming a ball.
-                </div>
-              )}
+              <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <input type="checkbox" checked={wicketCrossed} onChange={(e) => setWicketCrossed(e.target.checked)} />
+                <span style={{ fontWeight: 900 }}>Batters crossed</span>
+              </label>
 
               <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
                 <button onClick={() => setNeedsWicketModal(false)} style={modalBtnGhost}>
                   Cancel
                 </button>
-                <button
-                  onClick={dismissalKind === "retired hurt" ? addRetiredHurt : confirmWicket}
-                  disabled={saving}
-                  style={modalBtnPrimary}
-                >
-                  {dismissalKind === "retired hurt" ? "Confirm retired hurt" : "Confirm wicket"}
+                <button onClick={confirmWicket} disabled={saving} style={modalBtnPrimary}>
+                  Confirm wicket
                 </button>
               </div>
             </div>
@@ -2356,7 +2039,6 @@ You can then start scoring again from ball 1.`
                       <option value="run out">Run out</option>
                       <option value="stumped">Stumped</option>
                       <option value="hit wicket">Hit wicket</option>
-                      <option value="retired hurt">Retired hurt</option>
                     </select>
 
                     <div style={{ marginTop: 8, fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Dismissed player</div>
