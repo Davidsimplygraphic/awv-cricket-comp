@@ -10,6 +10,7 @@ const ballByBall = fs.readFileSync(new URL("../src/components/BallByBall.jsx", i
 const partnerships = fs.readFileSync(new URL("../src/components/Partnerships.jsx", import.meta.url), "utf8");
 const wormGraph = fs.readFileSync(new URL("../src/components/WormGraph.jsx", import.meta.url), "utf8");
 const leaderboards = fs.readFileSync(new URL("../src/pages/Leaderboards.jsx", import.meta.url), "utf8");
+const spectator = fs.readFileSync(new URL("../src/views/SpectatorView.jsx", import.meta.url), "utf8");
 const integrationTypes = fs.readFileSync(new URL("../src/integrations/supabase/types.ts", import.meta.url), "utf8").trim();
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const wicketEventDesign = fs.readFileSync(new URL("../docs/wicket-event-design.md", import.meta.url), "utf8");
@@ -37,6 +38,17 @@ test("destructive scorer admin flows require hardened RPCs and no longer fall ba
   assert.match(scoreHome, /missingRequiredRpcMessage\("delete_match_state"/);
   assert.match(scoreHome, /missingRequiredRpcMessage\("reset_match_state"/);
   assert.match(scoreView, /missingRequiredRpcMessage\("reset_match_state"/);
+});
+
+test("ScoreHome assigns new matches to the current authenticated scorer session", () => {
+  assert.match(scoreHome, /supabase\.auth\.onAuthStateChange/);
+  assert.match(scoreHome, /const currentUser = sess\?\.data\?\.session\?\.user \|\| null;/);
+  assert.match(scoreHome, /scorer_user_id: currentUser\.id/);
+});
+
+test("ScoreView loads or creates innings through the hardened RPC instead of a direct innings insert", () => {
+  assert.match(scoreView, /rpc\("get_or_create_match_innings"/);
+  assert.doesNotMatch(scoreView, /\.from\("innings"\)\.insert\(/);
 });
 
 test("retired hurt now uses an administrative state event instead of a fake delivery", () => {
@@ -77,6 +89,9 @@ test("bowling read models use authoritative bowler wicket-credit helpers instead
   assert.match(leaderboards, /isBowlerCreditedWicket/);
   assert.match(leaderboards, /function computeWktsByBowlerPerInnings[\s\S]*isBowlerCreditedWicket/);
   assert.doesNotMatch(leaderboards, /const row = perPlayer\.get\(bowlerId\);[\s\S]*if \(b\.wicket\) row\.wkts \+= 1;/);
+
+  assert.match(spectator, /isBowlerCreditedWicket/);
+  assert.doesNotMatch(spectator, /const wkts = by\.filter\(\(b\) => isBattingSideWicket\(b\)\)\.length;/);
 });
 
 test("bowling read models use authoritative bowler-conceded run helpers instead of raw run plus extra sums", () => {
@@ -98,13 +113,53 @@ test("wicket-cap read models use the shared resolver instead of treating nullabl
   assert.match(leaderboards, /resolveWicketCap/);
 
   const fixtures = fs.readFileSync(new URL("../src/pages/Fixtures.jsx", import.meta.url), "utf8");
-  const spectator = fs.readFileSync(new URL("../src/views/SpectatorView.jsx", import.meta.url), "utf8");
+  const matchCentre = fs.readFileSync(new URL("../src/pages/MatchCentre.jsx", import.meta.url), "utf8");
 
-  assert.match(fixtures, /resolveWicketCap/);
-  assert.match(spectator, /resolveWicketCap/);
+  assert.match(scoreView, /resolveDisplayWicketCap/);
+  assert.match(fixtures, /resolveDisplayWicketCap/);
+  assert.match(matchCentre, /resolveDisplayWicketCap/);
+  assert.match(spectator, /resolveDisplayWicketCap/);
   assert.doesNotMatch(fixtures, /wicketCap:\s*toInt\(m\.wicket_cap,\s*10\)/);
   assert.doesNotMatch(spectator, /const wicketCap = toInt\(match\?\.wicket_cap,\s*10\)/);
   assert.doesNotMatch(leaderboards, /const wicketCap = toInt\(match\.wicket_cap,\s*10\)/);
+});
+
+test("spectator wicket cap prefers fixture-level squad caps over stale persisted match values", () => {
+  assert.match(spectator, /\.from\("fixture_wicket_caps"\)/);
+  assert.match(spectator, /resolveDisplayWicketCap\(\{/);
+  assert.match(spectator, /fixtureWicketCap,/);
+  assert.match(spectator, /matchWicketCap: match\?\.wicket_cap/);
+  assert.match(spectator, /rosterWicketCap,/);
+});
+
+test("fixture and match-centre cards also prefer fixture-level wicket caps for display", () => {
+  const fixtures = fs.readFileSync(new URL("../src/pages/Fixtures.jsx", import.meta.url), "utf8");
+  const matchCentre = fs.readFileSync(new URL("../src/pages/MatchCentre.jsx", import.meta.url), "utf8");
+
+  assert.match(fixtures, /\.from\("fixture_wicket_caps"\)/);
+  assert.match(fixtures, /resolveDisplayWicketCap\(\{/);
+  assert.match(fixtures, /fixtureWicketCap: fixtureWicketCaps\.get\(fixtureId\) \?\? null/);
+
+  assert.match(matchCentre, /\.from\("fixture_wicket_caps"\)/);
+  assert.match(matchCentre, /resolveDisplayWicketCap\(\{/);
+  assert.match(matchCentre, /fixtureWicketCap,/);
+});
+
+test("spectator stats use compact partnerships and worm graph modes", () => {
+  assert.match(spectator, /<Partnerships balls={tabBalls} playersById={playersById} theme="dark" compact/);
+  assert.match(spectator, /<WormGraph[\s\S]*compact/);
+});
+
+test("partnership displays use batter names instead of generic stand labels", () => {
+  assert.match(partnerships, /partnershipPairLabel/);
+  assert.doesNotMatch(partnerships, /Stand \d/);
+});
+
+test("spectator commentary shows grouped over summaries with over totals", () => {
+  assert.match(ballByBall, /sumRuns/);
+  assert.match(ballByBall, /function buildOverSummary/);
+  assert.match(ballByBall, /Over \{over\.overNo \+ 1\}/);
+  assert.match(ballByBall, /buildOverSummary\(over\.balls\)/);
 });
 
 test("stale scorer backup files are not kept in the repository", () => {

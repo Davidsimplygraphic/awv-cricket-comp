@@ -22,6 +22,7 @@ import {
   computeNextPosition,
   countLegalBallsBowledBy,
   DELIVERY_RECORDED_EVENT_TYPE,
+  deriveRosterWicketCap,
   deriveWicketPostState,
   didBatterFaceBall,
   getOverCounts,
@@ -32,6 +33,7 @@ import {
   mergeBallIntoList,
   normalizeDeliveryOutcome,
   oversTextFromLegal,
+  resolveDisplayWicketCap,
   resolveWicketCap,
   runsConcededByBowler,
   sortBallsByPosition,
@@ -56,52 +58,24 @@ import {
   replayPendingEventsOnState,
 } from "../lib/scoringSync";
 
-async function getOrCreateInnings({ matchId, inningsNo, match }) {
-  const innRes = await supabase
-    .from("innings")
-    .select("*")
-    .eq("match_id", matchId)
-    .eq("innings_no", inningsNo)
-    .maybeSingle();
+async function getOrCreateInnings({ matchId, inningsNo }) {
+  const { data, error } = await supabase.rpc("get_or_create_match_innings", {
+    p_match_id: matchId,
+    p_innings_no: inningsNo,
+  });
 
-  if (innRes.error) return { data: null, error: innRes.error };
-  if (innRes.data) return { data: innRes.data, error: null };
-
-  // IMPORTANT:
-  // Two-innings-per-match model:
-  // - Innings 1: match.team_a_id bats, match.team_b_id bowls
-  // - Innings 2: match.team_b_id bats, match.team_a_id bowls
-  const isSecondInnings = Number(inningsNo) === 2;
-  const batting_team_id = isSecondInnings ? match.team_b_id : match.team_a_id;
-  const bowling_team_id = isSecondInnings ? match.team_a_id : match.team_b_id;
-
-  const createInn = await supabase
-    .from("innings")
-    .insert({
-      match_id: matchId,
-      innings_no: inningsNo,
-      batting_team_id,
-      bowling_team_id,
-      completed: false,
-    })
-    .select("*")
-    .single();
-
-  if (createInn.error) {
-    const message = String(createInn.error?.message || "");
-    if (/duplicate key|unique/i.test(message)) {
-      const existingInn = await supabase
-        .from("innings")
-        .select("*")
-        .eq("match_id", matchId)
-        .eq("innings_no", inningsNo)
-        .maybeSingle();
-      if (!existingInn.error && existingInn.data) return { data: existingInn.data, error: null };
+  if (error) {
+    if (isMissingRpcError(error)) {
+      return {
+        data: null,
+        error: new Error(missingRequiredRpcMessage("get_or_create_match_innings", "Innings load/create")),
+      };
     }
 
-    return { data: null, error: createInn.error };
+    return { data: null, error };
   }
-  return { data: createInn.data, error: null };
+
+  return { data, error: null };
 }
 
 /**
@@ -148,6 +122,7 @@ export default function ScoreView() {
   const [canonicalFixtureId, setCanonicalFixtureId] = useState("");
 
   const [match, setMatch] = useState(null);
+  const [fixtureDisplayWicketCap, setFixtureDisplayWicketCap] = useState(null);
   const [clientSessionId] = useState(() => getOrCreateScorerSessionId(fixtureId || "unknown"));
   const [deviceLabel] = useState(() => describeScorerDevice());
 
@@ -243,6 +218,15 @@ export default function ScoreView() {
   const wicketCap = useMemo(() => {
     return resolveWicketCap(match?.wicket_cap, 10);
   }, [match]);
+  const displayWicketCap = useMemo(() => resolveDisplayWicketCap({
+    fixtureWicketCap: fixtureDisplayWicketCap,
+    matchWicketCap: match?.wicket_cap,
+    rosterWicketCap: deriveRosterWicketCap(
+      [...(battingPlayers || []), ...(bowlingPlayers || [])],
+      [match?.team_a_id, match?.team_b_id]
+    ),
+    fallback: 10,
+  }), [fixtureDisplayWicketCap, match?.wicket_cap, match?.team_a_id, match?.team_b_id, battingPlayers, bowlingPlayers]);
 
   const allOut = useMemo(() => wickets >= wicketCap, [wickets, wicketCap]);
   const oversDone = useMemo(() => legalBalls >= maxLegal, [legalBalls, maxLegal]);
@@ -938,6 +922,13 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
 
       // Use the real fixture_id when available for anything keyed by fixture_id (match_squads, fixtures grouping, etc.)
       setCanonicalFixtureId(m.data.fixture_id || m.data.id);
+
+      const cap = await supabase
+        .from("fixture_wicket_caps")
+        .select("wicket_cap")
+        .eq("fixture_id", m.data.fixture_id || m.data.id)
+        .maybeSingle();
+      if (alive && !cap.error) setFixtureDisplayWicketCap(cap.data?.wicket_cap ?? null);
 
       // If this match has no fixture_id (older data), normalise it so all routes work consistently.
       if (!m.data.fixture_id) {
@@ -2314,7 +2305,7 @@ You can then start scoring again from ball 1.`
             <div style={{ fontSize: 34, fontWeight: 900, letterSpacing: -0.5 }}>
               {totalRuns}/{wickets}
               <span style={{ fontSize: 14, fontWeight: 700, marginLeft: 10, color: "rgba(232,238,252,0.75)" }}>
-                ({oversText} / {oversLimit} ov) • 7-ball overs rule • Wicket cap {wicketCap}
+                ({oversText} / {oversLimit} ov) • 7-ball overs rule • Wicket cap {displayWicketCap}
               </span>
             </div>
 

@@ -4,6 +4,7 @@ import { test } from "./test-helpers.js";
 import {
   buildCompletedResultText,
   countLegalBallsBowledBy,
+  deriveRosterWicketCap,
   deriveWicketPostState,
   didBatterFaceBall,
   isBattingSideWicket,
@@ -11,6 +12,7 @@ import {
   isBowlerCreditedWicket,
   legalBallsCount,
   normalizeDeliveryOutcome,
+  resolveDisplayWicketCap,
   resolveWicketCap,
   runsConcededByBowler,
   selectInningsSummary,
@@ -99,6 +101,57 @@ test("wicket cap resolution treats null as the default and non-positive values a
   assert.equal(resolveWicketCap(0, 10), 1);
   assert.equal(resolveWicketCap(-3, 10), 1);
   assert.equal(resolveWicketCap(8, 10), 8);
+});
+
+test("display wicket cap prefers fixture caps, then persisted match caps, then roster fallback", () => {
+  const players = [
+    { id: "a1", team_id: "team-a", active: true },
+    { id: "a2", team_id: "team-a", active: true },
+    { id: "a3", team_id: "team-a", active: true },
+    { id: "a4", team_id: "team-a", active: true },
+    { id: "a5", team_id: "team-a", active: true },
+    { id: "a6", team_id: "team-a", active: true },
+    { id: "a7", team_id: "team-a", active: true },
+    { id: "a8", team_id: "team-a", active: true },
+    { id: "a9", team_id: "team-a", active: true },
+    { id: "a10", team_id: "team-a", active: true },
+    { id: "a11", team_id: "team-a", active: true },
+    { id: "a12", team_id: "team-a", active: true },
+    { id: "a13", team_id: "team-a", active: true },
+    { id: "a14", team_id: "team-a", active: true },
+    { id: "a15", team_id: "team-a", active: true },
+    { id: "b1", team_id: "team-b", active: true },
+    { id: "b2", team_id: "team-b", active: true },
+    { id: "b3", team_id: "team-b", active: true },
+    { id: "b4", team_id: "team-b", active: true },
+    { id: "b5", team_id: "team-b", active: true },
+    { id: "b6", team_id: "team-b", active: true },
+    { id: "b7", team_id: "team-b", active: true },
+    { id: "b8", team_id: "team-b", active: true },
+    { id: "b9", team_id: "team-b", active: true },
+    { id: "b10", team_id: "team-b", active: true },
+    { id: "b11", team_id: "team-b", active: true },
+  ];
+
+  const rosterWicketCap = deriveRosterWicketCap(players, ["team-a", "team-b"]);
+  assert.equal(rosterWicketCap, 14);
+
+  assert.equal(
+    resolveDisplayWicketCap({ fixtureWicketCap: 14, matchWicketCap: 10, rosterWicketCap, fallback: 10 }),
+    14
+  );
+  assert.equal(
+    resolveDisplayWicketCap({ fixtureWicketCap: null, matchWicketCap: 12, rosterWicketCap, fallback: 10 }),
+    12
+  );
+  assert.equal(
+    resolveDisplayWicketCap({ fixtureWicketCap: null, matchWicketCap: null, rosterWicketCap, fallback: 10 }),
+    14
+  );
+  assert.equal(
+    resolveDisplayWicketCap({ fixtureWicketCap: null, matchWicketCap: null, rosterWicketCap: null, fallback: 10 }),
+    10
+  );
 });
 
 test("match completion heuristics do not treat a missing wicket cap as zero wickets", () => {

@@ -4,12 +4,13 @@ import { supabase } from "../lib/supabase";
 
 import Partnerships from "../components/Partnerships";
 import WormGraph from "../components/WormGraph";
-import BallByBall from "../components/BallByBall";
 import ScorecardTables from "../components/ScorecardTables";
 import {
   buildCompletedResultText,
   buildInningsTotals,
+  deriveRosterWicketCap,
   deriveMatchDisplayStatus,
+  resolveDisplayWicketCap,
   sortBallsByPosition,
   toInt,
 } from "../lib/scoring";
@@ -22,6 +23,7 @@ export default function MatchCentre() {
 
   const [players, setPlayers] = useState([]);
   const [match, setMatch] = useState(null);
+  const [fixtureWicketCap, setFixtureWicketCap] = useState(null);
   const [inningsByNo, setInningsByNo] = useState({}); // {1: row, 2: row}
   const [ballsByInnings, setBallsByInnings] = useState({}); // {inningsId: balls[]}
 
@@ -79,6 +81,13 @@ export default function MatchCentre() {
       }
 
       setMatch(m.data);
+      const cap = await supabase
+        .from("fixture_wicket_caps")
+        .select("wicket_cap")
+        .eq("fixture_id", m.data.fixture_id || fixtureId)
+        .maybeSingle();
+      if (!alive) return;
+      if (!cap.error) setFixtureWicketCap(cap.data?.wicket_cap ?? null);
 
       const inn = await supabase
         .from("innings")
@@ -175,8 +184,15 @@ export default function MatchCentre() {
       .on(
         "postgres_changes",
         { event: "UPDATE", schema: "public", table: "matches", filter: `id=eq.${match.id}` },
-        (payload) => {
+        async (payload) => {
+          const nextMatch = { ...(match || {}), ...(payload.new || {}) };
           setMatch((prev) => ({ ...(prev || {}), ...(payload.new || {}) }));
+          const cap = await supabase
+            .from("fixture_wicket_caps")
+            .select("wicket_cap")
+            .eq("fixture_id", nextMatch.fixture_id || fixtureId)
+            .maybeSingle();
+          if (!cap.error) setFixtureWicketCap(cap.data?.wicket_cap ?? null);
         }
       )
       .subscribe();
@@ -222,6 +238,16 @@ export default function MatchCentre() {
 
   const inn1Team = inn1Row?.batting_team_id ? teamById.get(inn1Row.batting_team_id) : teamA;
   const inn2Team = inn2Row?.batting_team_id ? teamById.get(inn2Row.batting_team_id) : teamB;
+  const rosterWicketCap = useMemo(
+    () => deriveRosterWicketCap(players, [teamA?.id, teamB?.id]),
+    [players, teamA?.id, teamB?.id]
+  );
+  const displayWicketCap = useMemo(() => resolveDisplayWicketCap({
+    fixtureWicketCap,
+    matchWicketCap: match?.wicket_cap,
+    rosterWicketCap,
+    fallback: 10,
+  }), [fixtureWicketCap, match?.wicket_cap, rosterWicketCap]);
 
   const derivedStatus = useMemo(() => {
     return deriveMatchDisplayStatus({
@@ -231,9 +257,9 @@ export default function MatchCentre() {
       innings1Balls: inn1Balls,
       innings2Balls: inn2Balls,
       oversLimit: match?.overs_limit,
-      wicketCap: match?.wicket_cap,
+      wicketCap: displayWicketCap,
     });
-  }, [match?.status, match?.overs_limit, match?.wicket_cap, inn1Row, inn2Row, inn1Balls, inn2Balls]);
+  }, [match?.status, match?.overs_limit, displayWicketCap, inn1Row, inn2Row, inn1Balls, inn2Balls]);
 
   const resultText = useMemo(() => {
     return buildCompletedResultText({
@@ -242,11 +268,11 @@ export default function MatchCentre() {
       innings2Team: inn2Team,
       innings1: inn1,
       innings2: inn2,
-      wicketCap: match?.wicket_cap,
+      wicketCap: displayWicketCap,
     });
-  }, [derivedStatus, inn1Team, inn2Team, inn1, inn2]);
+  }, [derivedStatus, inn1Team, inn2Team, inn1, inn2, displayWicketCap]);
 
-const activeBalls = useMemo(() => {
+  const activeBalls = useMemo(() => {
     if (activeInnings === 2) return inn2Balls;
     return inn1Balls;
   }, [activeInnings, inn1Balls, inn2Balls]);
@@ -318,6 +344,9 @@ const activeBalls = useMemo(() => {
             </div>
             <div style={{ fontSize: 13, opacity: 0.75, marginTop: 2 }}>
               {teamB?.name || "Team B"}: {inn2 ? `${inn2.runs}/${inn2.wkts} (${inn2.overs} ov)` : "—"}
+            </div>
+            <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
+              Wicket cap {displayWicketCap}
             </div>
           </div>
 
@@ -409,7 +438,7 @@ const activeBalls = useMemo(() => {
               Partnerships — {activeInnings === 1 ? teamA?.name : teamB?.name}
             </div>
             <div style={{ padding: 12 }}>
-              <Partnerships balls={activeBalls} theme="light" />
+              <Partnerships balls={activeBalls} playersById={playersById} theme="light" />
             </div>
           </div>
         ) : null}

@@ -88,6 +88,24 @@ export default function ScoreHome() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    let alive = true;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (!alive) return;
+      setUser(data?.session?.user || null);
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user || null);
+    });
+
+    return () => {
+      alive = false;
+      sub.subscription.unsubscribe();
+    };
+  }, []);
+
   const formatTeam = (team) => {
     if (!team) return "—";
     return team.short_name ? `${team.name} (${team.short_name})` : team.name;
@@ -100,7 +118,11 @@ export default function ScoreHome() {
     setErr("");
     setInfo("");
 
-    if (!user?.id) {
+    const sess = await supabase.auth.getSession();
+    const currentUser = sess?.data?.session?.user || null;
+    setUser(currentUser);
+
+    if (!currentUser?.id) {
       setErr("You must be logged in to create fixtures.");
       return;
     }
@@ -136,7 +158,7 @@ export default function ScoreHome() {
         team_b_id: newTeamB,
         overs_limit: overs,
         status: "scheduled",
-        scorer_user_id: user.id,
+        scorer_user_id: currentUser.id,
       })
       .select(
         `

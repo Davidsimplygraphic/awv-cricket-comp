@@ -24,6 +24,31 @@ export function resolveWicketCap(value, fallback = 10) {
   return Math.max(1, next);
 }
 
+export function deriveRosterWicketCap(players = [], teamIds = []) {
+  const relevantTeams = new Set((teamIds || []).filter(Boolean));
+  if (!relevantTeams.size) return null;
+
+  const counts = new Map();
+  for (const player of players || []) {
+    if (!player?.team_id || !relevantTeams.has(player.team_id)) continue;
+    if (player?.active === false) continue;
+    counts.set(player.team_id, (counts.get(player.team_id) || 0) + 1);
+  }
+
+  const maxPlayers = Math.max(...[...relevantTeams].map((teamId) => counts.get(teamId) || 0));
+  return maxPlayers > 0 ? Math.max(1, maxPlayers - 1) : null;
+}
+
+export function resolveDisplayWicketCap({
+  fixtureWicketCap = null,
+  matchWicketCap = null,
+  rosterWicketCap = null,
+  fallback = 10,
+} = {}) {
+  const preferred = fixtureWicketCap ?? matchWicketCap ?? rosterWicketCap;
+  return resolveWicketCap(preferred, rosterWicketCap ?? fallback);
+}
+
 export function isAdministrativeBall(ball) {
   return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
 }

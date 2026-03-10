@@ -1,5 +1,5 @@
 BEGIN;
-SELECT plan(20);
+SELECT plan(24);
 
 SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000111', true);
 SELECT set_config('request.jwt.claim.role', 'authenticated', true);
@@ -38,6 +38,48 @@ VALUES (
   '00000000-0000-0000-0000-000000000111'
 );
 
+INSERT INTO public.matches (
+  id,
+  fixture_id,
+  team_a_id,
+  team_b_id,
+  overs_limit,
+  wicket_cap,
+  status,
+  scorer_user_id
+)
+VALUES (
+  '00000000-0000-0000-0000-000000000403',
+  '00000000-0000-0000-0000-000000000404',
+  '00000000-0000-0000-0000-000000000201',
+  '00000000-0000-0000-0000-000000000202',
+  2,
+  10,
+  'scheduled',
+  '00000000-0000-0000-0000-000000000111'
+);
+
+INSERT INTO public.matches (
+  id,
+  fixture_id,
+  team_a_id,
+  team_b_id,
+  overs_limit,
+  wicket_cap,
+  status,
+  scorer_user_id
+)
+VALUES (
+  '00000000-0000-0000-0000-000000000405',
+  '00000000-0000-0000-0000-000000000406',
+  '00000000-0000-0000-0000-000000000201',
+  '00000000-0000-0000-0000-000000000202',
+  2,
+  10,
+  'scheduled',
+  '00000000-0000-0000-0000-000000000999'
+);
+
 INSERT INTO public.innings (
   id,
   match_id,
@@ -68,6 +110,44 @@ SELECT is(
   auth.uid()::text,
   '00000000-0000-0000-0000-000000000111',
   'db tests run with a seeded authenticated scorer id'
+);
+
+SELECT is(
+  (public.get_or_create_match_innings(
+    '00000000-0000-0000-0000-000000000403',
+    1
+  )).batting_team_id::text,
+  '00000000-0000-0000-0000-000000000201',
+  'owner-scoped innings creation uses team A batting for innings 1'
+);
+
+SELECT is(
+  (public.get_or_create_match_innings(
+    '00000000-0000-0000-0000-000000000403',
+    2
+  )).batting_team_id::text,
+  '00000000-0000-0000-0000-000000000202',
+  'owner-scoped innings creation uses team B batting for innings 2'
+);
+
+SELECT is(
+  (public.get_or_create_match_innings(
+    '00000000-0000-0000-0000-000000000403',
+    1
+  )).id::text,
+  (SELECT id::text FROM public.innings WHERE match_id = '00000000-0000-0000-0000-000000000403' AND innings_no = 1),
+  'get_or_create_match_innings reuses the existing innings row idempotently'
+);
+
+SELECT throws_ok(
+  $$
+    SELECT public.get_or_create_match_innings(
+      '00000000-0000-0000-0000-000000000405',
+      1
+    );
+  $$,
+  'Only the assigned scorer can create or access innings for this match',
+  'get_or_create_match_innings rejects non-owner access'
 );
 
 SELECT is(

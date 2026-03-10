@@ -4,8 +4,9 @@ import { supabase } from "../lib/supabase";
 import {
   buildCompletedResultText,
   buildInningsTotals,
+  deriveRosterWicketCap,
   deriveMatchDisplayStatus,
-  resolveWicketCap,
+  resolveDisplayWicketCap,
   toInt,
 } from "../lib/scoring";
 
@@ -39,6 +40,8 @@ export default function Fixtures() {
   const [matches, setMatches] = useState([]); // match rows
   const [inningsByMatch, setInningsByMatch] = useState(new Map()); // matchId -> {1: inningsRow, 2: inningsRow}
   const [ballsByInnings, setBallsByInnings] = useState(new Map()); // inningsId -> balls
+  const [fixtureWicketCaps, setFixtureWicketCaps] = useState(new Map()); // fixtureId -> wicket cap
+  const [players, setPlayers] = useState([]); // active players for roster fallback
 
   useEffect(() => {
     let alive = true;
@@ -78,6 +81,42 @@ export default function Fixtures() {
 
       const rows = (m.data || []).slice();
       setMatches(rows);
+
+      const fixtureIds = rows.map((r) => r.fixture_id || r.id).filter(Boolean);
+      if (fixtureIds.length) {
+        const caps = await supabase
+          .from("fixture_wicket_caps")
+          .select("fixture_id,wicket_cap")
+          .in("fixture_id", fixtureIds);
+
+        if (!alive) return;
+        if (!caps.error) {
+          const capMap = new Map();
+          for (const row of caps.data || []) {
+            if (row?.fixture_id) capMap.set(row.fixture_id, row.wicket_cap ?? null);
+          }
+          setFixtureWicketCaps(capMap);
+        } else {
+          setFixtureWicketCaps(new Map());
+        }
+      } else {
+        setFixtureWicketCaps(new Map());
+      }
+
+      const teamIds = [...new Set(rows.flatMap((r) => [r.team_a_id, r.team_b_id]).filter(Boolean))];
+      if (teamIds.length) {
+        const p = await supabase
+          .from("players")
+          .select("id,team_id,active")
+          .in("team_id", teamIds)
+          .eq("active", true);
+
+        if (!alive) return;
+        if (!p.error) setPlayers(p.data || []);
+        else setPlayers([]);
+      } else {
+        setPlayers([]);
+      }
 
       const matchIds = rows.map((r) => r.id).filter(Boolean);
 
@@ -170,6 +209,13 @@ export default function Fixtures() {
 
       const inn1Balls = inn1Row ? ballsByInnings.get(inn1Row.id) || [] : [];
       const inn2Balls = inn2Row ? ballsByInnings.get(inn2Row.id) || [] : [];
+      const rosterWicketCap = deriveRosterWicketCap(players, [teamA?.id, teamB?.id]);
+      const displayWicketCap = resolveDisplayWicketCap({
+        fixtureWicketCap: fixtureWicketCaps.get(fixtureId) ?? null,
+        matchWicketCap: m.wicket_cap,
+        rosterWicketCap,
+        fallback: 10,
+      });
 
       const displayStatus = deriveMatchDisplayStatus({
         matchStatus: m.status,
@@ -178,7 +224,7 @@ export default function Fixtures() {
         innings1Balls: inn1Balls,
         innings2Balls: inn2Balls,
         oversLimit: m.overs_limit,
-        wicketCap: m.wicket_cap,
+        wicketCap: displayWicketCap,
       });
 
       const inn1 = inn1Row ? buildInningsTotals(inn1Row, inn1Balls) : null;
@@ -190,7 +236,7 @@ export default function Fixtures() {
         innings2Team: inn2Team,
         innings1: inn1,
         innings2: inn2,
-        wicketCap: m.wicket_cap,
+        wicketCap: displayWicketCap,
       });
 
       out.push({
@@ -202,7 +248,7 @@ export default function Fixtures() {
         inn1Team,
         inn2Team,
         oversLimit: toInt(m.overs_limit, 20),
-        wicketCap: resolveWicketCap(m.wicket_cap, 10),
+        wicketCap: displayWicketCap,
         timeLabel: formatTime(m.scheduled_at),
         status: displayStatus || "",
         inn1,
@@ -213,7 +259,7 @@ export default function Fixtures() {
 
     out.sort((a, b) => new Date(matches.find(m=>m.id===a.matchId)?.scheduled_at || 0).getTime() - new Date(matches.find(m=>m.id===b.matchId)?.scheduled_at || 0).getTime());
     return out;
-  }, [matches, inningsByMatch, ballsByInnings]);
+  }, [matches, inningsByMatch, ballsByInnings, fixtureWicketCaps, players]);
 
   const dateGroups = useMemo(() => {
     const g = new Map();
