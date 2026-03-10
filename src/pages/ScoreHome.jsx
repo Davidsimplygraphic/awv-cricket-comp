@@ -254,7 +254,6 @@ export default function ScoreHome() {
       .single();
 
     setSaving(false);
-    setBusyId("");
 
     if (res.error) {
       setErr(`Update error: ${res.error.message}`);
@@ -284,6 +283,48 @@ export default function ScoreHome() {
     if (!confirm(`Delete match: ${label}?\n\nThis will delete innings and balls too.`)) return;
 
     setBusyId(match.id);
+
+    const legacyDeleteMatch = async () => {
+      const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
+      if (delBalls.error) {
+        throw new Error(`Delete balls error: ${delBalls.error.message}`);
+      }
+
+      const delInnings = await supabase.from("innings").delete().eq("match_id", match.id);
+      if (delInnings.error) {
+        throw new Error(`Delete innings error: ${delInnings.error.message}`);
+      }
+
+      const delMatch = await supabase.from("matches").delete().eq("id", match.id);
+      if (delMatch.error) {
+        throw new Error(`Delete match error: ${delMatch.error.message}`);
+      }
+    };
+
+    try {
+      const { error } = await supabase.rpc("delete_match_state", {
+        p_match_id: match.id,
+        p_client_session_id: null,
+      });
+
+      if (error) {
+        if (isMissingRpcError(error)) {
+          await legacyDeleteMatch();
+        } else {
+          throw new Error(`Delete match error: ${error.message}`);
+        }
+      }
+
+      setMatches((prev) => prev.filter((m) => m.id !== match.id));
+      setBusyId("");
+      setInfo("Match deleted.");
+      if (editingId === match.id) cancelEdit();
+      return;
+    } catch (error) {
+      setBusyId("");
+      setErr(String(error?.message || error || "Match delete failed."));
+      return;
+    }
 
     // 1) delete balls
     const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
@@ -338,43 +379,58 @@ This will delete ALL balls + innings for this match, clear any selected playing 
 
     setBusyId(match.id);
 
-    // 1) delete balls
-    const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
-    if (delBalls.error) {
+    const legacyResetMatch = async () => {
+      const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
+      if (delBalls.error) {
+        throw new Error(`Reset balls error: ${delBalls.error.message}`);
+      }
+
+      const delInnings = await supabase.from("innings").delete().eq("match_id", match.id);
+      if (delInnings.error) {
+        throw new Error(`Reset innings error: ${delInnings.error.message}`);
+      }
+
+      const fid = match.fixture_id || match.id;
+      if (fid) {
+        const delSq = await supabase.from("match_squads").delete().eq("fixture_id", fid);
+        if (delSq.error) console.warn("Reset: match_squads delete blocked", delSq.error.message);
+      }
+
+      const upd = await supabase.from("matches").update({ status: "scheduled", wicket_cap: null }).eq("id", match.id);
+      if (upd.error) {
+        throw new Error(`Reset match error: ${upd.error.message}`);
+      }
+    };
+
+    try {
+      const { error } = await supabase.rpc("reset_match_state", {
+        p_match_id: match.id,
+        p_client_session_id: null,
+        p_clear_squads: true,
+      });
+
+      if (error) {
+        if (isMissingRpcError(error)) {
+          await legacyResetMatch();
+        } else {
+          throw new Error(`Reset match error: ${error.message}`);
+        }
+      }
+
       setBusyId("");
-      setErr(`Reset balls error: ${delBalls.error.message}`);
+      setInfo("Match reset.");
+      load();
+      return;
+    } catch (error) {
+      setBusyId("");
+      setErr(String(error?.message || error || "Match reset failed."));
       return;
     }
 
-    // 2) delete innings
-    const delInnings = await supabase.from("innings").delete().eq("match_id", match.id);
-    if (delInnings.error) {
-      setBusyId("");
-      setErr(`Reset innings error: ${delInnings.error.message}`);
-      return;
-    }
-
-    // 3) clear selected squads (optional)
-    const fid = match.fixture_id || match.id;
-    if (fid) {
-      const delSq = await supabase.from("match_squads").delete().eq("fixture_id", fid);
-      // Don't hard-fail if RLS blocks this table in your setup
-      if (delSq.error) console.warn("Reset: match_squads delete blocked", delSq.error.message);
-    }
-
-    // 4) reset match status
-    const upd = await supabase.from("matches").update({ status: "scheduled", wicket_cap: null }).eq("id", match.id);
-    if (upd.error) {
-      setBusyId("");
-      setErr(`Reset match error: ${upd.error.message}`);
-      return;
-    }
 
     setBusyId("");
     setInfo("Match reset ✅");
 
-    // Reload list
-    load();
   };
 
   if (loading) return <div>Loading...</div>;
@@ -452,6 +508,7 @@ This will delete ALL balls + innings for this match, clear any selected playing 
           {matches.map((m) => {
             const isEditing = editingId === m.id;
             const isBusy = busyId === m.id;
+            const isOwner = isMatchOwner(m);
 
             return (
               <div key={m.id} style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
@@ -470,18 +527,22 @@ This will delete ALL balls + innings for this match, clear any selected playing 
                       <Link to={`/score/${m.fixture_id || m.id}`}>Open scorer</Link>
                       <Link to={`/match/${m.fixture_id || m.id}`}>Open spectator</Link>
 
-                      {user?.id && m.scorer_user_id === user.id ? (
+                      {isOwner ? (
                         <button onClick={() => resetMatch(m)} disabled={creating || saving || isBusy} style={{ color: "#b91c1c" }}>
                           {isBusy ? "Working..." : "Reset"}
                         </button>
                       ) : null}
 
-                      <button onClick={() => startEdit(m)} disabled={creating || saving || isBusy}>
-                        Edit
-                      </button>
-                      <button onClick={() => deleteMatch(m)} disabled={creating || saving || isBusy} style={{ color: "crimson" }}>
-                        {isBusy ? "Deleting..." : "Delete"}
-                      </button>
+                      {isOwner ? (
+                        <>
+                          <button onClick={() => startEdit(m)} disabled={creating || saving || isBusy}>
+                            Edit
+                          </button>
+                          <button onClick={() => deleteMatch(m)} disabled={creating || saving || isBusy} style={{ color: "crimson" }}>
+                            {isBusy ? "Deleting..." : "Delete"}
+                          </button>
+                        </>
+                      ) : null}
                     </div>
 
                     <div style={{ marginTop: 6, color: "#999", fontSize: 12 }}>

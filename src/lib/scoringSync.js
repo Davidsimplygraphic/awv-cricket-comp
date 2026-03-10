@@ -1,4 +1,4 @@
-import { mergeBallIntoList, sortBallsByPosition, updateBallInList } from "./scoring";
+import { mergeBallIntoList, sortBallsByPosition, updateBallInList } from "./scoring.js";
 
 let lastClientOrder = 0;
 
@@ -125,21 +125,34 @@ export function applyRpcResultToState({ balls = [], innings = null, event, resul
   const normalized = normalizePendingEvent(event);
   if (!normalized) return { balls: sortBallsByPosition(balls), innings };
 
-  if ((normalized.event_type === "add_ball" || normalized.event_type === "edit_ball") && result?.ball) {
+  const resolvedBall = result?.ball || result?.result?.ball || null;
+  const resolvedInnings = result?.innings || result?.result?.innings || null;
+  const resolvedPostState = result?.post_state || result?.result?.post_state || null;
+  const invalidatesPostState = result?.invalidate_post_state === true || result?.result?.invalidate_post_state === true;
+
+  if ((normalized.event_type === "add_ball" || normalized.event_type === "edit_ball") && resolvedBall) {
     return {
-      balls: mergeBallIntoList(balls, result.ball),
-      innings,
+      balls: mergeBallIntoList(balls, resolvedBall),
+      innings: resolvedInnings || innings,
+      postState: invalidatesPostState ? null : resolvedPostState,
+      invalidatesPostState,
     };
   }
 
-  if ((normalized.event_type === "end_innings" || normalized.event_type === "reopen_innings") && result?.innings) {
+  if ((normalized.event_type === "end_innings" || normalized.event_type === "reopen_innings") && resolvedInnings) {
     return {
       balls: sortBallsByPosition(balls),
-      innings: result.innings,
+      innings: resolvedInnings,
+      postState: invalidatesPostState ? null : resolvedPostState,
+      invalidatesPostState,
     };
   }
 
-  return applyEventOptimistically({ balls, innings, event: normalized });
+  return {
+    ...applyEventOptimistically({ balls, innings, event: normalized }),
+    postState: invalidatesPostState ? null : resolvedPostState,
+    invalidatesPostState,
+  };
 }
 
 export function replayPendingEventsOnState({ balls = [], innings = null, queue = [], inningsId = null }) {

@@ -7,6 +7,7 @@ revoke insert, update, delete on table public.teams from anon;
 
 alter table public.match_scorer_sessions enable row level security;
 alter table public.match_session_events enable row level security;
+alter table public.balls add column if not exists updated_at timestamp with time zone not null default now();
 
 revoke all on table public.match_scorer_sessions from anon;
 revoke all on table public.match_scorer_sessions from authenticated;
@@ -160,6 +161,16 @@ declare
   v_patch jsonb;
   v_target_ball_id uuid;
   v_target_source_event_id text;
+  v_effective_extra_type text;
+  v_effective_extra_runs integer;
+  v_effective_legal_ball boolean;
+  v_legal_balls integer := 0;
+  v_wickets integer := 0;
+  v_total_runs integer := 0;
+  v_first_innings_runs integer := 0;
+  v_boundary_event_type text;
+  v_should_complete boolean := false;
+  v_post_state jsonb;
   v_error_message text;
   v_active_lock record;
 begin
@@ -234,11 +245,19 @@ begin
       'duplicate', true,
       'event_id', v_event.event_id,
       'event_type', v_event.event_type,
+      'ball', v_event.result -> 'ball',
+      'innings', v_event.result -> 'innings',
+      'post_state', v_event.result -> 'post_state',
+      'invalidate_post_state', coalesce((v_event.result ->> 'invalidate_post_state')::boolean, false),
       'result', coalesce(v_event.result, '{}'::jsonb)
     );
   end if;
 
   if p_event_type = 'add_ball' then
+    if coalesce(v_innings.completed, false) then
+      raise exception 'Cannot add a ball to a completed innings';
+    end if;
+
     insert into public.balls (
       match_id,
       innings_id,
@@ -285,64 +304,223 @@ begin
       limit 1;
     end if;
 
+    select
+      coalesce(sum(case when b.legal_ball = false then 0 else 1 end), 0),
+      coalesce(sum(case when coalesce(b.wicket, false) then 1 else 0 end), 0),
+      coalesce(sum(coalesce(b.runs_off_bat, 0) + coalesce(b.extra_runs, 0)), 0)
+      into v_legal_balls, v_wickets, v_total_runs
+    from public.balls b
+    where b.match_id = p_match_id
+      and b.innings_id = p_innings_id;
+
+    if v_innings.innings_no = 2 then
+      select coalesce(sum(coalesce(b.runs_off_bat, 0) + coalesce(b.extra_runs, 0)), 0)
+        into v_first_innings_runs
+      from public.balls b
+      join public.innings i on i.id = b.innings_id
+      where b.match_id = p_match_id
+        and i.match_id = p_match_id
+        and i.innings_no = 1;
+    else
+      v_first_innings_runs := 0;
+    end if;
+
+    select event_type
+      into v_boundary_event_type
+    from public.match_session_events
+    where match_id = p_match_id
+      and innings_id = p_innings_id
+      and status = 'applied'
+      and event_type in ('end_innings', 'reopen_innings')
+    order by applied_at desc nulls last, created_at desc
+    limit 1;
+
+    v_should_complete := (
+      v_legal_balls >= greatest(1, coalesce(v_match.overs_limit, 20)) * 6
+      or v_wickets >= greatest(1, coalesce(v_match.wicket_cap, 10))
+      or (v_innings.innings_no = 2 and v_total_runs >= (v_first_innings_runs + 1))
+    );
+
+    if coalesce(v_boundary_event_type, '') = 'end_innings' then
+      v_should_complete := true;
+    end if;
+
+    update public.innings
+    set completed = v_should_complete
+    where id = p_innings_id
+      and match_id = p_match_id
+    returning * into v_innings;
+
+    update public.matches
+    set status = case
+      when v_innings.innings_no = 2 and v_should_complete then 'completed'
+      else 'playing'
+    end
+    where id = p_match_id
+    returning * into v_match;
+
+    v_post_state := case
+      when jsonb_typeof(p_payload -> 'post_state') = 'object' then p_payload -> 'post_state'
+      else null
+    end;
+
     update public.match_session_events
     set status = 'applied',
         applied_at = now(),
-        result = jsonb_build_object('ball', to_jsonb(v_ball))
+        result = jsonb_strip_nulls(jsonb_build_object(
+          'ball', to_jsonb(v_ball),
+          'innings', to_jsonb(v_innings),
+          'post_state', v_post_state
+        ))
     where event_id = p_event_id;
 
-    return jsonb_build_object(
+    return jsonb_strip_nulls(jsonb_build_object(
       'ok', true,
       'duplicate', false,
       'event_id', p_event_id,
       'event_type', p_event_type,
-      'ball', to_jsonb(v_ball)
-    );
+      'ball', to_jsonb(v_ball),
+      'innings', to_jsonb(v_innings),
+      'post_state', v_post_state
+    ));
   elsif p_event_type = 'edit_ball' then
     v_patch := coalesce(p_payload -> 'patch', '{}'::jsonb);
     v_target_source_event_id := nullif(p_payload ->> 'target_source_event_id', '');
     v_target_ball_id := nullif(p_payload ->> 'ball_id', '')::uuid;
 
     if v_target_ball_id is not null then
-      update public.balls
-      set runs_off_bat = coalesce((v_patch ->> 'runs_off_bat')::integer, runs_off_bat),
-          extra_type = case when v_patch ? 'extra_type' then nullif(v_patch ->> 'extra_type', '') else extra_type end,
-          extra_runs = coalesce((v_patch ->> 'extra_runs')::integer, extra_runs),
-          wicket = coalesce((v_patch ->> 'wicket')::boolean, wicket),
-          dismissal_kind = case when v_patch ? 'dismissal_kind' then nullif(v_patch ->> 'dismissal_kind', '') else dismissal_kind end,
-          dismissed_player_id = case
-            when v_patch ? 'dismissed_player_id' then nullif(v_patch ->> 'dismissed_player_id', '')::uuid
-            else dismissed_player_id
-          end
+      select *
+        into v_ball
+      from public.balls
       where id = v_target_ball_id
         and match_id = p_match_id
-        and innings_id = p_innings_id
-      returning * into v_ball;
+        and innings_id = p_innings_id;
     elsif v_target_source_event_id is not null then
-      update public.balls
-      set runs_off_bat = coalesce((v_patch ->> 'runs_off_bat')::integer, runs_off_bat),
-          extra_type = case when v_patch ? 'extra_type' then nullif(v_patch ->> 'extra_type', '') else extra_type end,
-          extra_runs = coalesce((v_patch ->> 'extra_runs')::integer, extra_runs),
-          wicket = coalesce((v_patch ->> 'wicket')::boolean, wicket),
-          dismissal_kind = case when v_patch ? 'dismissal_kind' then nullif(v_patch ->> 'dismissal_kind', '') else dismissal_kind end,
-          dismissed_player_id = case
-            when v_patch ? 'dismissed_player_id' then nullif(v_patch ->> 'dismissed_player_id', '')::uuid
-            else dismissed_player_id
-          end
+      select *
+        into v_ball
+      from public.balls
       where source_event_id = v_target_source_event_id
         and match_id = p_match_id
-        and innings_id = p_innings_id
-      returning * into v_ball;
+        and innings_id = p_innings_id;
     end if;
 
     if v_ball.id is null then
       raise exception 'Target ball not found for edit event %', p_event_id;
     end if;
 
+    v_effective_extra_type := case
+      when v_patch ? 'extra_type' then nullif(v_patch ->> 'extra_type', '')
+      else v_ball.extra_type
+    end;
+
+    v_effective_extra_runs := case
+      when v_effective_extra_type = 'wide' then greatest(2, coalesce((v_patch ->> 'extra_runs')::integer, v_ball.extra_runs, 0))
+      when v_effective_extra_type = 'noball' then greatest(1, coalesce((v_patch ->> 'extra_runs')::integer, v_ball.extra_runs, 1))
+      when v_effective_extra_type in ('bye', 'legbye') then greatest(0, coalesce((v_patch ->> 'extra_runs')::integer, v_ball.extra_runs, 0))
+      else 0
+    end;
+
+    select case
+      when v_effective_extra_type in ('wide', 'noball') then exists (
+        select 1
+        from public.balls b
+        where b.match_id = p_match_id
+          and b.innings_id = p_innings_id
+          and b.over_no = v_ball.over_no
+          and b.delivery_in_over < v_ball.delivery_in_over
+          and b.legal_ball = false
+      )
+      else true
+    end
+    into v_effective_legal_ball;
+
+    update public.balls
+    set runs_off_bat = case
+          when v_effective_extra_type in ('wide', 'bye', 'legbye') then 0
+          else coalesce((v_patch ->> 'runs_off_bat')::integer, v_ball.runs_off_bat, 0)
+        end,
+        extra_type = v_effective_extra_type,
+        extra_runs = v_effective_extra_runs,
+        legal_ball = v_effective_legal_ball,
+        wicket = coalesce((v_patch ->> 'wicket')::boolean, v_ball.wicket),
+        dismissal_kind = case
+          when coalesce((v_patch ->> 'wicket')::boolean, v_ball.wicket) = false then null
+          when v_patch ? 'dismissal_kind' then nullif(v_patch ->> 'dismissal_kind', '')
+          else v_ball.dismissal_kind
+        end,
+        dismissed_player_id = case
+          when coalesce((v_patch ->> 'wicket')::boolean, v_ball.wicket) = false then null
+          when v_patch ? 'dismissed_player_id' then nullif(v_patch ->> 'dismissed_player_id', '')::uuid
+          else v_ball.dismissed_player_id
+        end,
+        updated_at = now()
+    where id = v_ball.id
+    returning * into v_ball;
+
+    select
+      coalesce(sum(case when b.legal_ball = false then 0 else 1 end), 0),
+      coalesce(sum(case when coalesce(b.wicket, false) then 1 else 0 end), 0),
+      coalesce(sum(coalesce(b.runs_off_bat, 0) + coalesce(b.extra_runs, 0)), 0)
+      into v_legal_balls, v_wickets, v_total_runs
+    from public.balls b
+    where b.match_id = p_match_id
+      and b.innings_id = p_innings_id;
+
+    if v_innings.innings_no = 2 then
+      select coalesce(sum(coalesce(b.runs_off_bat, 0) + coalesce(b.extra_runs, 0)), 0)
+        into v_first_innings_runs
+      from public.balls b
+      join public.innings i on i.id = b.innings_id
+      where b.match_id = p_match_id
+        and i.match_id = p_match_id
+        and i.innings_no = 1;
+    else
+      v_first_innings_runs := 0;
+    end if;
+
+    select event_type
+      into v_boundary_event_type
+    from public.match_session_events
+    where match_id = p_match_id
+      and innings_id = p_innings_id
+      and status = 'applied'
+      and event_type in ('end_innings', 'reopen_innings')
+    order by applied_at desc nulls last, created_at desc
+    limit 1;
+
+    v_should_complete := (
+      v_legal_balls >= greatest(1, coalesce(v_match.overs_limit, 20)) * 6
+      or v_wickets >= greatest(1, coalesce(v_match.wicket_cap, 10))
+      or (v_innings.innings_no = 2 and v_total_runs >= (v_first_innings_runs + 1))
+    );
+
+    if coalesce(v_boundary_event_type, '') = 'end_innings' then
+      v_should_complete := true;
+    end if;
+
+    update public.innings
+    set completed = v_should_complete
+    where id = p_innings_id
+      and match_id = p_match_id
+    returning * into v_innings;
+
+    update public.matches
+    set status = case
+      when v_innings.innings_no = 2 and v_should_complete then 'completed'
+      when exists (select 1 from public.balls where match_id = p_match_id) then 'playing'
+      else 'scheduled'
+    end
+    where id = p_match_id
+    returning * into v_match;
+
     update public.match_session_events
     set status = 'applied',
         applied_at = now(),
-        result = jsonb_build_object('ball', to_jsonb(v_ball))
+        result = jsonb_build_object(
+          'ball', to_jsonb(v_ball),
+          'innings', to_jsonb(v_innings),
+          'invalidate_post_state', true
+        )
     where event_id = p_event_id;
 
     return jsonb_build_object(
@@ -350,7 +528,9 @@ begin
       'duplicate', false,
       'event_id', p_event_id,
       'event_type', p_event_type,
-      'ball', to_jsonb(v_ball)
+      'ball', to_jsonb(v_ball),
+      'innings', to_jsonb(v_innings),
+      'invalidate_post_state', true
     );
   elsif p_event_type = 'end_innings' then
     update public.innings
@@ -358,6 +538,13 @@ begin
     where id = p_innings_id
       and match_id = p_match_id
     returning * into v_innings;
+
+    update public.matches
+    set status = case
+      when v_innings.innings_no = 2 then 'completed'
+      else 'playing'
+    end
+    where id = p_match_id;
 
     update public.match_session_events
     set status = 'applied',
@@ -378,6 +565,13 @@ begin
     where id = p_innings_id
       and match_id = p_match_id
     returning * into v_innings;
+
+    update public.matches
+    set status = case
+      when exists (select 1 from public.balls where match_id = p_match_id) then 'playing'
+      else 'scheduled'
+    end
+    where id = p_match_id;
 
     update public.match_session_events
     set status = 'applied',
@@ -406,6 +600,90 @@ exception
     raise;
 end;
 $function$;
+
+create or replace function public.get_innings_recovery_state(
+  p_match_id uuid,
+  p_innings_id uuid
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = 'public'
+as $function$
+declare
+  v_match public.matches%rowtype;
+  v_innings public.innings%rowtype;
+  v_latest public.match_session_events%rowtype;
+  v_latest_with_state public.match_session_events%rowtype;
+begin
+  if auth.uid() is null then
+    raise exception 'authenticated scorer session required';
+  end if;
+
+  select *
+    into v_match
+  from public.matches
+  where id = p_match_id;
+
+  if v_match.id is null then
+    raise exception 'match_id is required';
+  end if;
+
+  if v_match.scorer_user_id is distinct from auth.uid() then
+    raise exception 'Only the assigned scorer can recover innings state for this match';
+  end if;
+
+  select *
+    into v_innings
+  from public.innings
+  where id = p_innings_id
+    and match_id = p_match_id;
+
+  if v_innings.id is null then
+    raise exception 'innings_id % does not belong to match %', p_innings_id, p_match_id;
+  end if;
+
+  select *
+    into v_latest
+  from public.match_session_events
+  where match_id = p_match_id
+    and innings_id = p_innings_id
+    and status = 'applied'
+  order by applied_at desc nulls last, created_at desc
+  limit 1;
+
+  if v_latest.id is not null and coalesce((v_latest.result ->> 'invalidate_post_state')::boolean, false) then
+    return jsonb_build_object(
+      'ok', true,
+      'innings', to_jsonb(v_innings),
+      'recovery_state', null,
+      'state_invalidated', true,
+      'event_id', v_latest.event_id
+    );
+  end if;
+
+  select *
+    into v_latest_with_state
+  from public.match_session_events
+  where match_id = p_match_id
+    and innings_id = p_innings_id
+    and status = 'applied'
+    and result ? 'post_state'
+  order by applied_at desc nulls last, created_at desc
+  limit 1;
+
+  return jsonb_build_object(
+    'ok', true,
+    'innings', to_jsonb(v_innings),
+    'recovery_state', coalesce(v_latest_with_state.result -> 'post_state', 'null'::jsonb),
+    'state_invalidated', false,
+    'event_id', v_latest_with_state.event_id
+  );
+end;
+$function$;
+
+revoke execute on function public.get_innings_recovery_state(uuid, uuid) from public;
+grant execute on function public.get_innings_recovery_state(uuid, uuid) to authenticated;
 
 create or replace function public.heartbeat_match_scorer_lock(
   p_match_id uuid,
@@ -541,3 +819,141 @@ begin
   );
 end;
 $function$;
+
+create or replace function public.reset_match_state(
+  p_match_id uuid,
+  p_client_session_id text default null,
+  p_clear_squads boolean default true
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = 'public'
+as $function$
+declare
+  v_match public.matches%rowtype;
+  v_active public.match_scorer_sessions%rowtype;
+begin
+  if auth.uid() is null then
+    raise exception 'authenticated scorer session required';
+  end if;
+
+  select *
+    into v_match
+  from public.matches
+  where id = p_match_id;
+
+  if v_match.id is null then
+    raise exception 'match_id is required';
+  end if;
+
+  if v_match.scorer_user_id is distinct from auth.uid() then
+    raise exception 'Only the assigned scorer can reset this match';
+  end if;
+
+  select *
+    into v_active
+  from public.match_scorer_sessions
+  where match_id = p_match_id
+    and status = 'active'
+  order by created_at desc
+  limit 1
+  for update;
+
+  if v_active.id is not null and coalesce(v_active.client_session_id, '') <> coalesce(p_client_session_id, '') then
+    raise exception 'Match is locked by another scorer session';
+  end if;
+
+  delete from public.match_scorer_sessions
+  where match_id = p_match_id;
+
+  delete from public.match_session_events
+  where match_id = p_match_id;
+
+  delete from public.balls
+  where match_id = p_match_id;
+
+  delete from public.innings
+  where match_id = p_match_id;
+
+  if coalesce(p_clear_squads, false) and v_match.fixture_id is not null then
+    delete from public.match_squads
+    where fixture_id = v_match.fixture_id;
+  end if;
+
+  update public.matches
+  set status = 'scheduled',
+      wicket_cap = null
+  where id = p_match_id
+  returning * into v_match;
+
+  return jsonb_build_object(
+    'ok', true,
+    'match', to_jsonb(v_match)
+  );
+end;
+$function$;
+
+revoke execute on function public.reset_match_state(uuid, text, boolean) from public;
+grant execute on function public.reset_match_state(uuid, text, boolean) to authenticated;
+
+create or replace function public.delete_match_state(
+  p_match_id uuid,
+  p_client_session_id text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = 'public'
+as $function$
+declare
+  v_match public.matches%rowtype;
+  v_active public.match_scorer_sessions%rowtype;
+begin
+  if auth.uid() is null then
+    raise exception 'authenticated scorer session required';
+  end if;
+
+  select *
+    into v_match
+  from public.matches
+  where id = p_match_id;
+
+  if v_match.id is null then
+    raise exception 'match_id is required';
+  end if;
+
+  if v_match.scorer_user_id is distinct from auth.uid() then
+    raise exception 'Only the assigned scorer can delete this match';
+  end if;
+
+  select *
+    into v_active
+  from public.match_scorer_sessions
+  where match_id = p_match_id
+    and status = 'active'
+  order by created_at desc
+  limit 1
+  for update;
+
+  if v_active.id is not null and coalesce(v_active.client_session_id, '') <> coalesce(p_client_session_id, '') then
+    raise exception 'Match is locked by another scorer session';
+  end if;
+
+  if v_match.fixture_id is not null then
+    delete from public.match_squads
+    where fixture_id = v_match.fixture_id;
+  end if;
+
+  delete from public.matches
+  where id = p_match_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'match_id', p_match_id
+  );
+end;
+$function$;
+
+revoke execute on function public.delete_match_state(uuid, text) from public;
+grant execute on function public.delete_match_state(uuid, text) to authenticated;

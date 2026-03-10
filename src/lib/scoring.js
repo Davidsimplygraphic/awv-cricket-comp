@@ -144,7 +144,34 @@ export function sortBallsByPosition(balls) {
   });
 }
 
+export function ballVersionValue(ball) {
+  const value = ball?.updated_at || ball?.created_at || 0;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+export function preferNewerBall(existingBall, incomingBall) {
+  if (!existingBall) return incomingBall;
+  if (!incomingBall) return existingBall;
+
+  const existingVersion = ballVersionValue(existingBall);
+  const incomingVersion = ballVersionValue(incomingBall);
+
+  if (incomingVersion > existingVersion) return incomingBall;
+  if (incomingVersion < existingVersion) return existingBall;
+
+  if (!existingBall?.id && incomingBall?.id) return incomingBall;
+  if (existingBall?.id && !incomingBall?.id) return existingBall;
+
+  return incomingBall;
+}
+
 export function mergeBallIntoList(previousBalls, nextBall) {
+  const existingBall = (previousBalls || []).find((ball) => (
+    (nextBall?.id && ball?.id === nextBall.id)
+      || (nextBall?.source_event_id && ball?.source_event_id === nextBall.source_event_id)
+      || (nextBall?.local_temp_id && ball?.local_temp_id === nextBall.local_temp_id)
+  ));
   const filtered = (previousBalls || []).filter((ball) => {
     if (nextBall?.id && ball?.id === nextBall.id) return false;
     if (nextBall?.source_event_id && ball?.source_event_id === nextBall.source_event_id) return false;
@@ -152,7 +179,25 @@ export function mergeBallIntoList(previousBalls, nextBall) {
     return true;
   });
 
-  return sortBallsByPosition([...filtered, nextBall]);
+  return sortBallsByPosition([...filtered, preferNewerBall(existingBall, nextBall)]);
+}
+
+export function buildScorerPostState({
+  strikerId = "",
+  nonStrikerId = "",
+  strikerTurn = 1,
+  nonStrikerTurn = 1,
+  bowlerId = "",
+  needsNextBowler = false,
+} = {}) {
+  return {
+    striker_id: strikerId || null,
+    non_striker_id: nonStrikerId || null,
+    striker_turn: toInt(strikerTurn, 1) || 1,
+    non_striker_turn: toInt(nonStrikerTurn, 1) || 1,
+    bowler_id: bowlerId || null,
+    needs_next_bowler: !!needsNextBowler,
+  };
 }
 
 export function updateBallInList(previousBalls, target, patch) {

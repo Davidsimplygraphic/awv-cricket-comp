@@ -16,7 +16,7 @@ import {
   writeScoringSnapshot,
   writeScorerState,
 } from "../lib/scoringPersistence";
-import { didBatterFaceBall, mergeBallIntoList, runsConcededByBowler } from "../lib/scoring";
+import { buildScorerPostState, didBatterFaceBall, mergeBallIntoList, runsConcededByBowler } from "../lib/scoring";
 import {
   applyEventOptimistically,
   applyRpcResultToState,
@@ -316,10 +316,15 @@ export default function ScoreView() {
 
   const allOut = useMemo(() => wickets >= wicketCap, [wickets, wicketCap]);
   const oversDone = useMemo(() => legalBalls >= maxLegal, [legalBalls, maxLegal]);
+  const chaseComplete = useMemo(() => {
+    if (inningsNo !== 2) return false;
+    if (!(innings1Row?.completed || innings1Legal > 0)) return false;
+    return totalRuns >= (innings1Runs + 1);
+  }, [innings1Legal, innings1Row?.completed, innings1Runs, inningsNo, totalRuns]);
   const inningsCompletedFlag = useMemo(() => !!innings?.completed, [innings]);
   const inningsComplete = useMemo(
-    () => oversDone || allOut || inningsCompletedFlag,
-    [oversDone, allOut, inningsCompletedFlag]
+    () => oversDone || allOut || chaseComplete || inningsCompletedFlag,
+    [oversDone, allOut, chaseComplete, inningsCompletedFlag]
   );
 
   const nextPos = useMemo(() => computeNextPosition(balls), [balls]);
@@ -530,6 +535,55 @@ const setStrikerSelection = (playerId) => {
 const setNonStrikerSelection = (playerId) => {
   setNonStrikerId(playerId || "");
   setNonStrikerTurn(getTurnFor(playerId));
+};
+
+const clearLiveSelections = () => {
+  setStrikerSelection("");
+  setNonStrikerSelection("");
+  setBowlerId("");
+  setNeedsNextBowler(false);
+};
+
+const applyRecoveredScorerState = (state) => {
+  if (!state || typeof state !== "object") return false;
+
+  setStrikerSelection(state.striker_id || "");
+  setNonStrikerSelection(state.non_striker_id || "");
+  if (typeof state.striker_turn === "number") setStrikerTurn(toInt(state.striker_turn, 1) || 1);
+  if (typeof state.non_striker_turn === "number") setNonStrikerTurn(toInt(state.non_striker_turn, 1) || 1);
+  setBowlerId(state.bowler_id || "");
+  setNeedsNextBowler(!!state.needs_next_bowler);
+  return true;
+};
+
+const loadCanonicalRecoveryState = async (resolvedMatchId, resolvedInningsId) => {
+  if (!resolvedMatchId || !resolvedInningsId || !isOnline) {
+    return { recoveryState: null, stateInvalidated: false, missing: false };
+  }
+
+  const { data, error } = await supabase.rpc("get_innings_recovery_state", {
+    p_match_id: resolvedMatchId,
+    p_innings_id: resolvedInningsId,
+  });
+
+  if (error) {
+    if (isMissingRpcError(error)) {
+      return { recoveryState: null, stateInvalidated: false, missing: true };
+    }
+
+    if (isNetworkLikeError(error)) {
+      return { recoveryState: null, stateInvalidated: false, missing: false };
+    }
+
+    setErr(`Recovery state error: ${error.message}`);
+    return { recoveryState: null, stateInvalidated: false, missing: false };
+  }
+
+  return {
+    recoveryState: data?.recovery_state && typeof data.recovery_state === "object" ? data.recovery_state : null,
+    stateInvalidated: data?.state_invalidated === true,
+    missing: false,
+  };
 };
 
 const readStoredPendingQueue = (resolvedMatchId) => {
@@ -976,10 +1030,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       setInfo("");
       const storedSnapshot = readScoringSnapshot(matchSnapshotScope);
 
-      setStrikerSelection("");
-      setNonStrikerSelection("");
-      setBowlerId("");
-      setNeedsNextBowler(false);
+      clearLiveSelections();
       setNeedsWicketModal(false);
       setIncomingBatterId("");
       setDismissedPlayerId("");
@@ -1055,6 +1106,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       const sorted = sortBallsByPosition(restoredState.balls || []);
       setInnings(restoredState.innings || inn.data);
       setBalls(sorted);
+      const recovery = await loadCanonicalRecoveryState(matchId, inn.data.id);
 
       /* Do not reopen innings implicitly from the client.
       if (inn.data?.completed && sorted.length === 0) {
@@ -1068,21 +1120,23 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
         setInfo("Innings 2 is marked completed but has no balls. Click ‘Reopen innings’ to start scoring.");
       }
 
-      if (sorted.length) {
-        const last = sorted[sorted.length - 1];
-        if (last.striker_id) setStrikerSelection(last.striker_id);
-        if (last.non_striker_id) setNonStrikerSelection(last.non_striker_id);
-        if (last.bowler_id) setBowlerId(last.bowler_id);
-      }
-
       const storedScorerState = readScorerState(matchId, inn.data.id);
-      if (storedScorerState) {
+      if (recovery.stateInvalidated) {
+        clearScorerState(matchId, inn.data.id);
+        clearLiveSelections();
+        setInfo("Last delivery was edited. Re-select striker, non-striker, and bowler before scoring again.");
+      } else if (applyRecoveredScorerState(recovery.recoveryState)) {
+        // Canonical scorer state recovered from persisted event history.
+      } else if (storedScorerState) {
         if (storedScorerState.strikerId) setStrikerSelection(storedScorerState.strikerId);
         if (storedScorerState.nonStrikerId) setNonStrikerSelection(storedScorerState.nonStrikerId);
         if (typeof storedScorerState.strikerTurn === "number") setStrikerTurn(storedScorerState.strikerTurn);
         if (typeof storedScorerState.nonStrikerTurn === "number") setNonStrikerTurn(storedScorerState.nonStrikerTurn);
         if (storedScorerState.bowlerId !== undefined) setBowlerId(storedScorerState.bowlerId || "");
         setNeedsNextBowler(!!storedScorerState.needsNextBowler);
+      } else if (sorted.length && !recovery.missing) {
+        clearLiveSelections();
+        setInfo("Scoring totals were recovered, but the active batter/bowler state could not be proven. Re-select them before scoring.");
       }
 
       channel = supabase
@@ -1443,8 +1497,15 @@ const battingScorecardRows = useMemo(() => {
     const currentBowlerId = bowlerIdRef.current;
     const currentNextPos = computeNextPosition(currentBalls);
     const currentLastOverBowlerId = currentBalls[currentBalls.length - 1]?.bowler_id || "";
+    const currentChaseComplete =
+      currentInnings?.innings_no === 2 &&
+      !!innings1Row?.completed &&
+      sumRuns(currentBalls) >= (toInt(innings1Runs, 0) + 1);
     const currentInningsComplete =
-      legalBallsCount(currentBalls) >= maxLegal || sumWkts(currentBalls) >= wicketCap || !!currentInnings?.completed;
+      legalBallsCount(currentBalls) >= maxLegal
+      || sumWkts(currentBalls) >= wicketCap
+      || currentChaseComplete
+      || !!currentInnings?.completed;
 
     if (!currentInnings?.id) return { ok: false, msg: "Innings not loaded." };
     if (lockFeatureAvailable && scoringLocked) return { ok: false, msg: "Scoring is locked by another active scorer session." };
@@ -1486,6 +1547,7 @@ const battingScorecardRows = useMemo(() => {
     wicket = false,
     dismissal_kind = null,
     dismissed_player_id = null, // ✅ NEW
+    postStateOverride = null,
   }) => {
     setErr("");
     setInfo("");
@@ -1506,8 +1568,15 @@ const battingScorecardRows = useMemo(() => {
       const currentNonStrikerId = nonStrikerIdRef.current;
       const currentBowlerId = bowlerIdRef.current;
       const currentLegalBalls = legalBallsCount(currentBalls);
+      const currentChaseComplete =
+        currentInnings?.innings_no === 2 &&
+        !!innings1Row?.completed &&
+        sumRuns(currentBalls) >= (toInt(innings1Runs, 0) + 1);
       const currentInningsComplete =
-        currentLegalBalls >= maxLegal || sumWkts(currentBalls) >= wicketCap || !!currentInnings?.completed;
+        currentLegalBalls >= maxLegal
+        || sumWkts(currentBalls) >= wicketCap
+        || currentChaseComplete
+        || !!currentInnings?.completed;
       const pos = computeNextPosition(currentBalls);
 
       const overCountsBefore = getOverCounts(currentBalls, pos.over_no);
@@ -1573,6 +1642,63 @@ const battingScorecardRows = useMemo(() => {
   batting_turn,
 };
 
+      const previewEvent = {
+        created_at: new Date().toISOString(),
+        event_id: "preview-ball",
+        event_type: "add_ball",
+        innings_id: currentInnings.id,
+        match_id: matchId,
+        payload: {
+          ball: payload,
+        },
+      };
+
+      const nextBalls = applyEventOptimistically({
+        balls: currentBalls,
+        innings: currentInnings,
+        event: previewEvent,
+      }).balls;
+
+      const totalRunsOnBall = (payload.runs_off_bat || 0) + (payload.extra_runs || 0);
+      let nextStrikerId = currentStrikerId;
+      let nextNonStrikerId = currentNonStrikerId;
+
+      if (!payload.wicket && totalRunsOnBall % 2 === 1) {
+        [nextStrikerId, nextNonStrikerId] = [nextNonStrikerId, nextStrikerId];
+      }
+
+      const overCountsAfter = getOverCounts(nextBalls, payload.over_no);
+      const overFinishedAfter = isOverFinished(overCountsAfter);
+      const projectedRuns = sumRuns(nextBalls);
+      const projectedWickets = sumWkts(nextBalls);
+      const projectedLegalBalls = legalBallsCount(nextBalls);
+      const projectedChaseComplete =
+        currentInnings?.innings_no === 2 &&
+        !!innings1Row?.completed &&
+        projectedRuns >= (toInt(innings1Runs, 0) + 1);
+      const projectedInningsComplete =
+        projectedLegalBalls >= maxLegal
+        || projectedWickets >= wicketCap
+        || projectedChaseComplete
+        || !!currentInnings?.completed;
+      let nextBowlerId = currentBowlerId;
+      let nextNeedsNextBowler = false;
+
+      if (!payload.wicket && overFinishedAfter && !projectedInningsComplete) {
+        [nextStrikerId, nextNonStrikerId] = [nextNonStrikerId, nextStrikerId];
+        nextBowlerId = "";
+        nextNeedsNextBowler = true;
+      }
+
+      const postState = postStateOverride || buildScorerPostState({
+        strikerId: nextStrikerId,
+        nonStrikerId: nextNonStrikerId,
+        strikerTurn: getTurnFor(nextStrikerId),
+        nonStrikerTurn: getTurnFor(nextNonStrikerId),
+        bowlerId: nextBowlerId,
+        needsNextBowler: nextNeedsNextBowler,
+      });
+
       const event = {
         created_at: new Date().toISOString(),
         event_id: createEventId("ball"),
@@ -1581,6 +1707,7 @@ const battingScorecardRows = useMemo(() => {
         match_id: matchId,
         payload: {
           ball: payload,
+          post_state: postState,
         },
       };
 
