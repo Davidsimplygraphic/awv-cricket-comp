@@ -155,15 +155,6 @@ function sortBallsByPosition(balls) {
   return copy;
 }
 
-function mergeBallIntoList(prev, nextBall) {
-  const withoutTemp = (prev || []).filter((b) => {
-    if (nextBall?.local_temp_id && b?.local_temp_id === nextBall.local_temp_id) return false;
-    if (nextBall?.id && b?.id === nextBall.id) return false;
-    return true;
-  });
-  return sortBallsByPosition([...withoutTemp, nextBall]);
-}
-
 function countLegalBallsBowledBy(balls, bowlerId) {
   // Treat NULL as legal (legacy rows)
   return balls.filter((b) => b.bowler_id === bowlerId && b.legal_ball !== false).length;
@@ -250,57 +241,6 @@ async function loadSquadPlayers({ fixtureId, teamId }) {
 
   if (p2.error) return { data: null, error: p2.error };
   return { data: p2.data || [], error: null };
-}
-
-function getPendingQueueKey(matchId, inningsId) {
-  return `awv_pending_balls_${matchId || "unknown"}_${inningsId || "unknown"}`;
-}
-
-function readPendingQueue(matchId, inningsId) {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(getPendingQueueKey(matchId, inningsId));
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function writePendingQueue(matchId, inningsId, queue) {
-  if (typeof window === "undefined") return;
-  const key = getPendingQueueKey(matchId, inningsId);
-  if (!queue?.length) {
-    window.localStorage.removeItem(key);
-    return;
-  }
-  window.localStorage.setItem(key, JSON.stringify(queue));
-}
-
-
-function getScorerStateKey(matchId, inningsId) {
-  return `awv_scorer_state_${matchId || "unknown"}_${inningsId || "unknown"}`;
-}
-
-function readScorerState(matchId, inningsId) {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = window.localStorage.getItem(getScorerStateKey(matchId, inningsId));
-    const parsed = raw ? JSON.parse(raw) : null;
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeScorerState(matchId, inningsId, state) {
-  if (typeof window === "undefined" || !matchId || !inningsId) return;
-  const key = getScorerStateKey(matchId, inningsId);
-  if (!state) {
-    window.localStorage.removeItem(key);
-    return;
-  }
-  window.localStorage.setItem(key, JSON.stringify(state));
 }
 
 export default function ScoreView() {
@@ -2778,7 +2718,9 @@ You can then start scoring again from ball 1.`
                         {b.over_no}.{b.delivery_in_over}
                       </div>
                       {b.wicket ? <div style={{ marginTop: 4, fontSize: 11, color: "#ffb3b3" }}>{isAdministrativeBall(b) ? "RH" : "W"}</div> : null}
-                      {b._pending ? <div style={{ marginTop: 4, fontSize: 10, color: "#ffe4b0" }}>Pending</div> : null}
+                      {!b.id && b.local_temp_id ? (
+                        <div style={{ marginTop: 4, fontSize: 10, color: "#ffe4b0" }}>Pending</div>
+                      ) : null}
                       {b.batting_turn ? (
                         <div style={{ marginTop: 4, fontSize: 11, color: "rgba(232,238,252,0.65)" }}>T{b.batting_turn}</div>
                       ) : null}
