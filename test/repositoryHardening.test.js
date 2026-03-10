@@ -51,6 +51,13 @@ test("ScoreView loads or creates innings through the hardened RPC instead of a d
   assert.doesNotMatch(scoreView, /\.from\("innings"\)\.insert\(/);
 });
 
+test("ScoreView uses the hardened scorer-claim RPC instead of directly reassigning scorer_user_id", () => {
+  assert.match(scoreView, /rpc\("claim_match_scorer_ownership"/);
+  assert.match(scoreView, /Assign myself/);
+  assert.match(scoreView, /Take over scoring/);
+  assert.doesNotMatch(scoreView, /\.from\("matches"\)\.update\(\{\s*scorer_user_id:/);
+});
+
 test("retired hurt now uses an administrative state event instead of a fake delivery", () => {
   assert.match(scoreView, /ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE/);
   assert.match(scoreView, /action_type: "retired_hurt"/);
@@ -59,6 +66,12 @@ test("retired hurt now uses an administrative state event instead of a fake deli
 
 test("wicket scorer flow does not reference removed wicket-ended-over state", () => {
   assert.doesNotMatch(scoreView, /setWicketEndedOver/);
+});
+
+test("latest-ball edits reconcile actor state through the shared edit-selection helper", () => {
+  assert.match(scoreView, /reconcileLatestBallEditSelectionState/);
+  assert.match(scoreView, /describeLatestEditResolution/);
+  assert.doesNotMatch(scoreView, /Delivery updated\. Re-select striker, non-striker, and bowler before scoring again\."\);/);
 });
 
 test("ScoreView relies on shared scoring helpers instead of redefining scorer math locally", () => {

@@ -12,6 +12,7 @@ import {
   isBowlerCreditedWicket,
   legalBallsCount,
   normalizeDeliveryOutcome,
+  reconcileLatestBallEditSelectionState,
   resolveDisplayWicketCap,
   resolveWicketCap,
   runsConcededByBowler,
@@ -225,6 +226,130 @@ test("run out post-state follows completed runs before replacing the dismissed b
 
   assert.equal(postState.striker_id, "bat-2");
   assert.equal(postState.non_striker_id, "bat-3");
+});
+
+test("latest-ball edits preserve actor state when the updated outcome is fully deterministic", () => {
+  const originalBall = {
+    id: "ball-1",
+    over_no: 0,
+    delivery_in_over: 1,
+    legal_ball: true,
+    runs_off_bat: 1,
+    extra_runs: 0,
+    wicket: false,
+    striker_id: "bat-1",
+    non_striker_id: "bat-2",
+    bowler_id: "bowl-1",
+    batting_turn: 1,
+  };
+
+  const editedBall = {
+    ...originalBall,
+    runs_off_bat: 2,
+  };
+
+  const resolution = reconcileLatestBallEditSelectionState({
+    originalBall,
+    editedBall,
+    ballsAfterEdit: [editedBall],
+    preEditPostState: {
+      striker_id: "bat-2",
+      non_striker_id: "bat-1",
+      bowler_id: "bowl-1",
+      needs_next_bowler: false,
+    },
+    inningsCompleted: false,
+  });
+
+  assert.equal(resolution.battingAmbiguous, false);
+  assert.equal(resolution.bowlerAmbiguous, false);
+  assert.equal(resolution.strikerId, "bat-1");
+  assert.equal(resolution.nonStrikerId, "bat-2");
+  assert.equal(resolution.bowlerId, "bowl-1");
+});
+
+test("latest-ball edits only clear batting selections when a new wicket would need an unknown incoming batter", () => {
+  const originalBall = {
+    id: "ball-2",
+    over_no: 0,
+    delivery_in_over: 2,
+    legal_ball: true,
+    runs_off_bat: 0,
+    extra_runs: 0,
+    wicket: false,
+    striker_id: "bat-1",
+    non_striker_id: "bat-2",
+    bowler_id: "bowl-1",
+    batting_turn: 1,
+  };
+
+  const editedBall = {
+    ...originalBall,
+    wicket: true,
+    dismissal_kind: "bowled",
+    dismissed_player_id: "bat-1",
+  };
+
+  const resolution = reconcileLatestBallEditSelectionState({
+    originalBall,
+    editedBall,
+    ballsAfterEdit: [editedBall],
+    preEditPostState: {
+      striker_id: "bat-1",
+      non_striker_id: "bat-2",
+      bowler_id: "bowl-1",
+      needs_next_bowler: false,
+    },
+    inningsCompleted: false,
+  });
+
+  assert.equal(resolution.battingAmbiguous, true);
+  assert.equal(resolution.bowlerAmbiguous, false);
+  assert.equal(resolution.bowlerId, "bowl-1");
+});
+
+test("latest-ball edits can restore pre-ball batters when a wicket is edited away", () => {
+  const originalBall = {
+    id: "ball-3",
+    over_no: 0,
+    delivery_in_over: 3,
+    legal_ball: true,
+    runs_off_bat: 0,
+    extra_runs: 0,
+    wicket: true,
+    dismissal_kind: "bowled",
+    dismissed_player_id: "bat-1",
+    striker_id: "bat-1",
+    non_striker_id: "bat-2",
+    bowler_id: "bowl-1",
+    batting_turn: 1,
+  };
+
+  const editedBall = {
+    ...originalBall,
+    wicket: false,
+    dismissal_kind: null,
+    dismissed_player_id: null,
+    runs_off_bat: 0,
+  };
+
+  const resolution = reconcileLatestBallEditSelectionState({
+    originalBall,
+    editedBall,
+    ballsAfterEdit: [editedBall],
+    preEditPostState: {
+      striker_id: "bat-3",
+      non_striker_id: "bat-2",
+      bowler_id: "bowl-1",
+      needs_next_bowler: false,
+    },
+    inningsCompleted: false,
+  });
+
+  assert.equal(resolution.battingAmbiguous, false);
+  assert.equal(resolution.strikerId, "bat-1");
+  assert.equal(resolution.nonStrikerId, "bat-2");
+  assert.equal(resolution.bowlerId, "bowl-1");
 });
 
 test("shared scorer totals and bowler legal-ball counts ignore administrative balls", () => {

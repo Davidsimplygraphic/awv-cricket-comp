@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 
@@ -47,6 +47,23 @@ function titleCaseWords(value) {
     .filter(Boolean)
     .map((part) => (part.toLowerCase() === "lbw" ? "LBW" : `${part[0].toUpperCase()}${part.slice(1).toLowerCase()}`))
     .join(" ");
+}
+
+function compactTeamName(team) {
+  const full = String(team?.name || "").trim();
+  const short = String(team?.short_name || "").trim();
+
+  if (full && full.length <= 18) return full;
+  if (short && short.length >= 3 && short.length <= 12) return short;
+  if (!full) return short || "Team";
+
+  const words = full.split(/\s+/).filter(Boolean);
+  if (words.length >= 2) {
+    const pair = `${words[0]} ${words[1]}`;
+    if (pair.length <= 18) return pair;
+  }
+
+  return `${full.slice(0, 15).trim()}…`;
 }
 
 function describeBallValue(ball) {
@@ -177,8 +194,89 @@ async function loadFixtureWicketCap(fixtureId) {
   return cap.data?.wicket_cap ?? null;
 }
 
+function SpectatorStickyHeader({
+  visible,
+  teamLabel,
+  score,
+  oversText,
+  context,
+}) {
+  return (
+    <div
+      style={{
+        position: "sticky",
+        top: 10,
+        zIndex: 30,
+        height: visible ? 62 : 0,
+        overflow: "hidden",
+        transition: "height 180ms ease",
+        pointerEvents: visible ? "auto" : "none",
+      }}
+    >
+      <div
+        style={{
+          opacity: visible ? 1 : 0,
+          transform: visible ? "translateY(0)" : "translateY(-8px)",
+          transition: "opacity 180ms ease, transform 180ms ease",
+          borderRadius: 16,
+          border: "1px solid rgba(255,255,255,0.10)",
+          background: "rgba(8,14,26,0.88)",
+          backdropFilter: "blur(12px)",
+          boxShadow: "0 10px 28px rgba(0,0,0,0.28)",
+          padding: "10px 12px",
+          display: "grid",
+          gap: 4,
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
+          <div
+            style={{
+              minWidth: 0,
+              fontSize: 12,
+              fontWeight: 900,
+              color: "rgba(232,238,252,0.82)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {teamLabel}
+          </div>
+          <div style={{ fontSize: 19, fontWeight: 1050, whiteSpace: "nowrap", color: "rgba(255,255,255,0.96)" }}>
+            {score}
+          </div>
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 12,
+            fontSize: 11,
+            color: "rgba(232,238,252,0.70)",
+            whiteSpace: "nowrap",
+          }}
+        >
+          <span>{oversText} overs</span>
+          <span
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {context}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function SpectatorView() {
   const { fixtureId } = useParams();
+  const heroRef = useRef(null);
 
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
@@ -190,6 +288,10 @@ export default function SpectatorView() {
   const [players, setPlayers] = useState([]);
   const [activeTab, setActiveTab] = useState("live");
   const [activeInnings, setActiveInnings] = useState(1);
+  const [showStickyHeader, setShowStickyHeader] = useState(false);
+  const [isCompactViewport, setIsCompactViewport] = useState(
+    typeof window !== "undefined" ? window.innerWidth <= 960 : false
+  );
 
   useEffect(() => {
     let alive = true;
@@ -363,6 +465,48 @@ export default function SpectatorView() {
     };
   }, [fixtureId, match?.id]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const handleResize = () => {
+      setIsCompactViewport(window.innerWidth <= 960);
+    };
+
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (loading || !isCompactViewport) {
+      setShowStickyHeader(false);
+      return undefined;
+    }
+
+    const heroEl = heroRef.current;
+    if (!heroEl || typeof window === "undefined") return undefined;
+
+    if ("IntersectionObserver" in window) {
+      const observer = new IntersectionObserver(
+        ([entry]) => {
+          setShowStickyHeader(!entry.isIntersecting);
+        },
+        { threshold: 0.2 }
+      );
+      observer.observe(heroEl);
+      return () => observer.disconnect();
+    }
+
+    const onScroll = () => {
+      const rect = heroEl.getBoundingClientRect();
+      setShowStickyHeader(rect.bottom < 88);
+    };
+
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, [isCompactViewport, loading]);
+
   const playersById = useMemo(() => {
     const map = {};
     (players || []).forEach((player) => {
@@ -462,6 +606,16 @@ export default function SpectatorView() {
   const lastBalls = useMemo(() => buildLastBallsStrip(liveBalls, 6), [liveBalls]);
   const partnership = useMemo(() => buildCurrentPartnership(liveBalls), [liveBalls]);
   const highlights = useMemo(() => buildRecentHighlights(liveBalls, playersById), [liveBalls, playersById]);
+  const stickyTeamLabel = `${compactTeamName(teamA)} vs ${compactTeamName(teamB)}`;
+  const stickyContext = useMemo(() => {
+    if (String(derivedStatus || "").toLowerCase() === "completed" && resultText) {
+      return resultText;
+    }
+    if (liveInnings === 2) {
+      return runsNeeded > 0 ? `Need ${runsNeeded} off ${ballsRemaining}` : `Target ${target}`;
+    }
+    return `Innings ${liveInnings}`;
+  }, [ballsRemaining, derivedStatus, liveInnings, resultText, runsNeeded, target]);
 
   const progress = useMemo(() => {
     const totalLegal = oversLimit * 6;
@@ -519,7 +673,16 @@ export default function SpectatorView() {
           </Link>
         </div>
 
+        <SpectatorStickyHeader
+          visible={showStickyHeader}
+          teamLabel={stickyTeamLabel}
+          score={`${liveTotals.runs} / ${liveTotals.wkts}`}
+          oversText={liveOversText}
+          context={stickyContext}
+        />
+
         <div
+          ref={heroRef}
           style={{
             marginTop: 14,
             borderRadius: 20,

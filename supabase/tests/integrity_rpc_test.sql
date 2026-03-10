@@ -1,5 +1,5 @@
 BEGIN;
-SELECT plan(24);
+SELECT plan(30);
 
 SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000111', true);
 SELECT set_config('request.jwt.claim.role', 'authenticated', true);
@@ -80,6 +80,48 @@ VALUES (
   '00000000-0000-0000-0000-000000000999'
 );
 
+INSERT INTO public.matches (
+  id,
+  fixture_id,
+  team_a_id,
+  team_b_id,
+  overs_limit,
+  wicket_cap,
+  status,
+  scorer_user_id
+)
+VALUES (
+  '00000000-0000-0000-0000-000000000409',
+  '00000000-0000-0000-0000-000000000410',
+  '00000000-0000-0000-0000-000000000201',
+  '00000000-0000-0000-0000-000000000202',
+  2,
+  10,
+  'scheduled',
+  '00000000-0000-0000-0000-000000000999'
+);
+
+INSERT INTO public.matches (
+  id,
+  fixture_id,
+  team_a_id,
+  team_b_id,
+  overs_limit,
+  wicket_cap,
+  status,
+  scorer_user_id
+)
+VALUES (
+  '00000000-0000-0000-0000-000000000407',
+  '00000000-0000-0000-0000-000000000408',
+  '00000000-0000-0000-0000-000000000201',
+  '00000000-0000-0000-0000-000000000202',
+  2,
+  10,
+  'scheduled',
+  null
+);
+
 INSERT INTO public.innings (
   id,
   match_id,
@@ -113,6 +155,60 @@ SELECT is(
 );
 
 SELECT is(
+  public.claim_match_scorer_ownership(
+    '00000000-0000-0000-0000-000000000407',
+    false
+  ) ->> 'action',
+  'assigned_self',
+  'an authenticated scorer can assign themselves to an unassigned match'
+);
+
+SELECT is(
+  (SELECT scorer_user_id::text FROM public.matches WHERE id = '00000000-0000-0000-0000-000000000407'),
+  '00000000-0000-0000-0000-000000000111',
+  'self-assignment persists scorer ownership on the match row'
+);
+
+SELECT throws_ok(
+  $$
+    SELECT public.acquire_match_scorer_lock(
+      '00000000-0000-0000-0000-000000000405',
+      'session-blocked',
+      false,
+      null
+    );
+  $$,
+  'Only the assigned scorer can acquire this match lock',
+  'non-owners cannot acquire scorer locks before claiming ownership'
+);
+
+SELECT throws_ok(
+  $$
+    SELECT public.claim_match_scorer_ownership(
+      '00000000-0000-0000-0000-000000000405',
+      false
+    );
+  $$,
+  'This match is assigned to another scorer. Use explicit take-over to claim it.',
+  'taking over scorer ownership requires an explicit force flag'
+);
+
+SELECT is(
+  public.claim_match_scorer_ownership(
+    '00000000-0000-0000-0000-000000000405',
+    true
+  ) ->> 'action',
+  'took_over',
+  'an authenticated scorer can explicitly take over another scorer''s match'
+);
+
+SELECT is(
+  (SELECT scorer_user_id::text FROM public.matches WHERE id = '00000000-0000-0000-0000-000000000405'),
+  '00000000-0000-0000-0000-000000000111',
+  'explicit take-over updates scorer ownership on the match row'
+);
+
+SELECT is(
   (public.get_or_create_match_innings(
     '00000000-0000-0000-0000-000000000403',
     1
@@ -142,7 +238,7 @@ SELECT is(
 SELECT throws_ok(
   $$
     SELECT public.get_or_create_match_innings(
-      '00000000-0000-0000-0000-000000000405',
+      '00000000-0000-0000-0000-000000000409',
       1
     );
   $$,

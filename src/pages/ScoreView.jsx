@@ -23,6 +23,7 @@ import {
   countLegalBallsBowledBy,
   DELIVERY_RECORDED_EVENT_TYPE,
   deriveRosterWicketCap,
+  reconcileLatestBallEditSelectionState,
   deriveWicketPostState,
   didBatterFaceBall,
   getOverCounts,
@@ -57,6 +58,10 @@ import {
   removePendingEventsForInnings,
   replayPendingEventsOnState,
 } from "../lib/scoringSync";
+
+function isScorerOwnershipError(error) {
+  return /Only the assigned scorer can/i.test(String(error?.message || error || ""));
+}
 
 async function getOrCreateInnings({ matchId, inningsNo }) {
   const { data, error } = await supabase.rpc("get_or_create_match_innings", {
@@ -111,6 +116,45 @@ async function loadSquadPlayers({ fixtureId, teamId }) {
 
   if (p2.error) return { data: null, error: p2.error };
   return { data: p2.data || [], error: null };
+}
+
+function ScoreViewLoadingShell() {
+  return (
+    <div style={{ minHeight: "100vh", background: "linear-gradient(180deg,#0b1220,#060a12)", color: "#e8eefc" }}>
+      <div
+        style={{
+          position: "sticky",
+          top: 0,
+          zIndex: 20,
+          backdropFilter: "blur(10px)",
+          background: "rgba(10,16,28,0.72)",
+          borderBottom: "1px solid rgba(255,255,255,0.08)",
+        }}
+      >
+        <div style={{ maxWidth: 980, margin: "0 auto", padding: "12px 14px", display: "flex", gap: 12, alignItems: "center" }}>
+          <div style={{ color: "#cfe0ff", fontWeight: 700 }}>Scorer</div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: "14px" }}>
+        <div
+          style={{
+            marginTop: 12,
+            padding: 14,
+            borderRadius: 16,
+            border: "1px solid rgba(255,255,255,0.10)",
+            background: "rgba(255,255,255,0.04)",
+            boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
+          }}
+        >
+          <div style={{ fontSize: 14, fontWeight: 800, color: "rgba(232,238,252,0.78)" }}>Loading scorer...</div>
+          <div style={{ marginTop: 8, fontSize: 13, color: "rgba(232,238,252,0.62)" }}>
+            Preparing match, scorer lock, innings, and recovery state.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default function ScoreView() {
@@ -179,6 +223,7 @@ export default function ScoreView() {
   const [err, setErr] = useState("");
   const [info, setInfo] = useState("");
   const [loading, setLoading] = useState(true);
+  const [startupLoading, setStartupLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
   const [pendingEvents, setPendingEvents] = useState([]);
@@ -188,6 +233,9 @@ export default function ScoreView() {
   const [activeScorerSession, setActiveScorerSession] = useState(null);
   const [lockFeatureAvailable, setLockFeatureAvailable] = useState(true);
   const [takingControl, setTakingControl] = useState(false);
+  const [claimingScorerRole, setClaimingScorerRole] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [ownershipRefreshKey, setOwnershipRefreshKey] = useState(0);
 
   const ballsRef = useRef([]);
   const inningsRef = useRef(null);
@@ -201,6 +249,24 @@ export default function ScoreView() {
   const flushingQueueRef = useRef(false);
   const matchSnapshotScope = fixtureId || canonicalFixtureId || matchId || "unknown";
   const persistenceScope = clientSessionId || "shared";
+
+  useEffect(() => {
+    let alive = true;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (!alive) return;
+      setCurrentUser(data?.session?.user || null);
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setCurrentUser(session?.user || null);
+    });
+
+    return () => {
+      alive = false;
+      sub.subscription.unsubscribe();
+    };
+  }, []);
 
   // CURRENT innings totals
   const totalRuns = useMemo(() => sumRuns(balls), [balls]);
@@ -227,6 +293,14 @@ export default function ScoreView() {
     ),
     fallback: 10,
   }), [fixtureDisplayWicketCap, match?.wicket_cap, match?.team_a_id, match?.team_b_id, battingPlayers, bowlingPlayers]);
+  const currentUserId = currentUser?.id || "";
+  const scorerAssignmentState = useMemo(() => {
+    if (!currentUserId) return "unauthenticated";
+    if (!match?.scorer_user_id) return "unassigned";
+    if (match.scorer_user_id === currentUserId) return "mine";
+    return "assigned_elsewhere";
+  }, [currentUserId, match?.scorer_user_id]);
+  const canClaimScorerRole = scorerAssignmentState === "unassigned" || scorerAssignmentState === "assigned_elsewhere";
 
   const allOut = useMemo(() => wickets >= wicketCap, [wickets, wicketCap]);
   const oversDone = useMemo(() => legalBalls >= maxLegal, [legalBalls, maxLegal]);
@@ -458,6 +532,51 @@ const clearLiveSelections = () => {
   setNeedsNextBowler(false);
 };
 
+const applyLocalScorerSelections = ({
+  strikerId: nextStrikerId = "",
+  nonStrikerId: nextNonStrikerId = "",
+  bowlerId: nextBowlerId = "",
+  needsNextBowler: nextNeedsNextBowler = false,
+  battingAmbiguous = false,
+  bowlerAmbiguous = false,
+} = {}) => {
+  if (battingAmbiguous) {
+    setStrikerSelection("");
+    setNonStrikerSelection("");
+  } else {
+    setStrikerSelection(nextStrikerId || "");
+    setNonStrikerSelection(nextNonStrikerId || "");
+  }
+
+  if (bowlerAmbiguous) {
+    setBowlerId("");
+    setNeedsNextBowler(false);
+  } else {
+    setBowlerId(nextBowlerId || "");
+    setNeedsNextBowler(!!nextNeedsNextBowler);
+  }
+};
+
+const describeLatestEditResolution = ({ battingAmbiguous = false, bowlerAmbiguous = false, needsNextBowler: nextNeedsNextBowler = false } = {}) => {
+  if (battingAmbiguous && bowlerAmbiguous) {
+    return "Delivery updated. Re-select striker, non-striker, and bowler before scoring again.";
+  }
+
+  if (battingAmbiguous) {
+    return "Delivery updated. Re-select striker and non-striker before scoring again.";
+  }
+
+  if (bowlerAmbiguous) {
+    return "Delivery updated. Select the bowler before scoring again.";
+  }
+
+  if (nextNeedsNextBowler) {
+    return "Delivery updated. Over complete - select a new bowler.";
+  }
+
+  return "Delivery updated.";
+};
+
 const applyRecoveredScorerState = (state) => {
   if (!state || typeof state !== "object") return false;
 
@@ -594,6 +713,25 @@ const restoreSnapshot = (snapshot) => {
   return true;
 };
 
+const reconcileLatestEditSelections = ({
+  originalBall = null,
+  editedBall = null,
+  nextBalls = [],
+  nextInnings = null,
+  preEditPostState = null,
+} = {}) => {
+  const resolution = reconcileLatestBallEditSelectionState({
+    originalBall,
+    editedBall,
+    ballsAfterEdit: nextBalls,
+    preEditPostState,
+    inningsCompleted: !!nextInnings?.completed,
+  });
+
+  applyLocalScorerSelections(resolution);
+  return resolution;
+};
+
 const applyOptimisticEventState = (event) => {
   const nextState = applyEventOptimistically({
     balls: ballsRef.current,
@@ -605,6 +743,9 @@ const applyOptimisticEventState = (event) => {
   if (nextState.innings !== inningsRef.current) {
     setInnings(nextState.innings);
   }
+
+  ballsRef.current = nextState.balls;
+  inningsRef.current = nextState.innings;
 
   return nextState;
 };
@@ -621,6 +762,9 @@ const applyServerEventState = (event, result) => {
   if (nextState.innings !== inningsRef.current) {
     setInnings(nextState.innings);
   }
+
+  ballsRef.current = nextState.balls;
+  inningsRef.current = nextState.innings;
 
   return nextState;
 };
@@ -671,9 +815,9 @@ const applySessionEvent = async (
 
   if (!isOnline) {
     setPendingEvents((prev) => enqueuePendingEvent(prev, normalizedEvent));
-    applyOptimisticEventState(normalizedEvent);
+    const optimisticState = applyOptimisticEventState(normalizedEvent);
     setInfo(optimisticQueuedInfo);
-    return { queued: true, result: null, event: normalizedEvent };
+    return { queued: true, result: null, event: normalizedEvent, state: optimisticState };
   }
 
   const { data, error } = await supabase.rpc("apply_match_session_event", {
@@ -699,9 +843,9 @@ const applySessionEvent = async (
 
     if (isNetworkLikeError(error)) {
       setPendingEvents((prev) => enqueuePendingEvent(prev, normalizedEvent));
-      applyOptimisticEventState(normalizedEvent);
+      const optimisticState = applyOptimisticEventState(normalizedEvent);
       setInfo(optimisticQueuedInfo);
-      return { queued: true, result: null, event: normalizedEvent };
+      return { queued: true, result: null, event: normalizedEvent, state: optimisticState };
     }
 
     const message = String(error?.message || error || "");
@@ -715,10 +859,10 @@ const applySessionEvent = async (
     throw error;
   }
 
-  applyServerEventState(normalizedEvent, data || {});
+  const nextState = applyServerEventState(normalizedEvent, data || {});
   setPendingEvents((prev) => removePendingEvent(prev, normalizedEvent.event_id));
   if (successInfo) setInfo(successInfo);
-  return { queued: false, result: data || null, event: normalizedEvent };
+  return { queued: false, result: data || null, event: normalizedEvent, state: nextState };
 };
 
 const flushPendingQueue = async () => {
@@ -783,9 +927,22 @@ const flushPendingQueue = async () => {
       const nextState = applyServerEventState(event, data || {});
       if (event.innings_id === inningsRef.current?.id) {
         if (nextState.invalidatesPostState) {
-          clearScorerState(matchId, event.innings_id, persistenceScope);
-          clearLiveSelections();
-          setInfo("A pending delivery edit synced. Re-select striker, non-striker, and bowler before scoring again.");
+          if (event.event_type === "edit_ball") {
+            const nextBalls = nextState.balls || ballsRef.current;
+            const editedBall = sortBallsByPosition(nextBalls).slice(-1)[0] || null;
+            const resolution = reconcileLatestEditSelections({
+              originalBall: event.payload?.original_ball || null,
+              editedBall,
+              nextBalls,
+              nextInnings: nextState.innings || inningsRef.current,
+              preEditPostState: event.payload?.pre_edit_post_state || null,
+            });
+            setInfo(`A pending delivery edit synced. ${describeLatestEditResolution(resolution)}`);
+          } else {
+            clearScorerState(matchId, event.innings_id, persistenceScope);
+            clearLiveSelections();
+            setInfo("A pending delivery edit synced. Re-select striker, non-striker, and bowler before scoring again.");
+          }
         } else if (nextState.postState && typeof nextState.postState === "object") {
           applyRecoveredScorerState(nextState.postState);
         }
@@ -813,6 +970,13 @@ const acquireScorerLock = async (override = false) => {
       setLockFeatureAvailable(false);
       setLockReady(true);
       setScoringLocked(false);
+      return false;
+    }
+
+    if (isScorerOwnershipError(error)) {
+      setLockReady(false);
+      setScoringLocked(false);
+      setActiveScorerSession(null);
       return false;
     }
 
@@ -849,6 +1013,76 @@ const takeScorerControl = async () => {
   }
 };
 
+const claimScorerRole = async ({ force = false } = {}) => {
+  if (!matchId) return false;
+  if (!currentUserId) {
+    setErr("You must be logged in to claim scorer access for this match.");
+    return false;
+  }
+
+  setClaimingScorerRole(true);
+  setErr("");
+  setInfo("");
+
+  try {
+    const { data, error } = await supabase.rpc("claim_match_scorer_ownership", {
+      p_match_id: matchId,
+      p_force: force,
+    });
+
+    if (error) {
+      if (isMissingRpcError(error)) {
+        throw new Error(missingRequiredRpcMessage("claim_match_scorer_ownership", "Scorer assignment"));
+      }
+      throw error;
+    }
+
+    const claimedMatch = data?.match && typeof data.match === "object" ? data.match : null;
+    if (claimedMatch) {
+      setMatch((prev) => (prev ? { ...prev, ...claimedMatch } : claimedMatch));
+    }
+
+    setScoringLocked(false);
+    setLockReady(false);
+    setOwnershipRefreshKey((value) => value + 1);
+
+    const action = String(data?.action || "");
+    let nextInfo = "Scorer assignment updated.";
+    if (action === "assigned_self") nextInfo = "You are now the assigned scorer for this match.";
+    if (action === "took_over") nextInfo = "You took over scorer ownership for this match.";
+    if (action === "already_assigned") nextInfo = "You are already the assigned scorer for this match.";
+
+    const lockAcquired = await acquireScorerLock(force);
+    if (lockAcquired) {
+      setInfo(
+        action === "took_over"
+          ? "You took over scorer ownership and control for this match."
+          : `${nextInfo} Scorer control is ready.`
+      );
+      flushPendingQueue();
+    } else {
+      setInfo(nextInfo);
+    }
+
+    return true;
+  } catch (error) {
+    setErr(`Scorer assignment error: ${error?.message || error}`);
+    return false;
+  } finally {
+    setClaimingScorerRole(false);
+  }
+};
+
+const assignSelfAsScorer = async () => claimScorerRole({ force: false });
+
+const takeOverScorerRole = async () => {
+  // eslint-disable-next-line no-restricted-globals
+  if (!confirm("Take over scoring for this match? This will reassign scorer ownership to your account and can supersede another active scorer session.")) {
+    return;
+  }
+  await claimScorerRole({ force: true });
+};
+
 const clearLocalMatchState = (resolvedMatchId = matchId) => {
   pendingEventsRef.current = [];
   setPendingEvents([]);
@@ -867,6 +1101,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
   useEffect(() => {
     let alive = true;
     const storedSnapshot = readScoringSnapshot(matchSnapshotScope, persistenceScope);
+    setStartupLoading(true);
 
     (async () => {
       setLoading(true);
@@ -892,24 +1127,28 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
 
       if (m.error) {
         if (isNetworkLikeError(m.error) && restoreSnapshot(storedSnapshot)) {
+          setStartupLoading(false);
           setLoading(false);
           return;
         }
         setErr(`Match load error: ${m.error.message}`);
         setMatch(null);
         setMatchId("");
+        setStartupLoading(false);
         setLoading(false);
         return;
       }
 
       if (!m.data) {
         if (restoreSnapshot(storedSnapshot)) {
+          setStartupLoading(false);
           setLoading(false);
           return;
         }
         setErr("No match found for this fixture.");
         setMatch(null);
         setMatchId("");
+        setStartupLoading(false);
         setLoading(false);
         return;
       }
@@ -940,7 +1179,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
         setPendingEvents(restoredQueue);
       }
 
-      setLoading(false);
+      if (!alive) return;
     })();
 
     return () => {
@@ -950,10 +1189,10 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
 
   // Always compute innings 1 totals for target/result
   useEffect(() => {
-    if (!matchId || !match) return;
+    if (!matchId) return;
 
     (async () => {
-      const inn1Res = await getOrCreateInnings({ matchId, inningsNo: 1, match });
+      const inn1Res = await getOrCreateInnings({ matchId, inningsNo: 1 });
       if (inn1Res.error) return;
 
       setInnings1Row(inn1Res.data);
@@ -970,14 +1209,14 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       setInnings1Wkts(sumWkts(list));
       setInnings1Legal(legalBallsCount(list));
     })();
-  }, [matchId, match]);
+  }, [matchId, ownershipRefreshKey]);
 
   // Also compute innings 2 totals for a reliable result calculation
   useEffect(() => {
-    if (!matchId || !match) return;
+    if (!matchId) return;
 
     (async () => {
-      const inn2Res = await getOrCreateInnings({ matchId, inningsNo: 2, match });
+      const inn2Res = await getOrCreateInnings({ matchId, inningsNo: 2 });
       if (inn2Res.error) return;
 
       setInnings2RowForResult(inn2Res.data);
@@ -994,7 +1233,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       setInnings2WktsForResult(sumWkts(list));
       setInnings2LegalForResult(legalBallsCount(list));
     })();
-  }, [matchId, match]);
+  }, [matchId, ownershipRefreshKey]);
 
   // If innings 1 is completed, auto-jump to innings 2 (unless user already chose otherwise)
   useEffect(() => {
@@ -1006,7 +1245,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
 
   // Load selected innings
   useEffect(() => {
-    if (!match) return;
+    if (!matchId) return;
 
     if (inningsNo === 2 && innings1Row && !innings1Row.completed) {
       setErr("You can only start Innings 2 after Innings 1 is ended/completed.");
@@ -1014,6 +1253,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       return;
     }
 
+    let alive = true;
     let channel;
 
     (async () => {
@@ -1027,31 +1267,42 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       setIncomingBatterId("");
       setDismissedPlayerId("");
 
-      const inn = await getOrCreateInnings({ matchId, inningsNo, match });
+      const inn = await getOrCreateInnings({ matchId, inningsNo });
+      if (!alive) return;
       if (inn.error) {
+        if (isScorerOwnershipError(inn.error)) {
+          setStartupLoading(false);
+          setLoading(false);
+          return;
+        }
         setErr(`Innings load/create error: ${inn.error.message}`);
+        setStartupLoading(false);
         setLoading(false);
         return;
       }
       setInnings(inn.data);
 
       const batPlayersRes = await loadSquadPlayers({ fixtureId: canonicalFixtureId || fixtureId, teamId: inn.data.batting_team_id });
+      if (!alive) return;
       if (batPlayersRes.error) {
         if (isNetworkLikeError(batPlayersRes.error) && Array.isArray(storedSnapshot?.battingPlayers)) {
           setBattingPlayers(storedSnapshot.battingPlayers);
         } else {
           setErr(`Batting roster error: ${batPlayersRes.error.message}`);
+          setStartupLoading(false);
           setLoading(false);
           return;
         }
       }
 
       const bowlPlayersRes = await loadSquadPlayers({ fixtureId: canonicalFixtureId || fixtureId, teamId: inn.data.bowling_team_id });
+      if (!alive) return;
       if (bowlPlayersRes.error) {
         if (isNetworkLikeError(bowlPlayersRes.error) && Array.isArray(storedSnapshot?.bowlingPlayers)) {
           setBowlingPlayers(storedSnapshot.bowlingPlayers);
         } else {
           setErr(`Bowling roster error: ${bowlPlayersRes.error.message}`);
+          setStartupLoading(false);
           setLoading(false);
           return;
         }
@@ -1067,6 +1318,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
         .eq("innings_id", inn.data.id)
         .order("over_no", { ascending: true })
         .order("delivery_in_over", { ascending: true });
+      if (!alive) return;
 
       if (b.error) {
         if (isNetworkLikeError(b.error) && storedSnapshot?.innings?.id === inn.data.id) {
@@ -1080,11 +1332,13 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
           setInnings(restoredState.innings || storedSnapshot.innings || inn.data);
           setBalls(restoredState.balls);
           setInfo("Offline snapshot restored for this innings. Pending events will sync when the network returns.");
+          setStartupLoading(false);
           setLoading(false);
           return;
         }
 
         setErr(`Balls load error: ${b.error.message}`);
+        setStartupLoading(false);
         setLoading(false);
         return;
       }
@@ -1099,6 +1353,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       setInnings(restoredState.innings || inn.data);
       setBalls(sorted);
       const recovery = await loadCanonicalRecoveryState(matchId, inn.data.id);
+      if (!alive) return;
 
       /* Do not reopen innings implicitly from the client.
       if (inn.data?.completed && sorted.length === 0) {
@@ -1156,13 +1411,15 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
         )
         .subscribe();
 
+      setStartupLoading(false);
       setLoading(false);
     })();
 
     return () => {
+      alive = false;
       if (channel) supabase.removeChannel(channel);
     };
-  }, [match, matchId, inningsNo, fixtureId, canonicalFixtureId, innings1Row]);
+  }, [matchId, inningsNo, fixtureId, canonicalFixtureId, ownershipRefreshKey]);
 
   useEffect(() => {
     if (!innings) return;
@@ -1290,7 +1547,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
   useEffect(() => {
     if (!matchId || !lockFeatureAvailable || !isOnline) return;
     acquireScorerLock(false);
-  }, [isOnline, lockFeatureAvailable, matchId]);
+  }, [isOnline, lockFeatureAvailable, matchId, ownershipRefreshKey]);
 
   useEffect(() => {
     if (!matchId || !lockFeatureAvailable || !lockReady || scoringLocked || !isOnline) return;
@@ -2188,7 +2445,7 @@ You can then start scoring again from ball 1.`
     cursor: "pointer",
   };
 
-  if (loading) return <div>Loading...</div>;
+  if ((loading || startupLoading) && !err) return <ScoreViewLoadingShell />;
 
   return (
     <div style={{ minHeight: "100vh", background: "linear-gradient(180deg,#0b1220,#060a12)", color: "#e8eefc" }}>
@@ -2256,6 +2513,48 @@ You can then start scoring again from ball 1.`
             {info}
           </div>
         )}
+
+        {match && scorerAssignmentState !== "mine" ? (
+          <div
+            style={{
+              marginTop: 10,
+              padding: 12,
+              borderRadius: 12,
+              background: "rgba(96, 165, 250, 0.10)",
+              border: "1px solid rgba(96,165,250,0.28)",
+              color: "#dbeafe",
+              display: "flex",
+              gap: 12,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontWeight: 900 }}>
+              {scorerAssignmentState === "unauthenticated"
+                ? "Sign in required"
+                : scorerAssignmentState === "unassigned"
+                  ? "No scorer assigned"
+                  : "Assigned to another scorer"}
+            </div>
+            <div style={{ flex: "1 1 280px", color: "rgba(219,234,254,0.82)" }}>
+              {scorerAssignmentState === "unauthenticated"
+                ? "You must be signed in to score this match."
+                : scorerAssignmentState === "unassigned"
+                  ? "Assign yourself as the scorer for this fixture before scoring."
+                  : "Take over scorer ownership explicitly if you need to score this match from this account."}
+            </div>
+            {scorerAssignmentState === "unassigned" ? (
+              <button onClick={assignSelfAsScorer} disabled={claimingScorerRole || !isOnline} style={modalBtnGhost}>
+                {claimingScorerRole ? "Assigning..." : "Assign myself"}
+              </button>
+            ) : null}
+            {scorerAssignmentState === "assigned_elsewhere" ? (
+              <button onClick={takeOverScorerRole} disabled={claimingScorerRole || !isOnline} style={modalBtnGhost}>
+                {claimingScorerRole ? "Taking over..." : "Take over scoring"}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
 
         {(!isOnline || pendingEvents.length || isFlushingQueue || scoringLocked) && (
           <div
@@ -3058,7 +3357,16 @@ You can then start scoring again from ball 1.`
                       nextExtraRuns = wicketValidation.extraRuns;
                     }
 
-                    await applySessionEvent(
+                    const preEditPostState = buildScorerPostState({
+                      strikerId: strikerIdRef.current,
+                      nonStrikerId: nonStrikerIdRef.current,
+                      strikerTurn: strikerTurnRef.current,
+                      nonStrikerTurn: nonStrikerTurnRef.current,
+                      bowlerId: bowlerIdRef.current,
+                      needsNextBowler,
+                    });
+
+                    const editResponse = await applySessionEvent(
                       {
                         created_at: new Date().toISOString(),
                         event_id: createEventId("edit-ball"),
@@ -3068,6 +3376,8 @@ You can then start scoring again from ball 1.`
                         payload: {
                           ball_id: editBall.id || null,
                           target_source_event_id: editBall.source_event_id || editBall.local_temp_id || null,
+                          original_ball: editBall,
+                          pre_edit_post_state: preEditPostState,
                           patch: {
                             runs_off_bat: nextBatRuns,
                             extra_type: editExtraType || null,
@@ -3085,16 +3395,17 @@ You can then start scoring again from ball 1.`
                       }
                     );
 
+                    const nextBalls = editResponse.state?.balls || ballsRef.current;
+                    const editedBall = sortBallsByPosition(nextBalls).slice(-1)[0] || null;
+                    const resolution = reconcileLatestEditSelections({
+                      originalBall: editBall,
+                      editedBall,
+                      nextBalls,
+                      nextInnings: editResponse.result?.innings || editResponse.state?.innings || inningsRef.current,
+                      preEditPostState,
+                    });
 
-
-
-                    if (!innings.completed) {
-                      clearScorerState(matchId, innings.id, persistenceScope);
-                      clearLiveSelections();
-                      setInfo("Delivery updated. Re-select striker, non-striker, and bowler before scoring again.");
-                    } else {
-                      setInfo("Delivery updated.");
-                    }
+                    setInfo(describeLatestEditResolution(resolution));
                     setEditOpen(false);
                   } finally {
                     setSaving(false);

@@ -87,6 +87,30 @@ export function isBowlerCreditedWicket(ball) {
   return isBowlerCreditedDismissalKind(ball?.dismissal_kind);
 }
 
+function inferIncomingBatterFromPostState(originalBall, preEditPostState) {
+  if (!originalBall || !preEditPostState || typeof preEditPostState !== "object") return null;
+
+  const preBallIds = new Set([originalBall.striker_id, originalBall.non_striker_id].filter(Boolean));
+  const postBallIds = [preEditPostState.striker_id, preEditPostState.non_striker_id].filter(Boolean);
+  const incoming = postBallIds.filter((playerId) => !preBallIds.has(playerId));
+
+  if (incoming.length !== 1) return null;
+  return incoming[0];
+}
+
+function inferCrossedFromPostState(originalBall, preEditPostState, incomingBatterId) {
+  if (!originalBall || !preEditPostState || !incomingBatterId) return null;
+  if (originalBall.dismissed_player_id !== originalBall.striker_id) return false;
+
+  const survivorId = originalBall.non_striker_id || "";
+  const postStrikerId = preEditPostState.striker_id || "";
+  const postNonStrikerId = preEditPostState.non_striker_id || "";
+
+  if (postStrikerId === incomingBatterId && postNonStrikerId === survivorId) return false;
+  if (postStrikerId === survivorId && postNonStrikerId === incomingBatterId) return true;
+  return null;
+}
+
 export function isDeliveryEventType(eventType) {
   return eventType === LEGACY_ADD_BALL_EVENT_TYPE || eventType === DELIVERY_RECORDED_EVENT_TYPE;
 }
@@ -500,6 +524,114 @@ export function buildScorerPostState({
     bowler_id: bowlerId || null,
     needs_next_bowler: !!needsNextBowler,
   };
+}
+
+export function reconcileLatestBallEditSelectionState({
+  originalBall = null,
+  editedBall = null,
+  ballsAfterEdit = [],
+  preEditPostState = null,
+  inningsCompleted = false,
+} = {}) {
+  if (!originalBall || !editedBall) {
+    return {
+      strikerId: "",
+      nonStrikerId: "",
+      bowlerId: "",
+      needsNextBowler: false,
+      battingAmbiguous: true,
+      bowlerAmbiguous: true,
+    };
+  }
+
+  const overFinishedAfter = isOverFinished(getOverCounts(ballsAfterEdit || [], editedBall.over_no));
+  const bowlerId = !inningsCompleted && overFinishedAfter
+    ? ""
+    : (editedBall.bowler_id || originalBall.bowler_id || preEditPostState?.bowler_id || "");
+  const needsNextBowler = !inningsCompleted && overFinishedAfter;
+  const totalRunsOnBall = toInt(editedBall.runs_off_bat, 0) + toInt(editedBall.extra_runs, 0);
+
+  const resolved = {
+    strikerId: "",
+    nonStrikerId: "",
+    bowlerId,
+    needsNextBowler,
+    battingAmbiguous: false,
+    bowlerAmbiguous: false,
+  };
+
+  if (!editedBall.wicket) {
+    let nextStrikerId = originalBall.striker_id || "";
+    let nextNonStrikerId = originalBall.non_striker_id || "";
+
+    if (totalRunsOnBall % 2 === 1) {
+      [nextStrikerId, nextNonStrikerId] = [nextNonStrikerId, nextStrikerId];
+    }
+
+    if (!inningsCompleted && overFinishedAfter) {
+      [nextStrikerId, nextNonStrikerId] = [nextNonStrikerId, nextStrikerId];
+    }
+
+    resolved.strikerId = nextStrikerId;
+    resolved.nonStrikerId = nextNonStrikerId;
+    return resolved;
+  }
+
+  if (inningsCompleted) {
+    resolved.strikerId = preEditPostState?.striker_id || originalBall.striker_id || "";
+    resolved.nonStrikerId = preEditPostState?.non_striker_id || originalBall.non_striker_id || "";
+    return resolved;
+  }
+
+  if (!originalBall.wicket) {
+    resolved.battingAmbiguous = true;
+    return resolved;
+  }
+
+  const incomingBatterId = inferIncomingBatterFromPostState(originalBall, preEditPostState);
+  if (!incomingBatterId) {
+    resolved.battingAmbiguous = true;
+    return resolved;
+  }
+
+  const dismissalKind = String(editedBall.dismissal_kind || originalBall.dismissal_kind || "bowled").trim().toLowerCase();
+  const dismissedPlayerId = editedBall.dismissed_player_id || originalBall.dismissed_player_id || originalBall.striker_id || "";
+
+  let crossed = false;
+  if (dismissalKind !== "run out" && dismissedPlayerId === originalBall.striker_id) {
+    const originalDismissalKind = String(originalBall.dismissal_kind || "").trim().toLowerCase();
+    if (originalDismissalKind === "run out" || !originalDismissalKind) {
+      resolved.battingAmbiguous = true;
+      return resolved;
+    }
+
+    const inferredCrossed = inferCrossedFromPostState(originalBall, preEditPostState, incomingBatterId);
+    if (inferredCrossed === null) {
+      resolved.battingAmbiguous = true;
+      return resolved;
+    }
+    crossed = inferredCrossed;
+  }
+
+  const wicketPostState = deriveWicketPostState({
+    strikerId: originalBall.striker_id || "",
+    nonStrikerId: originalBall.non_striker_id || "",
+    incomingBatterId,
+    dismissedPlayerId,
+    dismissalKind,
+    totalRunsOnBall,
+    crossed,
+    overFinishedAfter,
+    inningsComplete: false,
+    bowlerId: editedBall.bowler_id || originalBall.bowler_id || "",
+    getTurnFor: () => 1,
+  });
+
+  resolved.strikerId = wicketPostState.striker_id || "";
+  resolved.nonStrikerId = wicketPostState.non_striker_id || "";
+  resolved.bowlerId = wicketPostState.bowler_id || resolved.bowlerId;
+  resolved.needsNextBowler = !!wicketPostState.needs_next_bowler;
+  return resolved;
 }
 
 export function updateBallInList(previousBalls, target, patch) {
