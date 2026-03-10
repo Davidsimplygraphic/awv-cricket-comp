@@ -174,6 +174,12 @@ export default function ScoreHome() {
   // EDIT
   // -------------------------
   const startEdit = (match) => {
+    if (!isMatchOwner(match)) {
+      setErr("Only the assigned scorer can edit this match.");
+      setInfo("");
+      return;
+    }
+
     setErr("");
     setInfo("");
     setEditingId(match.id);
@@ -196,6 +202,12 @@ export default function ScoreHome() {
     setInfo("");
 
     if (!editingId) return;
+
+    const currentMatch = matches.find((match) => match.id === editingId);
+    if (!isMatchOwner(currentMatch)) {
+      setErr("Only the assigned scorer can edit this match.");
+      return;
+    }
 
     if (!editTeamA || !editTeamB) {
       setErr("Please select both Team A and Team B.");
@@ -261,6 +273,11 @@ export default function ScoreHome() {
     setErr("");
     setInfo("");
 
+    if (!isMatchOwner(match)) {
+      setErr("Only the assigned scorer can delete this match.");
+      return;
+    }
+
     const label = `${formatTeam(match.team_a)} vs ${formatTeam(match.team_b)}`;
 
     // eslint-disable-next-line no-restricted-globals
@@ -306,6 +323,11 @@ export default function ScoreHome() {
   const resetMatch = async (match) => {
     setErr("");
     setInfo("");
+
+    if (!isMatchOwner(match)) {
+      setErr("Only the assigned scorer can reset this match.");
+      return;
+    }
 
     const label = `${formatTeam(match.team_a)} vs ${formatTeam(match.team_b)}`;
 
