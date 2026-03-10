@@ -1,12 +1,7 @@
-function toInt(n, fallback = 0) {
-  const x = Number(n);
-  return Number.isFinite(x) ? x : fallback;
-}
+import { sortBallsByPosition, toInt } from "../lib/scoring";
 
 export default function BallByBall({ balls }) {
-  const sorted = (balls || [])
-    .slice()
-    .sort((a, b) => (a.over_no - b.over_no) || (a.delivery_in_over - b.delivery_in_over) || 0);
+  const sorted = sortBallsByPosition(balls);
 
   // last 5 overs by over_no
   const lastFive = (() => {

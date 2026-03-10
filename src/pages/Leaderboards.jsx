@@ -1,4 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
+import {
+  isBowlerCreditedWicket,
+  oversTextFromLegal,
+  runsConcededByBowler,
+  selectInningsSummary,
+} from "../lib/scoring";
 import { supabase } from "../lib/supabase";
 
 /**
@@ -44,26 +50,6 @@ function fmt(num, digits = 2) {
   return num.toFixed(digits);
 }
 
-function sumRuns(balls) {
-  return (balls || []).reduce((acc, b) => acc + toInt(b.runs_off_bat, 0) + toInt(b.extra_runs, 0), 0);
-}
-
-function sumWkts(balls) {
-  return (balls || []).reduce((acc, b) => acc + (b.wicket ? 1 : 0), 0);
-}
-
-function countLegal(balls) {
-  // Treat NULL as legal (legacy rows); only explicit false is illegal
-  return (balls || []).reduce((acc, b) => acc + (b?.legal_ball !== false ? 1 : 0), 0);
-}
-
-function oversTextFromLegal(legalBalls) {
-  const lb = toInt(legalBalls, 0);
-  const overs = Math.floor(lb / 6);
-  const ballsInOver = lb % 6;
-  return `${overs}.${ballsInOver}`;
-}
-
 function getDismissedBatterId(ball) {
   if (!ball?.wicket) return null;
   return ball.dismissed_player_id || null;
@@ -100,7 +86,7 @@ function computeWktsByBowlerPerInnings(balls) {
   // key = `${inningsId}:${bowlerId}`
   const m = new Map();
   for (const b of balls || []) {
-    if (!b.wicket) continue;
+    if (!isBowlerCreditedWicket(b)) continue;
     const inningsId = b.innings_id || null;
     const bowlerId = b.bowler_id || null;
     if (!inningsId || !bowlerId) continue;
@@ -269,14 +255,12 @@ export default function Leaderboards() {
       const wicketCap = toInt(match.wicket_cap, 10);
       const maxLegal = oversLimit * 6;
 
-      const i1Runs = sumRuns(b1);
-      const i2Runs = sumRuns(b2);
-      const i2Legal = countLegal(b2);
-      const i2Wkts = sumWkts(b2);
+      const innings1Summary = selectInningsSummary(b1);
+      const innings2Summary = selectInningsSummary(b2);
 
       // Chase is complete once innings 2 reaches the target (innings1 + 1)
-      const chaseCompleted = i2Runs >= i1Runs + 1;
-      const inn2Exhausted = i2Legal >= maxLegal || i2Wkts >= wicketCap || !!inn2.completed;
+      const chaseCompleted = innings2Summary.runs >= innings1Summary.runs + 1;
+      const inn2Exhausted = innings2Summary.legalBalls >= maxLegal || innings2Summary.wkts >= wicketCap || !!inn2.completed;
 
       if (chaseCompleted || inn2Exhausted) set.add(mid);
     }
@@ -375,14 +359,8 @@ export default function Leaderboards() {
       const inn2 = innObj[2] || null;
       if (!inn1 || !inn2) continue;
 
-      const b1 = ballsByInnings.get(inn1.id) || [];
-      const b2 = ballsByInnings.get(inn2.id) || [];
-
-      const i1Runs = sumRuns(b1);
-      const i2Runs = sumRuns(b2);
-
-      const i1Legal = countLegal(b1);
-      const i2Legal = countLegal(b2);
+      const innings1Summary = selectInningsSummary(ballsByInnings.get(inn1.id) || []);
+      const innings2Summary = selectInningsSummary(ballsByInnings.get(inn2.id) || []);
 
       // Teams: trust innings batting_team_id (match.team_a_id / team_b_id are not reliable for ordering)
       const teamAId = inn1.batting_team_id;
@@ -396,22 +374,22 @@ export default function Leaderboards() {
       rowB.played += 1;
 
       // Runs / balls for NRR
-      rowA.runsFor += i1Runs;
-      rowA.ballsFor += i1Legal;
-      rowA.runsAgainst += i2Runs;
-      rowA.ballsAgainst += i2Legal;
+      rowA.runsFor += innings1Summary.runs;
+      rowA.ballsFor += innings1Summary.legalBalls;
+      rowA.runsAgainst += innings2Summary.runs;
+      rowA.ballsAgainst += innings2Summary.legalBalls;
 
-      rowB.runsFor += i2Runs;
-      rowB.ballsFor += i2Legal;
-      rowB.runsAgainst += i1Runs;
-      rowB.ballsAgainst += i1Legal;
+      rowB.runsFor += innings2Summary.runs;
+      rowB.ballsFor += innings2Summary.legalBalls;
+      rowB.runsAgainst += innings1Summary.runs;
+      rowB.ballsAgainst += innings1Summary.legalBalls;
 
       // Result
-      if (i2Runs > i1Runs) {
+      if (innings2Summary.runs > innings1Summary.runs) {
         rowB.won += 1;
         rowA.lost += 1;
         rowB.points += 4;
-      } else if (i1Runs > i2Runs) {
+      } else if (innings1Summary.runs > innings2Summary.runs) {
         rowA.won += 1;
         rowB.lost += 1;
         rowA.points += 4;
@@ -519,8 +497,8 @@ export default function Leaderboards() {
       const row = perPlayer.get(bowlerId);
 
       if (b.match_id) row.matches.add(b.match_id);
-      row.runs += toInt(b.runs_off_bat, 0) + toInt(b.extra_runs, 0);
-      if (b.wicket) row.wkts += 1;
+      row.runs += runsConcededByBowler(b);
+      if (isBowlerCreditedWicket(b)) row.wkts += 1;
       if (b?.legal_ball !== false) row.legal += 1;
     }
 

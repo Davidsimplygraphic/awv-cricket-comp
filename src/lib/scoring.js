@@ -12,6 +12,40 @@ export function isAdministrativeBall(ball) {
   return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
 }
 
+export function isBattingSideWicket(ball) {
+  if (!ball?.wicket) return false;
+  if (isAdministrativeBall(ball)) return false;
+
+  const dismissalKind = String(ball?.dismissal_kind || "").trim().toLowerCase();
+  if (dismissalKind === "retired hurt") return false;
+
+  return true;
+}
+
+export function isBowlerCreditedDismissalKind(kind) {
+  const dismissalKind = String(kind || "").trim().toLowerCase();
+
+  if (!dismissalKind) return true;
+  if (dismissalKind === "run out" || dismissalKind === "retired hurt") return false;
+  if (
+    dismissalKind === "bowled"
+    || dismissalKind === "caught"
+    || dismissalKind === "lbw"
+    || dismissalKind === "hit wicket"
+    || dismissalKind === "stumped"
+  ) {
+    return true;
+  }
+
+  // Preserve historical/legacy scorecards unless an explicit exception is known.
+  return true;
+}
+
+export function isBowlerCreditedWicket(ball) {
+  if (!isBattingSideWicket(ball)) return false;
+  return isBowlerCreditedDismissalKind(ball?.dismissal_kind);
+}
+
 export function isDeliveryEventType(eventType) {
   return eventType === LEGACY_ADD_BALL_EVENT_TYPE || eventType === DELIVERY_RECORDED_EVENT_TYPE;
 }
@@ -282,9 +316,7 @@ export function deriveLegalBallForExtraType(extraType, priorOverBalls = []) {
 
 export function sumWkts(balls) {
   return (balls || []).reduce((total, ball) => {
-    if (!ball?.wicket) return total;
-    if (isAdministrativeBall(ball)) return total;
-    return total + 1;
+    return total + (isBattingSideWicket(ball) ? 1 : 0);
   }, 0);
 }
 
@@ -504,6 +536,31 @@ export function buildInningsTotals(inningsRow, balls) {
     overs: oversTextFromLegal(legal),
     balls: balls || [],
   };
+}
+
+export function selectInningsSummary(balls) {
+  const totals = buildInningsTotals(null, balls);
+  return {
+    runs: totals.runs,
+    wkts: totals.wkts,
+    legalBalls: totals.legalBalls,
+    oversText: totals.overs,
+  };
+}
+
+export function selectWormSeries(balls) {
+  const sorted = sortBallsByPosition(balls);
+  let cumulativeRuns = 0;
+  let cumulativeLegalBalls = 0;
+  const points = [{ x: 0, y: 0 }];
+
+  for (const ball of sorted) {
+    cumulativeRuns += sumRuns([ball]);
+    cumulativeLegalBalls += legalBallsCount([ball]);
+    points.push({ x: cumulativeLegalBalls, y: cumulativeRuns });
+  }
+
+  return points;
 }
 
 export function deriveMatchDisplayStatus({

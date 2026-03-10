@@ -1,26 +1,16 @@
 import { useMemo } from "react";
-import { didBatterFaceBall, runsConcededByBowler } from "../lib/scoring";
+import {
+  didBatterFaceBall,
+  isBowlerCreditedWicket,
+  oversTextFromLegal,
+  runsConcededByBowler,
+  selectInningsSummary,
+  sortBallsByPosition,
+} from "../lib/scoring";
 
 function toInt(n, fallback = 0) {
   const x = Number(n);
   return Number.isFinite(x) ? x : fallback;
-}
-
-function legalBallsCount(balls) {
-  // Treat NULL as legal; only explicit false is illegal
-  return (balls || []).reduce((acc, b) => acc + (b?.legal_ball !== false ? 1 : 0), 0);
-}
-
-function oversTextFromLegal(legalBalls) {
-  const overs = Math.floor(legalBalls / 6);
-  const ballsInOver = legalBalls % 6;
-  return `${overs}.${ballsInOver}`;
-}
-
-function sortBalls(balls) {
-  return (balls || [])
-    .slice()
-    .sort((a, b) => (toInt(a.over_no, 0) - toInt(b.over_no, 0)) || (toInt(a.delivery_in_over, 0) - toInt(b.delivery_in_over, 0)) || 0);
 }
 
 function buildBattingStats(balls, playerId, turn = 1) {
@@ -56,7 +46,7 @@ function buildBowlingStats(balls, playerId) {
   for (const x of balls || []) {
     if (x.bowler_id !== playerId) continue;
     runs += runsConcededByBowler(x);
-    if (x.wicket) wkts += 1;
+    if (isBowlerCreditedWicket(x)) wkts += 1;
     if (x?.legal_ball !== false) legal += 1;
   }
 
@@ -66,14 +56,9 @@ function buildBowlingStats(balls, playerId) {
 }
 
 export default function ScorecardTables({ title, balls, playersById, theme = "dark" }) {
-  const sorted = useMemo(() => sortBalls(balls), [balls]);
+  const sorted = useMemo(() => sortBallsByPosition(balls), [balls]);
 
-  const totals = useMemo(() => {
-    const runs = (sorted || []).reduce((acc, b) => acc + toInt(b.runs_off_bat, 0) + toInt(b.extra_runs, 0), 0);
-    const wkts = (sorted || []).reduce((acc, b) => acc + (b.wicket ? 1 : 0), 0);
-    const legal = legalBallsCount(sorted || []);
-    return { runs, wkts, legal, oversText: oversTextFromLegal(legal) };
-  }, [sorted]);
+  const totals = useMemo(() => selectInningsSummary(sorted), [sorted]);
 
   
 const batters = useMemo(() => {

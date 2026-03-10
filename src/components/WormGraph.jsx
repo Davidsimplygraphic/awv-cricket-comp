@@ -1,26 +1,5 @@
 import { useMemo } from "react";
-
-function toInt(n, fallback = 0) {
-  const x = Number(n);
-  return Number.isFinite(x) ? x : fallback;
-}
-
-function buildCumulativeSeries(balls) {
-  const sorted = (balls || [])
-    .slice()
-    .sort((a, b) => (toInt(a.over_no, 0) - toInt(b.over_no, 0)) || (toInt(a.delivery_in_over, 0) - toInt(b.delivery_in_over, 0)) || 0);
-
-  let cum = 0;
-  let legalX = 0; // x in legal balls
-  const pts = [{ x: 0, y: 0 }];
-
-  for (const b of sorted) {
-    cum += toInt(b.runs_off_bat, 0) + toInt(b.extra_runs, 0);
-    if (b?.legal_ball !== false) legalX += 1;
-    pts.push({ x: legalX, y: cum });
-  }
-  return pts;
-}
+import { selectWormSeries, toInt } from "../lib/scoring";
 
 function fmtOverFromBalls(legalBalls) {
   const o = Math.floor(legalBalls / 6);
@@ -35,8 +14,8 @@ export default function WormGraph({
   theme = "dark",
   maxOvers = 20,
 }) {
-  const series1 = useMemo(() => buildCumulativeSeries(innings1Balls), [innings1Balls]);
-  const series2 = useMemo(() => buildCumulativeSeries(innings2Balls), [innings2Balls]);
+  const series1 = useMemo(() => selectWormSeries(innings1Balls), [innings1Balls]);
+  const series2 = useMemo(() => selectWormSeries(innings2Balls), [innings2Balls]);
 
   const hasAny = (series1.length > 1) || (series2.length > 1);
 

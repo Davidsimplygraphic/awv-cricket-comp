@@ -5,6 +5,11 @@ import { test } from "./test-helpers.js";
 
 const scoreHome = fs.readFileSync(new URL("../src/pages/ScoreHome.jsx", import.meta.url), "utf8");
 const scoreView = fs.readFileSync(new URL("../src/pages/ScoreView.jsx", import.meta.url), "utf8");
+const scorecardTables = fs.readFileSync(new URL("../src/components/ScorecardTables.jsx", import.meta.url), "utf8");
+const ballByBall = fs.readFileSync(new URL("../src/components/BallByBall.jsx", import.meta.url), "utf8");
+const partnerships = fs.readFileSync(new URL("../src/components/Partnerships.jsx", import.meta.url), "utf8");
+const wormGraph = fs.readFileSync(new URL("../src/components/WormGraph.jsx", import.meta.url), "utf8");
+const leaderboards = fs.readFileSync(new URL("../src/pages/Leaderboards.jsx", import.meta.url), "utf8");
 const integrationTypes = fs.readFileSync(new URL("../src/integrations/supabase/types.ts", import.meta.url), "utf8").trim();
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const wicketEventDesign = fs.readFileSync(new URL("../docs/wicket-event-design.md", import.meta.url), "utf8");
@@ -42,6 +47,50 @@ test("retired hurt now uses an administrative state event instead of a fake deli
 
 test("wicket scorer flow does not reference removed wicket-ended-over state", () => {
   assert.doesNotMatch(scoreView, /setWicketEndedOver/);
+});
+
+test("ScoreView relies on shared scoring helpers instead of redefining scorer math locally", () => {
+  assert.match(scoreView, /from "\.\.\/lib\/scoring"/);
+  assert.doesNotMatch(scoreView, /^function (toInt|isAdministrativeBall|isCompetitiveBall|sumRuns|sumWkts|legalBallsCount|oversTextFromLegal|getOverBalls|getOverCounts|isOverFinished|computeNextPosition|sortBallsByPosition|countLegalBallsBowledBy)\(/m);
+});
+
+test("display read-model components rely on the shared ball sorter", () => {
+  for (const source of [scorecardTables, ballByBall, partnerships]) {
+    assert.match(source, /sortBallsByPosition/);
+    assert.doesNotMatch(source, /^function sortBalls\(/m);
+    assert.doesNotMatch(source, /\.sort\(\(a, b\) => .*over_no.*delivery_in_over/m);
+  }
+});
+
+test("WormGraph relies on the shared worm-series selector", () => {
+  assert.match(wormGraph, /selectWormSeries/);
+  assert.doesNotMatch(wormGraph, /^function buildCumulativeSeries\(/m);
+});
+
+test("bowling read models use authoritative bowler wicket-credit helpers instead of raw wicket flags", () => {
+  assert.match(scorecardTables, /isBowlerCreditedWicket/);
+  assert.doesNotMatch(scorecardTables, /if \(x\.wicket\) wkts \+= 1;/);
+
+  assert.match(scoreView, /isBowlerCreditedWicket/);
+  assert.doesNotMatch(scoreView, /if \(b\.wicket\) s\.wickets \+= 1;/);
+
+  assert.match(leaderboards, /isBowlerCreditedWicket/);
+  assert.match(leaderboards, /function computeWktsByBowlerPerInnings[\s\S]*isBowlerCreditedWicket/);
+  assert.doesNotMatch(leaderboards, /const row = perPlayer\.get\(bowlerId\);[\s\S]*if \(b\.wicket\) row\.wkts \+= 1;/);
+});
+
+test("bowling read models use authoritative bowler-conceded run helpers instead of raw run plus extra sums", () => {
+  assert.match(scorecardTables, /runsConcededByBowler/);
+  assert.match(scoreView, /runsConcededByBowler/);
+  assert.match(leaderboards, /runsConcededByBowler/);
+  assert.doesNotMatch(leaderboards, /row\.runs \+= toInt\(b\.runs_off_bat, 0\) \+ toInt\(b\.extra_runs, 0\);/);
+});
+
+test("ScorecardTables and Leaderboards rely on the shared innings summary selector", () => {
+  assert.match(scorecardTables, /selectInningsSummary/);
+  assert.doesNotMatch(scorecardTables, /^function legalBallsCount\(/m);
+  assert.match(leaderboards, /selectInningsSummary/);
+  assert.doesNotMatch(leaderboards, /^function (sumRuns|sumWkts|countLegal|oversTextFromLegal)\(/m);
 });
 
 test("stale scorer backup files are not kept in the repository", () => {

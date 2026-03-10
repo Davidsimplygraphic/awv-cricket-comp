@@ -1,13 +1,4 @@
-function toInt(n, fallback = 0) {
-  const x = Number(n);
-  return Number.isFinite(x) ? x : fallback;
-}
-
-function sortBalls(balls) {
-  return (balls || [])
-    .slice()
-    .sort((a, b) => (toInt(a.over_no, 0) - toInt(b.over_no, 0)) || (toInt(a.delivery_in_over, 0) - toInt(b.delivery_in_over, 0)) || 0);
-}
+import { sortBallsByPosition, toInt } from "../lib/scoring";
 
 function overText(overNo, deliveryInOver) {
   const o = toInt(overNo, 0);
@@ -16,7 +7,7 @@ function overText(overNo, deliveryInOver) {
 }
 
 export default function Partnerships({ balls, theme = "dark" }) {
-  const sorted = sortBalls(balls);
+  const sorted = sortBallsByPosition(balls);
 
   const isLight = theme === "light";
   const text = isLight ? "#0f172a" : "rgba(255,255,255,0.92)";

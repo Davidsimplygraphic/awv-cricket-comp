@@ -18,14 +18,25 @@ import {
 } from "../lib/scoringPersistence";
 import {
   ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE,
-  ADMIN_EXTRA_TYPE_RETIRED_HURT,
   buildScorerPostState,
+  computeNextPosition,
+  countLegalBallsBowledBy,
   DELIVERY_RECORDED_EVENT_TYPE,
   deriveWicketPostState,
   didBatterFaceBall,
+  getOverCounts,
+  isAdministrativeBall,
+  isBowlerCreditedWicket,
+  isOverFinished,
+  legalBallsCount,
   mergeBallIntoList,
   normalizeDeliveryOutcome,
+  oversTextFromLegal,
   runsConcededByBowler,
+  sortBallsByPosition,
+  sumRuns,
+  sumWkts,
+  toInt,
   validateWicketDeliveryInput,
 } from "../lib/scoring";
 import {
@@ -43,132 +54,6 @@ import {
   removePendingEventsForInnings,
   replayPendingEventsOnState,
 } from "../lib/scoringSync";
-
-function toInt(n, fallback = 0) {
-  const x = Number(n);
-  return Number.isFinite(x) ? x : fallback;
-}
-
-function isAdministrativeBall(ball) {
-  return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
-}
-
-function isCompetitiveBall(ball) {
-  return !isAdministrativeBall(ball);
-}
-
-function sumRuns(balls) {
-  return balls.reduce((acc, b) => (isAdministrativeBall(b) ? acc : acc + (b.runs_off_bat || 0) + (b.extra_runs || 0)), 0);
-}
-
-function sumWkts(balls) {
-  return balls.reduce((acc, b) => {
-    if (!b?.wicket) return acc;
-    if (isAdministrativeBall(b) || b?.dismissal_kind === "retired hurt") return acc;
-    return acc + 1;
-  }, 0);
-}
-
-function legalBallsCount(balls) {
-  // Treat NULL as legal (legacy rows); only explicit false is illegal
-  return balls.filter((b) => !isAdministrativeBall(b) && b.legal_ball !== false).length;
-}
-
-function oversTextFromLegal(legalBalls) {
-  const overs = Math.floor(legalBalls / 6);
-  const ballsInOver = legalBalls % 6;
-  return `${overs}.${ballsInOver}`;
-}
-
-function getOverBalls(balls, overNo) {
-  return balls.filter((b) => toInt(b.over_no, 0) === overNo && !isAdministrativeBall(b));
-}
-
-/**
- * Tournament rule:
- * - Hard cap: 7 deliveries max in any over
- * - If NO illegal balls in over: over ends after 6 legal balls (normal)
- * - If there IS an illegal ball in over:
- *   - First illegal ball is NOT legal
- *   - Any further deliveries in that over count as legal (even if illegal)
- *   - Over ends after 7 total deliveries
- */
-function getOverCounts(balls, overNo) {
-  const overBalls = getOverBalls(balls, overNo);
-  const deliveries = overBalls.length;
-  const legal = overBalls.filter((b) => b.legal_ball !== false).length;
-  const hasIllegal = overBalls.some((b) => b.legal_ball === false);
-  return { deliveries, legal, hasIllegal };
-}
-
-function isOverFinished(counts) {
-  if (!counts) return false;
-  if (counts.hasIllegal) return counts.deliveries >= 7;
-  return counts.legal >= 6;
-}
-
-function computeNextPosition(balls) {
-  const competitiveBalls = (balls || []).filter((b) => !isAdministrativeBall(b));
-
-  if (!competitiveBalls.length) {
-    return { over_no: 0, delivery_in_over: 1, counts: { deliveries: 0, legal: 0, hasIllegal: false }, newOver: true };
-  }
-
-  const last = competitiveBalls[competitiveBalls.length - 1];
-  const overNo = toInt(last.over_no, 0);
-  const counts = getOverCounts(competitiveBalls, overNo);
-
-  if (isOverFinished(counts)) {
-    return {
-      over_no: overNo + 1,
-      delivery_in_over: 1,
-      counts: { deliveries: 0, legal: 0, hasIllegal: false },
-      newOver: true,
-    };
-  }
-
-  const nextDelivery = Math.min(7, toInt(last.delivery_in_over, 0) + 1);
-
-  if (nextDelivery > 7 || counts.deliveries >= 7) {
-    return {
-      over_no: overNo + 1,
-      delivery_in_over: 1,
-      counts: { deliveries: 0, legal: 0, hasIllegal: false },
-      newOver: true,
-    };
-  }
-
-  return { over_no: overNo, delivery_in_over: nextDelivery, counts, newOver: false };
-}
-
-function sortBallsByPosition(balls) {
-  const copy = [...balls];
-  copy.sort((a, b) => {
-    const oa = toInt(a.over_no, 0);
-    const ob = toInt(b.over_no, 0);
-    if (oa !== ob) return oa - ob;
-
-    const da = toInt(a.delivery_in_over, 0);
-    const db = toInt(b.delivery_in_over, 0);
-    if (da !== db) return da - db;
-
-    const aAdmin = isAdministrativeBall(a) ? 1 : 0;
-    const bAdmin = isAdministrativeBall(b) ? 1 : 0;
-    if (aAdmin !== bAdmin) return aAdmin - bAdmin;
-
-    const aCreated = a?.created_at ? new Date(a.created_at).getTime() : 0;
-    const bCreated = b?.created_at ? new Date(b.created_at).getTime() : 0;
-    if (aCreated !== bCreated) return aCreated - bCreated;
-
-    return String(a?.id || a?.local_temp_id || "").localeCompare(String(b?.id || b?.local_temp_id || ""));
-  });
-  return copy;
-}
-
-function countLegalBallsBowledBy(balls, bowlerId) {
-  // Treat NULL as legal (legacy rows)
-  return balls.filter((b) => b.bowler_id === bowlerId && b.legal_ball !== false).length;
-}
 
 async function getOrCreateInnings({ matchId, inningsNo, match }) {
   const innRes = await supabase
@@ -2209,7 +2094,7 @@ You can then start scoring again from ball 1.`
 
       if (b.legal_ball) s.legalBalls += 1;
         s.runs += runsConcededByBowler(b);
-      if (b.wicket) s.wickets += 1;
+      if (isBowlerCreditedWicket(b)) s.wickets += 1;
 
       const overNo = toInt(b.over_no, 0);
       if (!s.perOver.has(overNo)) s.perOver.set(overNo, { deliveries: 0, legal: 0, runs: 0 });
