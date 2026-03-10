@@ -93,6 +93,20 @@ test("ScorecardTables and Leaderboards rely on the shared innings summary select
   assert.doesNotMatch(leaderboards, /^function (sumRuns|sumWkts|countLegal|oversTextFromLegal)\(/m);
 });
 
+test("wicket-cap read models use the shared resolver instead of treating nullable caps as raw numbers", () => {
+  assert.match(scoreView, /resolveWicketCap/);
+  assert.match(leaderboards, /resolveWicketCap/);
+
+  const fixtures = fs.readFileSync(new URL("../src/pages/Fixtures.jsx", import.meta.url), "utf8");
+  const spectator = fs.readFileSync(new URL("../src/views/SpectatorView.jsx", import.meta.url), "utf8");
+
+  assert.match(fixtures, /resolveWicketCap/);
+  assert.match(spectator, /resolveWicketCap/);
+  assert.doesNotMatch(fixtures, /wicketCap:\s*toInt\(m\.wicket_cap,\s*10\)/);
+  assert.doesNotMatch(spectator, /const wicketCap = toInt\(match\?\.wicket_cap,\s*10\)/);
+  assert.doesNotMatch(leaderboards, /const wicketCap = toInt\(match\.wicket_cap,\s*10\)/);
+});
+
 test("stale scorer backup files are not kept in the repository", () => {
   assert.equal(fs.existsSync(new URL("../src/pages/ScoreView.jsx.bak", import.meta.url)), false);
 });

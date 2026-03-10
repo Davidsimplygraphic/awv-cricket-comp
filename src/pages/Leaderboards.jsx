@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   isBowlerCreditedWicket,
   oversTextFromLegal,
+  resolveWicketCap,
   runsConcededByBowler,
   selectInningsSummary,
 } from "../lib/scoring";
@@ -252,7 +253,7 @@ export default function Leaderboards() {
       if (!hasI1 || !hasI2) continue;
 
       const oversLimit = toInt(match.overs_limit, 20);
-      const wicketCap = toInt(match.wicket_cap, 10);
+      const wicketCap = resolveWicketCap(match.wicket_cap, 10);
       const maxLegal = oversLimit * 6;
 
       const innings1Summary = selectInningsSummary(b1);

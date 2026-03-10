@@ -11,6 +11,7 @@ import {
   isBowlerCreditedWicket,
   legalBallsCount,
   normalizeDeliveryOutcome,
+  resolveWicketCap,
   runsConcededByBowler,
   selectInningsSummary,
   selectWormSeries,
@@ -19,6 +20,7 @@ import {
   sumWkts,
   updateBallInList,
   validateWicketDeliveryInput,
+  deriveMatchDisplayStatus,
 } from "../src/lib/scoring.js";
 
 test("editing the last delivery to a wide makes it the first illegal ball in the over", () => {
@@ -88,6 +90,29 @@ test("completed chase results report wickets remaining", () => {
   });
 
   assert.equal(text, "Team B won by 2 wickets");
+});
+
+test("wicket cap resolution treats null as the default and non-positive values as at least one wicket", () => {
+  assert.equal(resolveWicketCap(null, 10), 10);
+  assert.equal(resolveWicketCap(undefined, 10), 10);
+  assert.equal(resolveWicketCap("", 10), 10);
+  assert.equal(resolveWicketCap(0, 10), 1);
+  assert.equal(resolveWicketCap(-3, 10), 1);
+  assert.equal(resolveWicketCap(8, 10), 8);
+});
+
+test("match completion heuristics do not treat a missing wicket cap as zero wickets", () => {
+  const status = deriveMatchDisplayStatus({
+    matchStatus: "playing",
+    innings1Row: { completed: true },
+    innings2Row: { completed: false },
+    innings1Balls: [{ over_no: 0, delivery_in_over: 1, legal_ball: true, runs_off_bat: 1, extra_runs: 0, wicket: false }],
+    innings2Balls: [{ over_no: 0, delivery_in_over: 1, legal_ball: true, runs_off_bat: 0, extra_runs: 0, wicket: false }],
+    oversLimit: 20,
+    wicketCap: null,
+  });
+
+  assert.equal(status, "live");
 });
 
 test("run out deliveries can include completed runs and extras", () => {

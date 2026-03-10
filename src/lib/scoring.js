@@ -8,6 +8,22 @@ export function toInt(value, fallback = 0) {
   return Number.isFinite(next) ? next : fallback;
 }
 
+export function resolveWicketCap(value, fallback = 10) {
+  const normalizedFallback = (() => {
+    if (fallback === null || fallback === undefined || fallback === "") return 10;
+    const next = Number(fallback);
+    return Number.isFinite(next) && next > 0 ? next : 10;
+  })();
+
+  if (value === null || value === undefined || value === "") {
+    return normalizedFallback;
+  }
+
+  const next = Number(value);
+  if (!Number.isFinite(next)) return normalizedFallback;
+  return Math.max(1, next);
+}
+
 export function isAdministrativeBall(ball) {
   return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
 }
@@ -577,7 +593,7 @@ export function deriveMatchDisplayStatus({
   const innings2 = buildInningsTotals(innings2Row, innings2Balls);
   const anyBalls = innings1.balls.length + innings2.balls.length > 0;
   const maxLegal = Math.max(1, toInt(oversLimit, 20)) * 6;
-  const maxWickets = Math.max(1, toInt(wicketCap, 10));
+  const maxWickets = resolveWicketCap(wicketCap, 10);
   const innings2Started = innings2.balls.length > 0 || innings2.completed;
   const innings1Started = innings1.balls.length > 0 || innings1.completed;
   const innings2Exhausted = innings2Started && (innings2.completed || innings2.legalBalls >= maxLegal || innings2.wkts >= maxWickets);
@@ -603,7 +619,7 @@ export function buildCompletedResultText({ matchStatus, innings1Team, innings2Te
   if (innings1.runs === innings2.runs) return "Match tied";
 
   if (innings2.runs > innings1.runs) {
-    const wicketsRemaining = Math.max(0, Math.max(1, toInt(wicketCap, 10)) - toInt(innings2.wkts, 0));
+    const wicketsRemaining = Math.max(0, resolveWicketCap(wicketCap, 10) - toInt(innings2.wkts, 0));
     const name = innings2Team?.name || innings2Team?.short_name || "Winning team";
     return `${name} won by ${wicketsRemaining} wicket${wicketsRemaining === 1 ? "" : "s"}`;
   }

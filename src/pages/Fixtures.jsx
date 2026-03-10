@@ -5,6 +5,7 @@ import {
   buildCompletedResultText,
   buildInningsTotals,
   deriveMatchDisplayStatus,
+  resolveWicketCap,
   toInt,
 } from "../lib/scoring";
 
@@ -201,7 +202,7 @@ export default function Fixtures() {
         inn1Team,
         inn2Team,
         oversLimit: toInt(m.overs_limit, 20),
-        wicketCap: toInt(m.wicket_cap, 10),
+        wicketCap: resolveWicketCap(m.wicket_cap, 10),
         timeLabel: formatTime(m.scheduled_at),
         status: displayStatus || "",
         inn1,

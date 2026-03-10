@@ -32,6 +32,7 @@ import {
   mergeBallIntoList,
   normalizeDeliveryOutcome,
   oversTextFromLegal,
+  resolveWicketCap,
   runsConcededByBowler,
   sortBallsByPosition,
   sumRuns,
@@ -240,8 +241,7 @@ export default function ScoreView() {
   const oversText = useMemo(() => oversTextFromLegal(legalBalls), [legalBalls]);
 
   const wicketCap = useMemo(() => {
-    const v = toInt(match?.wicket_cap, 10);
-    return v > 0 ? v : 10;
+    return resolveWicketCap(match?.wicket_cap, 10);
   }, [match]);
 
   const allOut = useMemo(() => wickets >= wicketCap, [wickets, wicketCap]);

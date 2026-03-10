@@ -12,6 +12,7 @@ import {
   didBatterFaceBall,
   deriveMatchDisplayStatus,
   oversTextFromLegal,
+  resolveWicketCap,
   runsConcededByBowler,
   sortBallsByPosition,
   toInt,
@@ -275,7 +276,7 @@ export default function SpectatorView() {
   const activeBalls = activeRow ? (ballsByInnings?.[activeRow.id] || []) : [];
 
   const oversLimit = toInt(match?.overs_limit, 20);
-  const wicketCap = toInt(match?.wicket_cap, 10);
+  const wicketCap = resolveWicketCap(match?.wicket_cap, 10);
 
   const innings1Totals = useMemo(() => {
     return buildInningsTotals(inn1Row, inn1Balls);

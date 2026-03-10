@@ -1,5 +1,5 @@
 BEGIN;
-SELECT plan(16);
+SELECT plan(20);
 
 SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000111', true);
 SELECT set_config('request.jwt.claim.role', 'authenticated', true);
@@ -352,6 +352,39 @@ SELECT throws_ok(
   $$,
   'Cannot add a ball to a completed innings',
   'completed innings reject further delivery_recorded events at the database boundary'
+);
+
+SELECT is(
+  (SELECT wicket_cap::text FROM public.matches WHERE id = '00000000-0000-0000-0000-000000000401'),
+  '3',
+  'persisted wicket cap is derived from the larger playing squad minus one'
+);
+
+UPDATE public.match_squads
+SET is_playing = (player_id = '00000000-0000-0000-0000-000000000301')
+WHERE fixture_id = '00000000-0000-0000-0000-000000000402'
+  AND team_id = '00000000-0000-0000-0000-000000000201';
+
+SELECT is(
+  (SELECT wicket_cap::text FROM public.matches WHERE id = '00000000-0000-0000-0000-000000000401'),
+  '1',
+  'persisted wicket cap clamps to one when the largest playing squad is one'
+);
+
+SELECT is(
+  (SELECT wicket_cap::text FROM public.fixture_wicket_caps WHERE fixture_id = '00000000-0000-0000-0000-000000000402'),
+  '1',
+  'fixture wicket-cap view also clamps to one'
+);
+
+SELECT throws_ok(
+  $$
+    UPDATE public.matches
+    SET wicket_cap = 0
+    WHERE id = '00000000-0000-0000-0000-000000000401';
+  $$,
+  'new row for relation "matches" violates check constraint "matches_wicket_cap_positive_check"',
+  'persisted wicket caps cannot be written below one'
 );
 
 SELECT * FROM finish();
