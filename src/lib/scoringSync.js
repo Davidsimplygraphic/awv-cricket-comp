@@ -26,6 +26,11 @@ export function isMissingRpcError(error) {
   return /function|rpc|does not exist|could not find/i.test(message);
 }
 
+export function missingRequiredRpcMessage(rpcName, actionLabel) {
+  const action = actionLabel || "This action";
+  return `${action} requires the hardened Supabase RPC "${rpcName}". Apply the latest Supabase migrations before continuing.`;
+}
+
 export function isLockConflictError(error) {
   const message = String(error?.message || error || "");
   return /locked by another scorer session/i.test(message);

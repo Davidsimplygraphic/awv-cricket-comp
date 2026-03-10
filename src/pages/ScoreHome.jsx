@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "../lib/supabase";
-import { isMissingRpcError } from "../lib/scoringSync";
+import { isMissingRpcError, missingRequiredRpcMessage } from "../lib/scoringSync";
 
 export default function ScoreHome() {
   const [user, setUser] = useState(null);
@@ -284,23 +284,6 @@ export default function ScoreHome() {
 
     setBusyId(match.id);
 
-    const legacyDeleteMatch = async () => {
-      const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
-      if (delBalls.error) {
-        throw new Error(`Delete balls error: ${delBalls.error.message}`);
-      }
-
-      const delInnings = await supabase.from("innings").delete().eq("match_id", match.id);
-      if (delInnings.error) {
-        throw new Error(`Delete innings error: ${delInnings.error.message}`);
-      }
-
-      const delMatch = await supabase.from("matches").delete().eq("id", match.id);
-      if (delMatch.error) {
-        throw new Error(`Delete match error: ${delMatch.error.message}`);
-      }
-    };
-
     try {
       const { error } = await supabase.rpc("delete_match_state", {
         p_match_id: match.id,
@@ -309,52 +292,19 @@ export default function ScoreHome() {
 
       if (error) {
         if (isMissingRpcError(error)) {
-          await legacyDeleteMatch();
-        } else {
-          throw new Error(`Delete match error: ${error.message}`);
+          throw new Error(missingRequiredRpcMessage("delete_match_state", "Match deletion"));
         }
+        throw new Error(`Delete match error: ${error.message}`);
       }
 
       setMatches((prev) => prev.filter((m) => m.id !== match.id));
       setBusyId("");
       setInfo("Match deleted.");
       if (editingId === match.id) cancelEdit();
-      return;
     } catch (error) {
       setBusyId("");
       setErr(String(error?.message || error || "Match delete failed."));
-      return;
     }
-
-    // 1) delete balls
-    const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
-    if (delBalls.error) {
-      setBusyId("");
-      setErr(`Delete balls error: ${delBalls.error.message}`);
-      return;
-    }
-
-    // 2) delete innings
-    const delInnings = await supabase.from("innings").delete().eq("match_id", match.id);
-    if (delInnings.error) {
-      setBusyId("");
-      setErr(`Delete innings error: ${delInnings.error.message}`);
-      return;
-    }
-
-    // 3) delete match
-    const delMatch = await supabase.from("matches").delete().eq("id", match.id);
-    if (delMatch.error) {
-      setBusyId("");
-      setErr(`Delete match error: ${delMatch.error.message}`);
-      return;
-    }
-
-    setMatches((prev) => prev.filter((m) => m.id !== match.id));
-    setBusyId("");
-    setInfo("Match deleted ✅");
-
-    if (editingId === match.id) cancelEdit();
   };
 
 
@@ -379,29 +329,6 @@ This will delete ALL balls + innings for this match, clear any selected playing 
 
     setBusyId(match.id);
 
-    const legacyResetMatch = async () => {
-      const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
-      if (delBalls.error) {
-        throw new Error(`Reset balls error: ${delBalls.error.message}`);
-      }
-
-      const delInnings = await supabase.from("innings").delete().eq("match_id", match.id);
-      if (delInnings.error) {
-        throw new Error(`Reset innings error: ${delInnings.error.message}`);
-      }
-
-      const fid = match.fixture_id || match.id;
-      if (fid) {
-        const delSq = await supabase.from("match_squads").delete().eq("fixture_id", fid);
-        if (delSq.error) console.warn("Reset: match_squads delete blocked", delSq.error.message);
-      }
-
-      const upd = await supabase.from("matches").update({ status: "scheduled", wicket_cap: null }).eq("id", match.id);
-      if (upd.error) {
-        throw new Error(`Reset match error: ${upd.error.message}`);
-      }
-    };
-
     try {
       const { error } = await supabase.rpc("reset_match_state", {
         p_match_id: match.id,
@@ -411,26 +338,18 @@ This will delete ALL balls + innings for this match, clear any selected playing 
 
       if (error) {
         if (isMissingRpcError(error)) {
-          await legacyResetMatch();
-        } else {
-          throw new Error(`Reset match error: ${error.message}`);
+          throw new Error(missingRequiredRpcMessage("reset_match_state", "Match reset"));
         }
+        throw new Error(`Reset match error: ${error.message}`);
       }
 
       setBusyId("");
       setInfo("Match reset.");
       load();
-      return;
     } catch (error) {
       setBusyId("");
       setErr(String(error?.message || error || "Match reset failed."));
-      return;
     }
-
-
-    setBusyId("");
-    setInfo("Match reset ✅");
-
   };
 
   if (loading) return <div>Loading...</div>;
@@ -629,3 +548,4 @@ This will delete ALL balls + innings for this match, clear any selected playing 
 
 const labelStyle = { fontSize: 12, color: "#666", marginBottom: 6 };
 const inputStyle = { width: "100%", padding: 10 };
+

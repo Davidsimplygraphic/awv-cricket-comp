@@ -465,7 +465,7 @@ begin
       coalesce((p_payload #>> '{ball,batting_turn}')::integer, 1),
       p_event_id
     )
-    on conflict (source_event_id) do nothing
+    on conflict (source_event_id) where source_event_id is not null do nothing
     returning * into v_ball;
 
     if v_ball.id is null then
@@ -477,7 +477,7 @@ begin
 
     update public.match_session_events
     set status = 'applied',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_build_object('ball', to_jsonb(v_ball))
     where event_id = p_event_id;
 
@@ -527,7 +527,7 @@ begin
 
     update public.match_session_events
     set status = 'applied',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_build_object('ball', to_jsonb(v_ball))
     where event_id = p_event_id;
 
@@ -546,7 +546,7 @@ begin
 
     update public.match_session_events
     set status = 'applied',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_build_object('innings', to_jsonb(v_innings))
     where event_id = p_event_id;
 
@@ -565,7 +565,7 @@ begin
 
     update public.match_session_events
     set status = 'applied',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_build_object('innings', to_jsonb(v_innings))
     where event_id = p_event_id;
 
@@ -584,7 +584,7 @@ exception
     v_error_message := sqlerrm;
     update public.match_session_events
     set status = 'failed',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_build_object('error', v_error_message)
     where event_id = p_event_id;
     raise;
@@ -1585,5 +1585,3 @@ CREATE TRIGGER match_squads_recalc_cap AFTER INSERT OR DELETE OR UPDATE ON publi
 CREATE TRIGGER matches_ensure_squads_ins AFTER INSERT ON public.matches FOR EACH ROW EXECUTE FUNCTION public.trg_matches_ensure_squads();
 
 CREATE TRIGGER matches_ensure_squads_upd AFTER UPDATE OF fixture_id, team_a_id, team_b_id ON public.matches FOR EACH ROW EXECUTE FUNCTION public.trg_matches_ensure_squads();
-
-

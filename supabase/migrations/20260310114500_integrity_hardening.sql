@@ -322,7 +322,7 @@ begin
       and innings_id = p_innings_id
       and status = 'applied'
       and event_type in ('end_innings', 'reopen_innings')
-    order by applied_at desc nulls last, created_at desc
+    order by applied_at desc nulls last, created_at desc, id desc
     limit 1;
 
     v_should_complete := (
@@ -389,7 +389,7 @@ begin
       coalesce((p_payload #>> '{ball,batting_turn}')::integer, 1),
       p_event_id
     )
-    on conflict (source_event_id) do nothing
+    on conflict (source_event_id) where source_event_id is not null do nothing
     returning * into v_ball;
 
     if v_ball.id is null then
@@ -427,7 +427,7 @@ begin
       and innings_id = p_innings_id
       and status = 'applied'
       and event_type in ('end_innings', 'reopen_innings')
-    order by applied_at desc nulls last, created_at desc
+    order by applied_at desc nulls last, created_at desc, id desc
     limit 1;
 
     v_should_complete := (
@@ -461,7 +461,7 @@ begin
 
     update public.match_session_events
     set status = 'applied',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_strip_nulls(jsonb_build_object(
           'ball', to_jsonb(v_ball),
           'innings', to_jsonb(v_innings),
@@ -593,7 +593,7 @@ begin
       and innings_id = p_innings_id
       and status = 'applied'
       and event_type in ('end_innings', 'reopen_innings')
-    order by applied_at desc nulls last, created_at desc
+    order by applied_at desc nulls last, created_at desc, id desc
     limit 1;
 
     v_should_complete := (
@@ -623,7 +623,7 @@ begin
 
     update public.match_session_events
     set status = 'applied',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_build_object(
           'ball', to_jsonb(v_ball),
           'innings', to_jsonb(v_innings),
@@ -656,7 +656,7 @@ begin
 
     update public.match_session_events
     set status = 'applied',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_build_object('innings', to_jsonb(v_innings))
     where event_id = p_event_id;
 
@@ -683,7 +683,7 @@ begin
 
     update public.match_session_events
     set status = 'applied',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_build_object('innings', to_jsonb(v_innings))
     where event_id = p_event_id;
 
@@ -702,7 +702,7 @@ exception
     v_error_message := sqlerrm;
     update public.match_session_events
     set status = 'failed',
-        applied_at = now(),
+        applied_at = clock_timestamp(),
         result = jsonb_build_object('error', v_error_message)
     where event_id = p_event_id;
     raise;
@@ -757,7 +757,7 @@ begin
   where match_id = p_match_id
     and innings_id = p_innings_id
     and status = 'applied'
-  order by applied_at desc nulls last, created_at desc
+  order by applied_at desc nulls last, created_at desc, id desc
   limit 1;
 
   if v_latest.id is not null and coalesce((v_latest.result ->> 'invalidate_post_state')::boolean, false) then
@@ -777,7 +777,7 @@ begin
     and innings_id = p_innings_id
     and status = 'applied'
     and result ? 'post_state'
-  order by applied_at desc nulls last, created_at desc
+  order by applied_at desc nulls last, created_at desc, id desc
   limit 1;
 
   return jsonb_build_object(

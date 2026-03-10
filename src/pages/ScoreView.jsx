@@ -27,6 +27,7 @@ import {
   isLockConflictError,
   isMissingRpcError,
   isNetworkLikeError,
+  missingRequiredRpcMessage,
   removePendingEvent,
   removePendingEventsForInnings,
   replayPendingEventsOnState,
@@ -38,6 +39,8 @@ function toInt(n, fallback = 0) {
 }
 
 const ADMIN_EXTRA_TYPE_RETIRED_HURT = "retiredhurt";
+const RETIRED_HURT_UNSUPPORTED_MSG =
+  "Retired hurt needs the upcoming administrative event model and is not available in the live scorer yet.";
 
 function isAdministrativeBall(ball) {
   return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
@@ -1871,50 +1874,8 @@ const battingScorecardRows = useMemo(() => {
   };
 
   const addRetiredHurt = async () => {
-    setErr("");
     setInfo("");
-
-    const ok = canScore();
-    if (!ok.ok) {
-      setErr(ok.msg);
-      return;
-    }
-
-    if (!dismissedPlayerId) {
-      setErr("Select who is retired hurt (striker/non-striker).");
-      return;
-    }
-    if (!incomingBatterId) {
-      setErr("Select the replacement batter.");
-      return;
-    }
-
-    const outWasStriker = dismissedPlayerId === strikerId;
-    const nextStriker = outWasStriker ? incomingBatterId : strikerId;
-    const nextNonStriker = outWasStriker ? nonStrikerId : incomingBatterId;
-    const nextTurn = getTurnFor(nextStriker);
-
-    await insertBall({
-      runs_off_bat: 0,
-      extra_type: ADMIN_EXTRA_TYPE_RETIRED_HURT,
-      extra_runs: 0,
-      wicket: true,
-      dismissal_kind: "retired hurt",
-      dismissed_player_id: dismissedPlayerId,
-      administrative: true,
-      striker_override: nextStriker,
-      non_striker_override: nextNonStriker,
-      bowler_override: null,
-      batting_turn_override: nextTurn,
-      over_no_override: nextPos.over_no,
-      delivery_in_over_override: nextPos.delivery_in_over,
-    });
-
-    setNeedsWicketModal(false);
-    setDismissalKind("bowled");
-    setDismissedPlayerId("");
-    setIncomingBatterId("");
-    setWicketCrossed(false);
+    setErr(RETIRED_HURT_UNSUPPORTED_MSG);
   };
 
   // Incoming batters:
@@ -2110,29 +2071,6 @@ You can then start scoring again from ball 1.`
     setErr("");
     setInfo("");
 
-    const legacyResetMatchData = async () => {
-      const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
-      if (delBalls.error) {
-        throw new Error(`Reset failed (balls): ${delBalls.error.message}`);
-      }
-
-      const delInn = await supabase.from("innings").delete().eq("match_id", match.id);
-      if (delInn.error) {
-        throw new Error(`Reset failed (innings): ${delInn.error.message}`);
-      }
-
-      const fid = canonicalFixtureId || fixtureId;
-      if (fid) {
-        const delSq = await supabase.from("match_squads").delete().eq("fixture_id", fid);
-        if (delSq.error) console.warn("Reset: match_squads delete blocked", delSq.error.message);
-      }
-
-      const upd = await supabase.from("matches").update({ status: "scheduled", wicket_cap: null }).eq("id", match.id);
-      if (upd.error) {
-        throw new Error(`Reset failed (match): ${upd.error.message}`);
-      }
-    };
-
     try {
       const { error } = await supabase.rpc("reset_match_state", {
         p_match_id: match.id,
@@ -2142,10 +2080,9 @@ You can then start scoring again from ball 1.`
 
       if (error) {
         if (isMissingRpcError(error)) {
-          await legacyResetMatchData();
-        } else {
-          throw new Error(`Reset failed: ${error.message}`);
+          throw new Error(missingRequiredRpcMessage("reset_match_state", "Match reset"));
         }
+        throw new Error(`Reset failed: ${error.message}`);
       }
 
       clearLocalMatchState(match.id);
@@ -2902,7 +2839,7 @@ You can then start scoring again from ball 1.`
                   <option value="run out">Run out</option>
                   <option value="stumped">Stumped</option>
                   <option value="hit wicket">Hit wicket</option>
-                  <option value="retired hurt">Retired hurt</option>
+                  <option value="retired hurt" disabled>Retired hurt (coming soon)</option>
                 </select>
               </div>
 
@@ -3038,7 +2975,7 @@ You can then start scoring again from ball 1.`
                       <option value="run out">Run out</option>
                       <option value="stumped">Stumped</option>
                       <option value="hit wicket">Hit wicket</option>
-                      <option value="retired hurt">Retired hurt</option>
+                      <option value="retired hurt" disabled>Retired hurt (coming soon)</option>
                     </select>
 
                     <div style={{ marginTop: 8, fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Dismissed player</div>

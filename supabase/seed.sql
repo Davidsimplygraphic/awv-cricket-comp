@@ -1,0 +1,2 @@
+-- Intentionally empty.
+-- The database integration suite resets from migrations only.
