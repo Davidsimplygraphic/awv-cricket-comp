@@ -37,17 +37,31 @@ function toInt(n, fallback = 0) {
   return Number.isFinite(x) ? x : fallback;
 }
 
+const ADMIN_EXTRA_TYPE_RETIRED_HURT = "retiredhurt";
+
+function isAdministrativeBall(ball) {
+  return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
+}
+
+function isCompetitiveBall(ball) {
+  return !isAdministrativeBall(ball);
+}
+
 function sumRuns(balls) {
-  return balls.reduce((acc, b) => acc + (b.runs_off_bat || 0) + (b.extra_runs || 0), 0);
+  return balls.reduce((acc, b) => (isAdministrativeBall(b) ? acc : acc + (b.runs_off_bat || 0) + (b.extra_runs || 0)), 0);
 }
 
 function sumWkts(balls) {
-  return balls.reduce((acc, b) => acc + (b.wicket ? 1 : 0), 0);
+  return balls.reduce((acc, b) => {
+    if (!b?.wicket) return acc;
+    if (isAdministrativeBall(b) || b?.dismissal_kind === "retired hurt") return acc;
+    return acc + 1;
+  }, 0);
 }
 
 function legalBallsCount(balls) {
   // Treat NULL as legal (legacy rows); only explicit false is illegal
-  return balls.filter((b) => b.legal_ball !== false).length;
+  return balls.filter((b) => !isAdministrativeBall(b) && b.legal_ball !== false).length;
 }
 
 function oversTextFromLegal(legalBalls) {
@@ -57,7 +71,7 @@ function oversTextFromLegal(legalBalls) {
 }
 
 function getOverBalls(balls, overNo) {
-  return balls.filter((b) => toInt(b.over_no, 0) === overNo);
+  return balls.filter((b) => toInt(b.over_no, 0) === overNo && !isAdministrativeBall(b));
 }
 
 /**
@@ -84,13 +98,15 @@ function isOverFinished(counts) {
 }
 
 function computeNextPosition(balls) {
-  if (!balls.length) {
+  const competitiveBalls = (balls || []).filter((b) => !isAdministrativeBall(b));
+
+  if (!competitiveBalls.length) {
     return { over_no: 0, delivery_in_over: 1, counts: { deliveries: 0, legal: 0, hasIllegal: false }, newOver: true };
   }
 
-  const last = balls[balls.length - 1];
+  const last = competitiveBalls[competitiveBalls.length - 1];
   const overNo = toInt(last.over_no, 0);
-  const counts = getOverCounts(balls, overNo);
+  const counts = getOverCounts(competitiveBalls, overNo);
 
   if (isOverFinished(counts)) {
     return {
@@ -121,9 +137,31 @@ function sortBallsByPosition(balls) {
     const oa = toInt(a.over_no, 0);
     const ob = toInt(b.over_no, 0);
     if (oa !== ob) return oa - ob;
-    return toInt(a.delivery_in_over, 0) - toInt(b.delivery_in_over, 0);
+
+    const da = toInt(a.delivery_in_over, 0);
+    const db = toInt(b.delivery_in_over, 0);
+    if (da !== db) return da - db;
+
+    const aAdmin = isAdministrativeBall(a) ? 1 : 0;
+    const bAdmin = isAdministrativeBall(b) ? 1 : 0;
+    if (aAdmin !== bAdmin) return aAdmin - bAdmin;
+
+    const aCreated = a?.created_at ? new Date(a.created_at).getTime() : 0;
+    const bCreated = b?.created_at ? new Date(b.created_at).getTime() : 0;
+    if (aCreated !== bCreated) return aCreated - bCreated;
+
+    return String(a?.id || a?.local_temp_id || "").localeCompare(String(b?.id || b?.local_temp_id || ""));
   });
   return copy;
+}
+
+function mergeBallIntoList(prev, nextBall) {
+  const withoutTemp = (prev || []).filter((b) => {
+    if (nextBall?.local_temp_id && b?.local_temp_id === nextBall.local_temp_id) return false;
+    if (nextBall?.id && b?.id === nextBall.id) return false;
+    return true;
+  });
+  return sortBallsByPosition([...withoutTemp, nextBall]);
 }
 
 function countLegalBallsBowledBy(balls, bowlerId) {
@@ -212,6 +250,57 @@ async function loadSquadPlayers({ fixtureId, teamId }) {
 
   if (p2.error) return { data: null, error: p2.error };
   return { data: p2.data || [], error: null };
+}
+
+function getPendingQueueKey(matchId, inningsId) {
+  return `awv_pending_balls_${matchId || "unknown"}_${inningsId || "unknown"}`;
+}
+
+function readPendingQueue(matchId, inningsId) {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(getPendingQueueKey(matchId, inningsId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingQueue(matchId, inningsId, queue) {
+  if (typeof window === "undefined") return;
+  const key = getPendingQueueKey(matchId, inningsId);
+  if (!queue?.length) {
+    window.localStorage.removeItem(key);
+    return;
+  }
+  window.localStorage.setItem(key, JSON.stringify(queue));
+}
+
+
+function getScorerStateKey(matchId, inningsId) {
+  return `awv_scorer_state_${matchId || "unknown"}_${inningsId || "unknown"}`;
+}
+
+function readScorerState(matchId, inningsId) {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(getScorerStateKey(matchId, inningsId));
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeScorerState(matchId, inningsId, state) {
+  if (typeof window === "undefined" || !matchId || !inningsId) return;
+  const key = getScorerStateKey(matchId, inningsId);
+  if (!state) {
+    window.localStorage.removeItem(key);
+    return;
+  }
+  window.localStorage.setItem(key, JSON.stringify(state));
 }
 
 export default function ScoreView() {
@@ -334,8 +423,8 @@ export default function ScoreView() {
   const nextPos = useMemo(() => computeNextPosition(balls), [balls]);
 
   const lastOverBowlerId = useMemo(() => {
-    if (!balls.length) return "";
-    return balls[balls.length - 1]?.bowler_id || "";
+    const competitive = [...balls].reverse().find((b) => !isAdministrativeBall(b));
+    return competitive?.bowler_id || "";
   }, [balls]);
 
   const currentRR = useMemo(() => {
@@ -1558,8 +1647,8 @@ const battingScorecardRows = useMemo(() => {
       }
     } else {
       // Mid-over: bowler cannot change
-      const last = balls[balls.length - 1];
-      if (last?.bowler_id && bowlerId !== last.bowler_id) {
+      const lastCompetitive = [...balls].reverse().find((b) => !isAdministrativeBall(b));
+      if (lastCompetitive?.bowler_id && bowlerId !== lastCompetitive.bowler_id) {
         return { ok: false, msg: "Bowler cannot change mid-over." };
       }
     }
@@ -1654,7 +1743,11 @@ const battingScorecardRows = useMemo(() => {
       let extra_runs_calc = 0;
       let legal_ball = true;
 
-      if (extra_type === "wide") {
+      if (administrative && extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT) {
+        extra_runs_calc = 0;
+        legal_ball = false;
+        runs_off_bat = 0;
+      } else if (extra_type === "wide") {
         extra_runs_calc = Math.max(2, toInt(extra_runs ?? 2, 2));
         runs_off_bat = 0;
         legal_ball = overAlreadyHadIllegal ? true : false;
@@ -1837,6 +1930,53 @@ const battingScorecardRows = useMemo(() => {
     setNeedsWicketModal(true);
   };
 
+  const addRetiredHurt = async () => {
+    setErr("");
+    setInfo("");
+
+    const ok = canScore();
+    if (!ok.ok) {
+      setErr(ok.msg);
+      return;
+    }
+
+    if (!dismissedPlayerId) {
+      setErr("Select who is retired hurt (striker/non-striker).");
+      return;
+    }
+    if (!incomingBatterId) {
+      setErr("Select the replacement batter.");
+      return;
+    }
+
+    const outWasStriker = dismissedPlayerId === strikerId;
+    const nextStriker = outWasStriker ? incomingBatterId : strikerId;
+    const nextNonStriker = outWasStriker ? nonStrikerId : incomingBatterId;
+    const nextTurn = getTurnFor(nextStriker);
+
+    await insertBall({
+      runs_off_bat: 0,
+      extra_type: ADMIN_EXTRA_TYPE_RETIRED_HURT,
+      extra_runs: 0,
+      wicket: true,
+      dismissal_kind: "retired hurt",
+      dismissed_player_id: dismissedPlayerId,
+      administrative: true,
+      striker_override: nextStriker,
+      non_striker_override: nextNonStriker,
+      bowler_override: null,
+      batting_turn_override: nextTurn,
+      over_no_override: nextPos.over_no,
+      delivery_in_over_override: nextPos.delivery_in_over,
+    });
+
+    setNeedsWicketModal(false);
+    setDismissalKind("bowled");
+    setDismissedPlayerId("");
+    setIncomingBatterId("");
+    setWicketCrossed(false);
+  };
+
   // Incoming batters:
   // - allow ANY squad player not currently at crease (even if dismissed before),
   //   because players may bat twice under wicket cap rule.
@@ -1939,6 +2079,10 @@ const battingScorecardRows = useMemo(() => {
 
   const endInnings = async () => {
     if (!innings?.id) return;
+    if (scoringLocked) {
+      setErr("Another scorer session currently holds this match. Use override to take control.");
+      return;
+    }
     setErr("");
     setInfo("");
     savingRef.current = true;
@@ -1973,6 +2117,10 @@ const battingScorecardRows = useMemo(() => {
 
   const reopenInnings = async () => {
     if (!innings?.id) return;
+    if (scoringLocked) {
+      setErr("Another scorer session currently holds this match. Use override to take control.");
+      return;
+    }
     setErr("");
     setInfo("");
     savingRef.current = true;
@@ -2600,7 +2748,9 @@ You can then start scoring again from ball 1.`
             <div style={{ padding: 12, paddingTop: 0 }}>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                 {balls.slice(-18).reverse().map((b) => {
-                  const label = b.extra_type
+                  const label = isAdministrativeBall(b)
+                    ? "RH"
+                    : b.extra_type
                     ? b.extra_type === "wide"
                       ? `Wd(${b.extra_runs || 0})`
                       : b.extra_type === "noball"
@@ -2611,7 +2761,7 @@ You can then start scoring again from ball 1.`
                     : `${b.runs_off_bat || 0}`;
                   return (
                     <div
-                      key={b.id}
+                      key={b.id || b.local_temp_id}
                       title={`Over ${b.over_no}.${b.delivery_in_over}`}
                       style={{
                         width: 76,
@@ -2627,7 +2777,8 @@ You can then start scoring again from ball 1.`
                       <div style={{ marginTop: 4, fontSize: 11, color: "rgba(232,238,252,0.65)" }}>
                         {b.over_no}.{b.delivery_in_over}
                       </div>
-                      {b.wicket ? <div style={{ marginTop: 4, fontSize: 11, color: "#ffb3b3" }}>W</div> : null}
+                      {b.wicket ? <div style={{ marginTop: 4, fontSize: 11, color: "#ffb3b3" }}>{isAdministrativeBall(b) ? "RH" : "W"}</div> : null}
+                      {b._pending ? <div style={{ marginTop: 4, fontSize: 10, color: "#ffe4b0" }}>Pending</div> : null}
                       {b.batting_turn ? (
                         <div style={{ marginTop: 4, fontSize: 11, color: "rgba(232,238,252,0.65)" }}>T{b.batting_turn}</div>
                       ) : null}
@@ -2809,6 +2960,7 @@ You can then start scoring again from ball 1.`
                   <option value="run out">Run out</option>
                   <option value="stumped">Stumped</option>
                   <option value="hit wicket">Hit wicket</option>
+                  <option value="retired hurt">Retired hurt</option>
                 </select>
               </div>
 
@@ -2833,17 +2985,27 @@ You can then start scoring again from ball 1.`
                 </select>
               </div>
 
-              <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                <input type="checkbox" checked={wicketCrossed} onChange={(e) => setWicketCrossed(e.target.checked)} />
-                <span style={{ fontWeight: 900 }}>Batters crossed</span>
-              </label>
+              {dismissalKind !== "retired hurt" ? (
+                <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <input type="checkbox" checked={wicketCrossed} onChange={(e) => setWicketCrossed(e.target.checked)} />
+                  <span style={{ fontWeight: 900 }}>Batters crossed</span>
+                </label>
+              ) : (
+                <div style={{ fontSize: 12, color: "rgba(232,238,252,0.60)" }}>
+                  Retired hurt is recorded without consuming a ball.
+                </div>
+              )}
 
               <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
                 <button onClick={() => setNeedsWicketModal(false)} style={modalBtnGhost}>
                   Cancel
                 </button>
-                <button onClick={confirmWicket} disabled={saving} style={modalBtnPrimary}>
-                  Confirm wicket
+                <button
+                  onClick={dismissalKind === "retired hurt" ? addRetiredHurt : confirmWicket}
+                  disabled={saving}
+                  style={modalBtnPrimary}
+                >
+                  {dismissalKind === "retired hurt" ? "Confirm retired hurt" : "Confirm wicket"}
                 </button>
               </div>
             </div>
@@ -2934,6 +3096,7 @@ You can then start scoring again from ball 1.`
                       <option value="run out">Run out</option>
                       <option value="stumped">Stumped</option>
                       <option value="hit wicket">Hit wicket</option>
+                      <option value="retired hurt">Retired hurt</option>
                     </select>
 
                     <div style={{ marginTop: 8, fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Dismissed player</div>
@@ -3028,3 +3191,4 @@ You can then start scoring again from ball 1.`
     </div>
   ); 
 } 
+
