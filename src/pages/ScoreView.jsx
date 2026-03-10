@@ -3009,7 +3009,7 @@ You can then start scoring again from ball 1.`
                       <option value="run out">Run out</option>
                       <option value="stumped">Stumped</option>
                       <option value="hit wicket">Hit wicket</option>
-                      <option value="retired hurt" disabled>Retired hurt (coming soon)</option>
+                      <option value="retired hurt" disabled>Retired hurt (record separately, not via ball edit)</option>
                     </select>
 
                     <div style={{ marginTop: 8, fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Dismissed player</div>
