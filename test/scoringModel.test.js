@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "./test-helpers.js";
 
 import {
+  DELIVERY_RECORDED_EVENT_TYPE,
   buildInningsTotals,
   buildScorerPostState,
   computeNextPosition,
@@ -142,10 +143,10 @@ test("long scoring session stays rebuildable across innings and offline replay",
     const previewEvent = {
       created_at: stamp(),
       event_id: `preview-${readyState.innings.id}-${clock}`,
-      event_type: "add_ball",
+      event_type: DELIVERY_RECORDED_EVENT_TYPE,
       innings_id: readyState.innings.id,
       match_id: "match-1",
-      payload: { ball: payloadBall },
+      payload: { delivery: payloadBall },
     };
     const nextBalls = applyEventOptimistically({
       balls: readyState.balls,
@@ -185,11 +186,11 @@ test("long scoring session stays rebuildable across innings and offline replay",
     const event = {
       created_at: stamp(),
       event_id: `evt-${readyState.innings.id}-${clock}`,
-      event_type: "add_ball",
+      event_type: DELIVERY_RECORDED_EVENT_TYPE,
       innings_id: readyState.innings.id,
       match_id: "match-1",
       payload: {
-        ball: payloadBall,
+        delivery: payloadBall,
         post_state: postState,
       },
     };
@@ -214,7 +215,7 @@ test("long scoring session stays rebuildable across innings and offline replay",
         updated_at: stamp(),
         created_at: event.created_at,
         source_event_id: event.event_id,
-        ...event.payload.ball,
+        ...(event.payload.delivery || event.payload.ball || {}),
       },
     };
     const applied = applyRpcResultToState({
@@ -356,8 +357,8 @@ test("long scoring session stays rebuildable across innings and offline replay",
   const replay1 = buildInningsTotals(rebuilt1.innings, rebuilt1.balls);
   const replay2 = buildInningsTotals(rebuilt2.innings, rebuilt2.balls);
 
-  assert.equal(innings1Events.filter((event) => event.event_type === "add_ball").length, live1.balls.length);
-  assert.equal(innings2Events.filter((event) => event.event_type === "add_ball").length, live2.balls.length);
+  assert.equal(innings1Events.filter((event) => event.event_type === DELIVERY_RECORDED_EVENT_TYPE).length, live1.balls.length);
+  assert.equal(innings2Events.filter((event) => event.event_type === DELIVERY_RECORDED_EVENT_TYPE).length, live2.balls.length);
   assert.equal(live1.runs, replay1.runs);
   assert.equal(live1.wkts, replay1.wkts);
   assert.equal(live1.legalBalls, replay1.legalBalls);

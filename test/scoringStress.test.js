@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 import { test } from "./test-helpers.js";
-import { buildInningsTotals, computeNextPosition } from "../src/lib/scoring.js";
+import { buildInningsTotals, computeNextPosition, DELIVERY_RECORDED_EVENT_TYPE } from "../src/lib/scoring.js";
 import { applyRpcResultToState, replayPendingEventsOnState } from "../src/lib/scoringSync.js";
 import { createLongOfflineActions, simulateScenario } from "./scoringAuditHarness.js";
 
-const integritySql = fs.readFileSync(
-  new URL("../supabase/migrations/20260310114500_integrity_hardening.sql", import.meta.url),
-  "utf8"
-);
+const integritySql = [
+  "../supabase/migrations/20260310114500_integrity_hardening.sql",
+  "../supabase/migrations/20260310153000_wicket_event_model.sql",
+].map((path) => fs.readFileSync(new URL(path, import.meta.url), "utf8")).join("\n");
 
 test("Scenario 1: 50-ball offline session replays deterministically on reconnect", () => {
   const simulation = simulateScenario({
@@ -35,7 +35,7 @@ test("Scenario 3: refresh recovery uses post_state and fails closed after invali
     innings: { id: "inn-1", completed: false },
     event: {
       event_id: "evt-add",
-      event_type: "add_ball",
+      event_type: DELIVERY_RECORDED_EVENT_TYPE,
       innings_id: "inn-1",
       payload: {},
     },
@@ -72,7 +72,7 @@ test("Scenario 3: refresh recovery uses post_state and fails closed after invali
 });
 
 test("Scenario 4: the server contract prevents extra balls after innings completion", () => {
-  assert.match(integritySql, /if p_event_type = 'add_ball' then[\s\S]*raise exception 'Cannot add a ball to a completed innings'/);
+  assert.match(integritySql, /if v_effective_event_type = 'delivery_recorded' then[\s\S]*raise exception 'Cannot add a ball to a completed innings'/);
   assert.match(integritySql, /v_should_complete := \(/);
 });
 

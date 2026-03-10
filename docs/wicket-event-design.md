@@ -86,6 +86,22 @@ Suggested payload:
 }
 ```
 
+## Implemented In This Repository
+
+The current implementation now supports:
+
+- `delivery_recorded` for all normal deliveries
+- `delivery_recorded` wickets with completed runs or extras for `run out`
+- `delivery_recorded` wides on `stumped` only as the base wide, with no completed runs
+- `administrative_state_changed` for `retired_hurt`
+
+The current implementation still fails closed for:
+
+- `retired hurt` sent as a delivery event
+- wicket-plus-extras for non-`run out` dismissals
+- `stumped` deliveries with completed runs
+- any administrative action type other than `retired_hurt`
+
 ## Projection Rules
 
 - `balls` remains an ordered projection, not the source of truth.

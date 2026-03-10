@@ -16,6 +16,10 @@ const integrityHardeningSql = fs.readFileSync(
   new URL("../supabase/migrations/20260310114500_integrity_hardening.sql", import.meta.url),
   "utf8"
 );
+const wicketEventModelSql = fs.readFileSync(
+  new URL("../supabase/migrations/20260310153000_wicket_event_model.sql", import.meta.url),
+  "utf8"
+);
 const migrationNames = fs
   .readdirSync(new URL("../supabase/migrations/", import.meta.url))
   .filter((name) => name.endsWith(".sql"));
@@ -30,9 +34,18 @@ test("destructive scorer admin flows require hardened RPCs and no longer fall ba
   assert.match(scoreView, /missingRequiredRpcMessage\("reset_match_state"/);
 });
 
-test("retired hurt is explicitly fail-closed until administrative events are implemented", () => {
-  assert.match(scoreView, /RETIRED_HURT_UNSUPPORTED_MSG/);
-  assert.match(scoreView, /Retired hurt \(coming soon\)/);
+test("retired hurt now uses an administrative state event instead of a fake delivery", () => {
+  assert.match(scoreView, /ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE/);
+  assert.match(scoreView, /action_type: "retired_hurt"/);
+  assert.doesNotMatch(scoreView, /RETIRED_HURT_UNSUPPORTED_MSG/);
+});
+
+test("wicket scorer flow does not reference removed wicket-ended-over state", () => {
+  assert.doesNotMatch(scoreView, /setWicketEndedOver/);
+});
+
+test("stale scorer backup files are not kept in the repository", () => {
+  assert.equal(fs.existsSync(new URL("../src/pages/ScoreView.jsx.bak", import.meta.url)), false);
 });
 
 test("db integration scripts are wired into the repository", () => {
@@ -53,6 +66,13 @@ test("ball event idempotency uses the partial source_event_id index predicate co
 test("latest event ordering relies on per-call timestamps rather than transaction-scoped now()", () => {
   assert.match(integrityHardeningSql, /applied_at = clock_timestamp\(\)/);
   assert.doesNotMatch(integrityHardeningSql, /applied_at = now\(\)/);
+});
+
+test("forward wicket event migration distinguishes delivery and administrative events", () => {
+  assert.match(wicketEventModelSql, /v_effective_event_type := case/);
+  assert.match(wicketEventModelSql, /v_effective_event_type = 'delivery_recorded'/);
+  assert.match(wicketEventModelSql, /v_effective_event_type = 'administrative_state_changed'/);
+  assert.match(wicketEventModelSql, /Use administrative_state_changed for retired hurt events/);
 });
 
 test("integrations supabase types re-export the authoritative type source", () => {

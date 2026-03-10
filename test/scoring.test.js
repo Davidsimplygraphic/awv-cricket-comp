@@ -3,9 +3,12 @@ import { test } from "./test-helpers.js";
 
 import {
   buildCompletedResultText,
+  deriveWicketPostState,
   didBatterFaceBall,
+  normalizeDeliveryOutcome,
   runsConcededByBowler,
   updateBallInList,
+  validateWicketDeliveryInput,
 } from "../src/lib/scoring.js";
 
 test("editing the last delivery to a wide makes it the first illegal ball in the over", () => {
@@ -54,4 +57,63 @@ test("completed chase results report wickets remaining", () => {
   });
 
   assert.equal(text, "Team B won by 2 wickets");
+});
+
+test("run out deliveries can include completed runs and extras", () => {
+  const validated = validateWicketDeliveryInput({
+    dismissalKind: "run out",
+    runsOffBat: 1,
+    extraType: "noball",
+    extraRuns: 1,
+  });
+
+  assert.equal(validated.ok, true);
+
+  const normalized = normalizeDeliveryOutcome({
+    runsOffBat: validated.runsOffBat,
+    extraType: validated.extraType,
+    extraRuns: validated.extraRuns,
+    priorOverBalls: [],
+  });
+
+  assert.equal(normalized.runsOffBat, 1);
+  assert.equal(normalized.extraType, "noball");
+  assert.equal(normalized.extraRuns, 1);
+  assert.equal(normalized.legalBall, false);
+});
+
+test("unsupported wicket-plus-extra combinations fail closed", () => {
+  const bowledWithBye = validateWicketDeliveryInput({
+    dismissalKind: "bowled",
+    runsOffBat: 0,
+    extraType: "bye",
+    extraRuns: 1,
+  });
+  assert.equal(bowledWithBye.ok, false);
+
+  const stumpedWithExtraRuns = validateWicketDeliveryInput({
+    dismissalKind: "stumped",
+    runsOffBat: 0,
+    extraType: "wide",
+    extraRuns: 3,
+  });
+  assert.equal(stumpedWithExtraRuns.ok, false);
+});
+
+test("run out post-state follows completed runs before replacing the dismissed batter", () => {
+  const postState = deriveWicketPostState({
+    strikerId: "bat-1",
+    nonStrikerId: "bat-2",
+    incomingBatterId: "bat-3",
+    dismissedPlayerId: "bat-1",
+    dismissalKind: "run out",
+    totalRunsOnBall: 1,
+    overFinishedAfter: false,
+    inningsComplete: false,
+    bowlerId: "bowl-1",
+    getTurnFor: () => 1,
+  });
+
+  assert.equal(postState.striker_id, "bat-2");
+  assert.equal(postState.non_striker_id, "bat-3");
 });

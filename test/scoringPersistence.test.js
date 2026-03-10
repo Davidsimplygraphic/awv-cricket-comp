@@ -3,8 +3,10 @@ import { test } from "./test-helpers.js";
 
 import {
   clearPendingEvents,
+  clearLegacyPendingBallQueues,
   clearScorerState,
   clearScoringSnapshot,
+  readLegacyPendingBallQueues,
   readPendingEvents,
   readScorerState,
   readScoringSnapshot,
@@ -72,6 +74,33 @@ test("pending event persistence is isolated per scorer session and migrates lega
     clearPendingEvents("match-1", "session-a");
     assert.deepEqual(readPendingEvents("match-1", "session-a"), []);
     assert.deepEqual(readPendingEvents("match-1", "session-b").map((event) => event.event_id), ["session-b"]);
+  });
+});
+
+test("legacy pending ball queues migrate into delivery_recorded events", () => {
+  withWindow(({ localStorage }) => {
+    localStorage.setItem(
+      "awv_pending_balls_match-1_inn-1",
+      JSON.stringify([
+        {
+          local_temp_id: "legacy-ball-1",
+          created_at: "2026-03-10T12:00:00.000Z",
+          payload: {
+            over_no: 0,
+            delivery_in_over: 1,
+            runs_off_bat: 1,
+          },
+        },
+      ])
+    );
+
+    const migrated = readLegacyPendingBallQueues("match-1");
+    assert.equal(migrated.length, 1);
+    assert.equal(migrated[0].event_type, "delivery_recorded");
+    assert.equal(migrated[0].payload.delivery.over_no, 0);
+
+    clearLegacyPendingBallQueues("match-1");
+    assert.equal(localStorage.getItem("awv_pending_balls_match-1_inn-1"), null);
   });
 });
 

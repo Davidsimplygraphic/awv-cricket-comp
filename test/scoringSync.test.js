@@ -9,6 +9,10 @@ import {
   removePendingEventsForInnings,
   replayPendingEventsOnState,
 } from "../src/lib/scoringSync.js";
+import {
+  ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE,
+  DELIVERY_RECORDED_EVENT_TYPE,
+} from "../src/lib/scoring.js";
 
 test("pending events keep insertion order when timestamps collide", () => {
   const createdAt = "2026-03-10T12:00:00.000Z";
@@ -206,4 +210,86 @@ test("authoritative replay failures are detected and can discard the affected in
   assert.equal(isAuthoritativeScoringRejection(new Error("Only the latest ball in an innings can be edited safely")), true);
   assert.equal(isAuthoritativeScoringRejection(new Error("duplicate key value violates unique constraint \"balls_unique_position\"")), true);
   assert.equal(isAuthoritativeScoringRejection(new Error("Match is locked by another scorer session")), false);
+});
+
+test("delivery_recorded events replay like legacy add_ball events", () => {
+  const replayed = replayPendingEventsOnState({
+    balls: [],
+    innings: { id: "inn-1", completed: false },
+    queue: [
+      {
+        event_id: "evt-delivery",
+        event_type: DELIVERY_RECORDED_EVENT_TYPE,
+        innings_id: "inn-1",
+        created_at: "2026-03-10T12:00:00.000Z",
+        payload: {
+          delivery: {
+            over_no: 0,
+            delivery_in_over: 1,
+            runs_off_bat: 2,
+            extra_runs: 0,
+          },
+        },
+      },
+    ],
+    inningsId: "inn-1",
+  });
+
+  assert.equal(replayed.balls.length, 1);
+  assert.equal(replayed.balls[0].runs_off_bat, 2);
+});
+
+test("administrative_state_changed updates queued scorer recovery without creating a delivery", () => {
+  const derived = deriveQueuedScorerState({
+    inningsId: "inn-1",
+    basePostState: {
+      striker_id: "bat-1",
+      non_striker_id: "bat-2",
+      bowler_id: "bowl-1",
+      needs_next_bowler: false,
+    },
+    queue: [
+      {
+        event_id: "evt-admin",
+        event_type: ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE,
+        innings_id: "inn-1",
+        created_at: "2026-03-10T12:00:01.000Z",
+        payload: {
+          action_type: "retired_hurt",
+          post_state: {
+            striker_id: "bat-3",
+            non_striker_id: "bat-2",
+            bowler_id: "bowl-1",
+            needs_next_bowler: false,
+          },
+        },
+      },
+    ],
+  });
+
+  assert.equal(derived.invalidatesPostState, false);
+  assert.equal(derived.postState.striker_id, "bat-3");
+
+  const applied = applyRpcResultToState({
+    balls: [{ id: "ball-1", over_no: 0, delivery_in_over: 1 }],
+    innings: { id: "inn-1", completed: false },
+    event: {
+      event_id: "evt-admin",
+      event_type: ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE,
+      innings_id: "inn-1",
+      payload: {},
+    },
+    result: {
+      administrative_state: { action_type: "retired_hurt" },
+      post_state: {
+        striker_id: "bat-3",
+        non_striker_id: "bat-2",
+        bowler_id: "bowl-1",
+        needs_next_bowler: false,
+      },
+    },
+  });
+
+  assert.equal(applied.balls.length, 1);
+  assert.equal(applied.postState.striker_id, "bat-3");
 });

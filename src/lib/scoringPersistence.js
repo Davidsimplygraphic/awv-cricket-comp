@@ -3,6 +3,8 @@ function safeStorage(kind) {
   return kind === "session" ? window.sessionStorage : window.localStorage;
 }
 
+const DELIVERY_RECORDED_EVENT_TYPE = "delivery_recorded";
+
 function safeParse(raw, fallback) {
   try {
     return raw ? JSON.parse(raw) : fallback;
@@ -169,9 +171,9 @@ export function readLegacyPendingBallQueues(matchId) {
       legacy.push({
         created_at: item.created_at || null,
         event_id: eventId,
-        event_type: "add_ball",
+        event_type: DELIVERY_RECORDED_EVENT_TYPE,
         innings_id: inningsId,
-        payload: { ball: { ...item.payload, source_event_id: eventId } },
+        payload: { delivery: { ...item.payload, source_event_id: eventId } },
       });
     }
   }

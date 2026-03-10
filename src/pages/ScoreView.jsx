@@ -16,7 +16,18 @@ import {
   writeScoringSnapshot,
   writeScorerState,
 } from "../lib/scoringPersistence";
-import { buildScorerPostState, didBatterFaceBall, mergeBallIntoList, runsConcededByBowler } from "../lib/scoring";
+import {
+  ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE,
+  ADMIN_EXTRA_TYPE_RETIRED_HURT,
+  buildScorerPostState,
+  DELIVERY_RECORDED_EVENT_TYPE,
+  deriveWicketPostState,
+  didBatterFaceBall,
+  mergeBallIntoList,
+  normalizeDeliveryOutcome,
+  runsConcededByBowler,
+  validateWicketDeliveryInput,
+} from "../lib/scoring";
 import {
   applyEventOptimistically,
   applyRpcResultToState,
@@ -37,10 +48,6 @@ function toInt(n, fallback = 0) {
   const x = Number(n);
   return Number.isFinite(x) ? x : fallback;
 }
-
-const ADMIN_EXTRA_TYPE_RETIRED_HURT = "retiredhurt";
-const RETIRED_HURT_UNSUPPORTED_MSG =
-  "Retired hurt needs the upcoming administrative event model and is not available in the live scorer yet.";
 
 function isAdministrativeBall(ball) {
   return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
@@ -289,7 +296,9 @@ export default function ScoreView() {
   const [wicketCrossed, setWicketCrossed] = useState(false);
   const [incomingBatterId, setIncomingBatterId] = useState("");
   const [dismissalKind, setDismissalKind] = useState("bowled");
-  const [wicketEndedOver, setWicketEndedOver] = useState(false);
+  const [wicketBatRuns, setWicketBatRuns] = useState(0);
+  const [wicketExtraType, setWicketExtraType] = useState(null);
+  const [wicketExtraRuns, setWicketExtraRuns] = useState(0);
 
   // ✅ NEW: select who was dismissed (striker vs non-striker)
   const [dismissedPlayerId, setDismissedPlayerId] = useState("");
@@ -1599,7 +1608,7 @@ const battingScorecardRows = useMemo(() => {
     return { ok: true, msg: "" };
   };
 
-  const canScore = () => {
+  const canScore = ({ requireBowler = true } = {}) => {
     const currentInnings = inningsRef.current;
     const currentBalls = ballsRef.current;
     const currentStrikerId = strikerIdRef.current;
@@ -1629,21 +1638,23 @@ const battingScorecardRows = useMemo(() => {
     if (!currentStrikerId || !currentNonStrikerId) return { ok: false, msg: "Select striker and non-striker." };
     if (currentStrikerId === currentNonStrikerId) return { ok: false, msg: "Striker and non-striker must be different." };
 
-    if (!currentBowlerId) return { ok: false, msg: "Select current bowler." };
+    if (requireBowler) {
+      if (!currentBowlerId) return { ok: false, msg: "Select current bowler." };
 
-    if (currentNextPos.newOver) {
-      if (currentBowlerId === currentLastOverBowlerId && currentLastOverBowlerId) {
-        return { ok: false, msg: "Bowler cannot bowl two overs in a row. Choose a different bowler." };
-      }
+      if (currentNextPos.newOver) {
+        if (currentBowlerId === currentLastOverBowlerId && currentLastOverBowlerId) {
+          return { ok: false, msg: "Bowler cannot bowl two overs in a row. Choose a different bowler." };
+        }
 
-      const legalBowled = countLegalBallsBowledBy(currentBalls, currentBowlerId);
-      if (legalBowled >= 24) {
-        return { ok: false, msg: "That bowler has already bowled 4 overs (24 legal balls)." };
-      }
-    } else {
-      const last = currentBalls[currentBalls.length - 1];
-      if (last?.bowler_id && currentBowlerId !== last.bowler_id) {
-        return { ok: false, msg: "Bowler cannot change mid-over." };
+        const legalBowled = countLegalBallsBowledBy(currentBalls, currentBowlerId);
+        if (legalBowled >= 24) {
+          return { ok: false, msg: "That bowler has already bowled 4 overs (24 legal balls)." };
+        }
+      } else {
+        const last = currentBalls[currentBalls.length - 1];
+        if (last?.bowler_id && currentBowlerId !== last.bowler_id) {
+          return { ok: false, msg: "Bowler cannot change mid-over." };
+        }
       }
     }
 
@@ -1656,7 +1667,7 @@ const battingScorecardRows = useMemo(() => {
     extra_runs = null,
     wicket = false,
     dismissal_kind = null,
-    dismissed_player_id = null, // ✅ NEW
+    dismissed_player_id = null,
     postStateOverride = null,
   }) => {
     setErr("");
@@ -1679,32 +1690,16 @@ const battingScorecardRows = useMemo(() => {
       const currentBowlerId = bowlerIdRef.current;
       const currentLegalBalls = legalBallsCount(currentBalls);
       const pos = computeNextPosition(currentBalls);
-
-      const overCountsBefore = getOverCounts(currentBalls, pos.over_no);
-      const overAlreadyHadIllegal = !!overCountsBefore?.hasIllegal;
-
-      let extra_runs_calc = 0;
-      let legal_ball = true;
-
-      if (administrative && extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT) {
-        extra_runs_calc = 0;
-        legal_ball = false;
-        runs_off_bat = 0;
-      } else if (extra_type === "wide") {
-        extra_runs_calc = Math.max(2, toInt(extra_runs ?? 2, 2));
-        runs_off_bat = 0;
-        legal_ball = overAlreadyHadIllegal ? true : false;
-      } else if (extra_type === "noball") {
-        extra_runs_calc = Math.max(1, toInt(extra_runs ?? 1, 1));
-        legal_ball = overAlreadyHadIllegal ? true : false;
-      } else if (extra_type === "bye" || extra_type === "legbye") {
-        extra_runs_calc = Math.max(0, toInt(extra_runs ?? 0, 0));
-        legal_ball = true;
-        runs_off_bat = 0;
-      } else {
-        extra_runs_calc = 0;
-        legal_ball = true;
-      }
+      const priorOverBalls = currentBalls.filter(
+        (ball) => toInt(ball?.over_no, 0) === pos.over_no && toInt(ball?.delivery_in_over, 0) < pos.delivery_in_over
+      );
+      const normalizedDelivery = normalizeDeliveryOutcome({
+        runsOffBat: runs_off_bat,
+        extraType: extra_type,
+        extraRuns: extra_runs,
+        priorOverBalls,
+      });
+      const legal_ball = normalizedDelivery.legalBall;
 
       if (legal_ball && currentLegalBalls + 1 > maxLegal) {
         setErr(`Cannot add: overs limit reached (${oversLimit} overs).`);
@@ -1719,42 +1714,37 @@ const battingScorecardRows = useMemo(() => {
         }
       }
 
-      // batting_turn tracks the STRIKER's current batting stint in this innings (1 = first time batting, 2 = second, etc.)
-      // IMPORTANT: even if the NON-STRIKER is dismissed (run out), batting_turn still belongs to the striker's stint.
       const prevDismissals = currentStrikerId
         ? currentBalls.filter((ball) => ball.wicket && ball.dismissed_player_id === currentStrikerId).length
         : 0;
       const batting_turn = prevDismissals + 1;
 
       const payload = {
-  match_id: matchId,
-  innings_id: currentInnings.id,
-  over_no: pos.over_no,
-  delivery_in_over: pos.delivery_in_over,
-  legal_ball,
-  runs_off_bat: toInt(runs_off_bat, 0),
-  extra_type,
-  extra_runs: extra_runs_calc,
-  wicket,
-  dismissal_kind: wicket ? dismissal_kind : null,
-
-  // ✅ CRITICAL FIX: store the ACTUAL dismissed player (can be striker OR non-striker)
-  dismissed_player_id: wicket ? (dismissed_player_id || currentStrikerId) : null,
-
-  striker_id: currentStrikerId,
-  non_striker_id: currentNonStrikerId,
-  bowler_id: currentBowlerId,
-  batting_turn,
-};
+        match_id: matchId,
+        innings_id: currentInnings.id,
+        over_no: pos.over_no,
+        delivery_in_over: pos.delivery_in_over,
+        legal_ball,
+        runs_off_bat: normalizedDelivery.runsOffBat,
+        extra_type: normalizedDelivery.extraType,
+        extra_runs: normalizedDelivery.extraRuns,
+        wicket,
+        dismissal_kind: wicket ? dismissal_kind : null,
+        dismissed_player_id: wicket ? (dismissed_player_id || currentStrikerId) : null,
+        striker_id: currentStrikerId,
+        non_striker_id: currentNonStrikerId,
+        bowler_id: currentBowlerId,
+        batting_turn,
+      };
 
       const previewEvent = {
         created_at: new Date().toISOString(),
         event_id: "preview-ball",
-        event_type: "add_ball",
+        event_type: DELIVERY_RECORDED_EVENT_TYPE,
         innings_id: currentInnings.id,
         match_id: matchId,
         payload: {
-          ball: payload,
+          delivery: payload,
         },
       };
 
@@ -1782,10 +1772,10 @@ const battingScorecardRows = useMemo(() => {
         !!innings1Row?.completed &&
         projectedRuns >= (toInt(innings1Runs, 0) + 1);
       const projectedInningsComplete =
-        projectedLegalBalls >= maxLegal
-        || projectedWickets >= wicketCap
-        || projectedChaseComplete
-        || !!currentInnings?.completed;
+        projectedLegalBalls >= maxLegal ||
+        projectedWickets >= wicketCap ||
+        projectedChaseComplete ||
+        !!currentInnings?.completed;
       let nextBowlerId = currentBowlerId;
       let nextNeedsNextBowler = false;
 
@@ -1807,21 +1797,19 @@ const battingScorecardRows = useMemo(() => {
       const event = {
         created_at: new Date().toISOString(),
         event_id: createEventId("ball"),
-        event_type: "add_ball",
+        event_type: DELIVERY_RECORDED_EVENT_TYPE,
         innings_id: currentInnings.id,
         match_id: matchId,
         payload: {
-          ball: payload,
+          delivery: payload,
           post_state: postState,
         },
       };
 
       await applySessionEvent(event, {
         failurePrefix: "Ball save",
-        successInfo: "Saved ✅",
+        successInfo: "Saved.",
       });
-
-      
 
       if (!payload.wicket) {
         setStrikerSelection(postState.striker_id || "");
@@ -1854,28 +1842,90 @@ const battingScorecardRows = useMemo(() => {
   const addLegBye = (n) => insertBall({ runs_off_bat: 0, extra_type: "legbye", extra_runs: n, wicket: false });
 
   const addWicket = async () => {
-    const currentNextPos = computeNextPosition(ballsRef.current);
-    const simulated = {
-      deliveries: currentNextPos.counts.deliveries + 1,
-      legal: currentNextPos.counts.legal + 1,
-      hasIllegal: currentNextPos.counts.hasIllegal,
-    };
-    const wouldFinish = isOverFinished(simulated);
-
-    setWicketEndedOver(wouldFinish);
     setWicketCrossed(false);
     setIncomingBatterId("");
     setDismissalKind("bowled");
-
-    // ✅ Default: striker is out
     setDismissedPlayerId(strikerId || "");
-
+    setWicketBatRuns(0);
+    setWicketExtraType(null);
+    setWicketExtraRuns(0);
     setNeedsWicketModal(true);
   };
 
   const addRetiredHurt = async () => {
+    setErr("");
     setInfo("");
-    setErr(RETIRED_HURT_UNSUPPORTED_MSG);
+
+    const ok = canScore({ requireBowler: false });
+    if (!ok.ok) {
+      setErr(ok.msg);
+      return;
+    }
+
+    const currentInnings = inningsRef.current;
+    const currentStrikerId = strikerIdRef.current;
+    const currentNonStrikerId = nonStrikerIdRef.current;
+
+    if (!currentInnings?.id) {
+      setErr("Innings not loaded.");
+      return;
+    }
+    if (!dismissedPlayerId) {
+      setErr("Select who is retired hurt (striker/non-striker).");
+      return;
+    }
+    if (!incomingBatterId) {
+      setErr("Select the replacement batter.");
+      return;
+    }
+    if (dismissedPlayerId !== currentStrikerId && dismissedPlayerId !== currentNonStrikerId) {
+      setErr("Retired hurt must apply to the current striker or non-striker.");
+      return;
+    }
+
+    const outWasStriker = dismissedPlayerId === currentStrikerId;
+    const retiredHurtPostState = buildScorerPostState({
+      strikerId: outWasStriker ? incomingBatterId : currentStrikerId,
+      nonStrikerId: outWasStriker ? currentNonStrikerId : incomingBatterId,
+      strikerTurn: getTurnFor(outWasStriker ? incomingBatterId : currentStrikerId),
+      nonStrikerTurn: getTurnFor(outWasStriker ? currentNonStrikerId : incomingBatterId),
+      bowlerId: needsNextBowler ? "" : (bowlerIdRef.current || ""),
+      needsNextBowler: !!needsNextBowler,
+    });
+
+    await applySessionEvent(
+      {
+        created_at: new Date().toISOString(),
+        event_id: createEventId("admin-state"),
+        event_type: ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE,
+        innings_id: currentInnings.id,
+        match_id: matchId,
+        payload: {
+          action_type: "retired_hurt",
+          dismissed_player_id: dismissedPlayerId,
+          replacement_player_id: incomingBatterId,
+          post_state: retiredHurtPostState,
+        },
+      },
+      {
+        failurePrefix: "Retired hurt",
+        successInfo: "Retired hurt recorded.",
+        optimisticQueuedInfo: "Offline: retired hurt queued locally.",
+      }
+    );
+
+    setStrikerSelection(retiredHurtPostState.striker_id || "");
+    setNonStrikerSelection(retiredHurtPostState.non_striker_id || "");
+    setBowlerId(retiredHurtPostState.bowler_id || "");
+    setNeedsNextBowler(!!retiredHurtPostState.needs_next_bowler);
+    setNeedsWicketModal(false);
+    setDismissalKind("bowled");
+    setDismissedPlayerId("");
+    setIncomingBatterId("");
+    setWicketBatRuns(0);
+    setWicketExtraType(null);
+    setWicketExtraRuns(0);
+    setWicketCrossed(false);
   };
 
   // Incoming batters:
@@ -1886,10 +1936,8 @@ const battingScorecardRows = useMemo(() => {
   }, [battingPlayers, strikerId, nonStrikerId]);
 
   const confirmWicket = async () => {
-    if (!incomingBatterId) {
-      setErr("Select the incoming batter.");
-      return;
-    }
+    setErr("");
+
     if (!dismissedPlayerId) {
       setErr("Select who was dismissed (striker/non-striker).");
       return;
@@ -1899,64 +1947,108 @@ const battingScorecardRows = useMemo(() => {
       return;
     }
 
-    const outWasStriker = dismissedPlayerId === strikerId;
-    const survivor = outWasStriker ? nonStrikerId : strikerId;
-    const crossedApplies = wicketCrossed && outWasStriker;
-    const projectedLegalBalls = legalBallsCount(ballsRef.current) + 1;
-    const projectedWickets = sumWkts(ballsRef.current) + 1;
-    const projectedRuns = sumRuns(ballsRef.current);
+    const wicketInput = validateWicketDeliveryInput({
+      dismissalKind,
+      runsOffBat: wicketBatRuns,
+      extraType: wicketExtraType,
+      extraRuns: wicketExtraRuns,
+    });
+
+    if (!wicketInput.ok) {
+      setErr(wicketInput.message);
+      return;
+    }
+
+    const currentBalls = ballsRef.current;
+    const currentInnings = inningsRef.current;
+    const currentStrikerId = strikerIdRef.current;
+    const currentNonStrikerId = nonStrikerIdRef.current;
+    const currentBowlerId = bowlerIdRef.current;
+    const position = computeNextPosition(currentBalls);
+    const priorOverBalls = currentBalls.filter(
+      (ball) => toInt(ball?.over_no, 0) === position.over_no && toInt(ball?.delivery_in_over, 0) < position.delivery_in_over
+    );
+    const normalizedDelivery = normalizeDeliveryOutcome({
+      runsOffBat: wicketInput.runsOffBat,
+      extraType: wicketInput.extraType,
+      extraRuns: wicketInput.extraRuns,
+      priorOverBalls,
+    });
+
+    const previewPayload = {
+      over_no: position.over_no,
+      delivery_in_over: position.delivery_in_over,
+      legal_ball: normalizedDelivery.legalBall,
+      runs_off_bat: normalizedDelivery.runsOffBat,
+      extra_type: normalizedDelivery.extraType,
+      extra_runs: normalizedDelivery.extraRuns,
+      wicket: true,
+      dismissal_kind: wicketInput.dismissalKind,
+      dismissed_player_id: dismissedPlayerId,
+      striker_id: currentStrikerId,
+      non_striker_id: currentNonStrikerId,
+      bowler_id: currentBowlerId,
+    };
+    const previewEvent = {
+      created_at: new Date().toISOString(),
+      event_id: "preview-wicket",
+      event_type: DELIVERY_RECORDED_EVENT_TYPE,
+      innings_id: currentInnings?.id || "",
+      match_id: matchId,
+      payload: { delivery: previewPayload },
+    };
+    const nextBalls = applyEventOptimistically({
+      balls: currentBalls,
+      innings: currentInnings,
+      event: previewEvent,
+    }).balls;
+
+    const projectedLegalBalls = legalBallsCount(nextBalls);
+    const projectedWickets = sumWkts(nextBalls);
+    const projectedRuns = sumRuns(nextBalls);
     const projectedChaseComplete =
-      inningsRef.current?.innings_no === 2 &&
+      currentInnings?.innings_no === 2 &&
       !!innings1Row?.completed &&
       projectedRuns >= (toInt(innings1Runs, 0) + 1);
     const projectedInningsComplete =
-      projectedLegalBalls >= maxLegal
-      || projectedWickets >= wicketCap
-      || projectedChaseComplete
-      || !!inningsRef.current?.completed;
+      projectedLegalBalls >= maxLegal ||
+      projectedWickets >= wicketCap ||
+      projectedChaseComplete ||
+      !!currentInnings?.completed;
+    const overCountsAfter = getOverCounts(nextBalls, previewPayload.over_no);
+    const overFinishedAfter = isOverFinished(overCountsAfter);
 
-    let nextStrikerId = strikerId;
-    let nextNonStrikerId = nonStrikerId;
-    let nextBowlerId = bowlerId;
-    let nextNeedsNextBowler = false;
-
-    if (wicketEndedOver && !projectedInningsComplete) {
-      if (crossedApplies) {
-        nextStrikerId = survivor;
-        nextNonStrikerId = incomingBatterId;
-      } else {
-        nextStrikerId = incomingBatterId;
-        nextNonStrikerId = survivor;
-      }
-      nextBowlerId = "";
-      nextNeedsNextBowler = true;
-    } else if (outWasStriker) {
-      if (crossedApplies) {
-        nextStrikerId = survivor;
-        nextNonStrikerId = incomingBatterId;
-      } else {
-        nextStrikerId = incomingBatterId;
-        nextNonStrikerId = survivor;
-      }
-    } else {
-      nextStrikerId = strikerId;
-      nextNonStrikerId = incomingBatterId;
+    if (!projectedInningsComplete && !incomingBatterId) {
+      setErr("Select the incoming batter.");
+      return;
     }
 
-    const wicketPostState = buildScorerPostState({
-      strikerId: nextStrikerId,
-      nonStrikerId: nextNonStrikerId,
-      strikerTurn: getTurnFor(nextStrikerId),
-      nonStrikerTurn: getTurnFor(nextNonStrikerId),
-      bowlerId: nextBowlerId,
-      needsNextBowler: nextNeedsNextBowler,
-    });
+    let wicketPostState;
+    try {
+      wicketPostState = deriveWicketPostState({
+        strikerId: currentStrikerId,
+        nonStrikerId: currentNonStrikerId,
+        incomingBatterId,
+        dismissedPlayerId,
+        dismissalKind: wicketInput.dismissalKind,
+        totalRunsOnBall: normalizedDelivery.runsOffBat + normalizedDelivery.extraRuns,
+        crossed: wicketCrossed,
+        overFinishedAfter,
+        inningsComplete: projectedInningsComplete,
+        bowlerId: currentBowlerId,
+        getTurnFor,
+      });
+    } catch (error) {
+      setErr(String(error?.message || error || "Invalid wicket state."));
+      return;
+    }
 
     const { postState, saved } = await insertBall({
-      runs_off_bat: 0,
-      extra_type: null,
+      runs_off_bat: normalizedDelivery.runsOffBat,
+      extra_type: normalizedDelivery.extraType,
+      extra_runs: normalizedDelivery.extraRuns,
       wicket: true,
-      dismissal_kind: dismissalKind,
+      dismissal_kind: wicketInput.dismissalKind,
       dismissed_player_id: dismissedPlayerId,
       postStateOverride: wicketPostState,
     });
@@ -1970,11 +2062,16 @@ const battingScorecardRows = useMemo(() => {
     setNonStrikerSelection(resolvedPostState.non_striker_id || "");
     setBowlerId(resolvedPostState.bowler_id || "");
     setNeedsNextBowler(!!resolvedPostState.needs_next_bowler);
+    setDismissalKind("bowled");
+    setDismissedPlayerId("");
+    setIncomingBatterId("");
+    setWicketBatRuns(0);
+    setWicketExtraType(null);
+    setWicketExtraRuns(0);
+    setWicketCrossed(false);
 
     if (resolvedPostState.needs_next_bowler) {
-      // End of over + wicket: apply "crossed?" + force new bowler
       setInfo("Over complete - select a new bowler.");
-
     }
   };
 
@@ -2839,11 +2936,10 @@ You can then start scoring again from ball 1.`
                   <option value="run out">Run out</option>
                   <option value="stumped">Stumped</option>
                   <option value="hit wicket">Hit wicket</option>
-                  <option value="retired hurt" disabled>Retired hurt (coming soon)</option>
+                  <option value="retired hurt">Retired hurt</option>
                 </select>
               </div>
 
-              {/* ✅ NEW: who got out */}
               <div>
                 <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Who is out?</div>
                 <select value={dismissedPlayerId || ""} onChange={(e) => setDismissedPlayerId(e.target.value)} style={modalSelectStyle}>
@@ -2853,9 +2949,9 @@ You can then start scoring again from ball 1.`
               </div>
 
               <div>
-                <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>New batter</div>
+                <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Replacement batter</div>
                 <select value={incomingBatterId} onChange={(e) => setIncomingBatterId(e.target.value)} style={modalSelectStyle}>
-                  <option value="">Select…</option>
+                  <option value="">Select...</option>
                   {availableIncomingBatters.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.name}
@@ -2864,16 +2960,69 @@ You can then start scoring again from ball 1.`
                 </select>
               </div>
 
-              {dismissalKind !== "retired hurt" ? (
+              {dismissalKind === "run out" || dismissalKind === "stumped" ? (
+                <>
+                  <div>
+                    <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Extra type</div>
+                    <select value={wicketExtraType || ""} onChange={(e) => setWicketExtraType(e.target.value || null)} style={modalSelectStyle}>
+                      <option value="">None</option>
+                      <option value="wide">Wide</option>
+                      <option value="noball">No ball</option>
+                      <option value="bye">Bye</option>
+                      <option value="legbye">Leg bye</option>
+                    </select>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Bat runs</div>
+                      <input
+                        type="number"
+                        min="0"
+                        max="6"
+                        value={wicketBatRuns}
+                        onChange={(e) => setWicketBatRuns(toInt(e.target.value, 0))}
+                        disabled={dismissalKind === "stumped" || wicketExtraType === "wide" || wicketExtraType === "bye" || wicketExtraType === "legbye"}
+                        style={modalInputStyle}
+                      />
+                    </div>
+
+                    <div>
+                      <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Extra runs</div>
+                      <input
+                        type="number"
+                        min="0"
+                        value={wicketExtraRuns}
+                        onChange={(e) => setWicketExtraRuns(toInt(e.target.value, 0))}
+                        style={modalInputStyle}
+                      />
+                    </div>
+                  </div>
+
+                  <div style={{ fontSize: 12, color: "rgba(232,238,252,0.60)" }}>
+                    {dismissalKind === "run out"
+                      ? "Run out deliveries can include completed runs and extras."
+                      : "Stumped currently supports either a standard wicket or a base wide only."}
+                  </div>
+                </>
+              ) : null}
+
+              {dismissalKind !== "retired hurt" && dismissalKind !== "run out" && dismissalKind !== "stumped" ? (
+                <div style={{ fontSize: 12, color: "rgba(232,238,252,0.60)" }}>
+                  This dismissal type is currently recorded as a zero-run, no-extra delivery.
+                </div>
+              ) : null}
+
+              {dismissalKind !== "retired hurt" && dismissalKind !== "run out" && dismissalKind !== "stumped" ? (
                 <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
                   <input type="checkbox" checked={wicketCrossed} onChange={(e) => setWicketCrossed(e.target.checked)} />
                   <span style={{ fontWeight: 900 }}>Batters crossed</span>
                 </label>
-              ) : (
+              ) : dismissalKind === "retired hurt" ? (
                 <div style={{ fontSize: 12, color: "rgba(232,238,252,0.60)" }}>
                   Retired hurt is recorded without consuming a ball.
                 </div>
-              )}
+              ) : null}
 
               <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
                 <button onClick={() => setNeedsWicketModal(false)} style={modalBtnGhost}>
@@ -3015,6 +3164,22 @@ You can then start scoring again from ball 1.`
                       nextExtraRuns = Math.max(1, nextExtraRuns);
                     } else if (!editExtraType) {
                       nextExtraRuns = 0;
+                    }
+
+                    if (editIsWicket) {
+                      const wicketValidation = validateWicketDeliveryInput({
+                        dismissalKind: editDismissalKind,
+                        runsOffBat: nextBatRuns,
+                        extraType: editExtraType,
+                        extraRuns: nextExtraRuns,
+                      });
+
+                      if (!wicketValidation.ok) {
+                        throw new Error(wicketValidation.message);
+                      }
+
+                      nextBatRuns = wicketValidation.runsOffBat;
+                      nextExtraRuns = wicketValidation.extraRuns;
                     }
 
                     await applySessionEvent(

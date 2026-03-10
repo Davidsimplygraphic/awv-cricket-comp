@@ -1,4 +1,10 @@
-import { mergeBallIntoList, sortBallsByPosition, updateBallInList } from "./scoring.js";
+import {
+  ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE,
+  isDeliveryEventType,
+  mergeBallIntoList,
+  sortBallsByPosition,
+  updateBallInList,
+} from "./scoring.js";
 
 let lastClientOrder = 0;
 
@@ -82,7 +88,9 @@ export function sortPendingEvents(queue) {
 
 export function isAuthoritativeScoringRejection(error) {
   const message = String(error?.message || error || "");
-  return /balls_unique_position|Cannot add a ball to a completed innings|Only the latest ball in an innings can be edited safely|Target ball not found for edit event/i.test(message);
+  return /balls_unique_position|Cannot add a ball to a completed innings|Cannot apply an administrative state change to a completed innings|Only the latest ball in an innings can be edited safely|Target ball not found for edit event|Use administrative_state_changed for retired hurt events|Only run out deliveries can|Only run out and stumped deliveries can|Stumped deliveries cannot include|Administrative state changes require a current canonical scorer state|Unsupported administrative_state_changed action_type/i.test(
+    message
+  );
 }
 
 export function deriveQueuedScorerState({ queue = [], inningsId = null, basePostState = null } = {}) {
@@ -100,7 +108,19 @@ export function deriveQueuedScorerState({ queue = [], inningsId = null, basePost
       continue;
     }
 
-    if (event.event_type !== "add_ball") continue;
+    if (event.event_type === ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE) {
+      const nextPostState = event.payload?.post_state;
+      if (nextPostState && typeof nextPostState === "object") {
+        postState = nextPostState;
+        invalidatesPostState = false;
+      } else {
+        postState = null;
+        invalidatesPostState = true;
+      }
+      continue;
+    }
+
+    if (!isDeliveryEventType(event.event_type)) continue;
 
     const nextPostState = event.payload?.post_state;
     if (nextPostState && typeof nextPostState === "object") {
@@ -123,9 +143,9 @@ export function applyEventOptimistically({ balls = [], innings = null, event }) 
   const normalized = normalizePendingEvent(event);
   if (!normalized) return { balls: sortBallsByPosition(balls), innings };
 
-  if (normalized.event_type === "add_ball") {
+  if (isDeliveryEventType(normalized.event_type)) {
     const optimisticBall = {
-      ...(normalized.payload?.ball || {}),
+      ...(normalized.payload?.delivery || normalized.payload?.ball || {}),
       source_event_id: normalized.event_id,
       local_temp_id: normalized.event_id,
       created_at: normalized.created_at,
@@ -146,6 +166,13 @@ export function applyEventOptimistically({ balls = [], innings = null, event }) 
 
     return {
       balls: updateBallInList(balls, target, normalized.payload?.patch || {}),
+      innings,
+    };
+  }
+
+  if (normalized.event_type === ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE) {
+    return {
+      balls: sortBallsByPosition(balls),
       innings,
     };
   }
@@ -179,9 +206,18 @@ export function applyRpcResultToState({ balls = [], innings = null, event, resul
   const resolvedPostState = result?.post_state || result?.result?.post_state || null;
   const invalidatesPostState = result?.invalidate_post_state === true || result?.result?.invalidate_post_state === true;
 
-  if ((normalized.event_type === "add_ball" || normalized.event_type === "edit_ball") && resolvedBall) {
+  if ((isDeliveryEventType(normalized.event_type) || normalized.event_type === "edit_ball") && resolvedBall) {
     return {
       balls: mergeBallIntoList(balls, resolvedBall),
+      innings: resolvedInnings || innings,
+      postState: invalidatesPostState ? null : resolvedPostState,
+      invalidatesPostState,
+    };
+  }
+
+  if (normalized.event_type === ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE) {
+    return {
+      balls: sortBallsByPosition(balls),
       innings: resolvedInnings || innings,
       postState: invalidatesPostState ? null : resolvedPostState,
       invalidatesPostState,

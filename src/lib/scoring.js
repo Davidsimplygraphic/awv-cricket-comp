@@ -1,4 +1,7 @@
 export const ADMIN_EXTRA_TYPE_RETIRED_HURT = "retiredhurt";
+export const LEGACY_ADD_BALL_EVENT_TYPE = "add_ball";
+export const DELIVERY_RECORDED_EVENT_TYPE = "delivery_recorded";
+export const ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE = "administrative_state_changed";
 
 export function toInt(value, fallback = 0) {
   const next = Number(value);
@@ -7,6 +10,232 @@ export function toInt(value, fallback = 0) {
 
 export function isAdministrativeBall(ball) {
   return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
+}
+
+export function isDeliveryEventType(eventType) {
+  return eventType === LEGACY_ADD_BALL_EVENT_TYPE || eventType === DELIVERY_RECORDED_EVENT_TYPE;
+}
+
+export function normalizeDeliveryValues({
+  runsOffBat = 0,
+  extraType = null,
+  extraRuns = 0,
+} = {}) {
+  const normalizedExtraType = extraType || null;
+  let normalizedRunsOffBat = Math.max(0, toInt(runsOffBat, 0));
+  let normalizedExtraRuns = 0;
+
+  if (normalizedExtraType === "wide") {
+    normalizedRunsOffBat = 0;
+    normalizedExtraRuns = Math.max(2, toInt(extraRuns, 2));
+  } else if (normalizedExtraType === "noball") {
+    normalizedExtraRuns = Math.max(1, toInt(extraRuns, 1));
+  } else if (normalizedExtraType === "bye" || normalizedExtraType === "legbye") {
+    normalizedRunsOffBat = 0;
+    normalizedExtraRuns = Math.max(0, toInt(extraRuns, 0));
+  } else {
+    normalizedExtraRuns = 0;
+  }
+
+  return {
+    runsOffBat: normalizedRunsOffBat,
+    extraType: normalizedExtraType,
+    extraRuns: normalizedExtraRuns,
+  };
+}
+
+export function normalizeDeliveryOutcome({
+  runsOffBat = 0,
+  extraType = null,
+  extraRuns = 0,
+  priorOverBalls = [],
+} = {}) {
+  const normalized = normalizeDeliveryValues({ runsOffBat, extraType, extraRuns });
+  return {
+    ...normalized,
+    legalBall: deriveLegalBallForExtraType(normalized.extraType, priorOverBalls),
+  };
+}
+
+export function validateWicketDeliveryInput({
+  dismissalKind = "bowled",
+  runsOffBat = 0,
+  extraType = null,
+  extraRuns = 0,
+} = {}) {
+  const normalizedKind = String(dismissalKind || "bowled").trim().toLowerCase();
+  const normalized = normalizeDeliveryValues({ runsOffBat, extraType, extraRuns });
+
+  if (normalizedKind === "retired hurt") {
+    return {
+      ok: false,
+      message: 'Use "administrative_state_changed" for retired hurt. It is not a delivery event.',
+      ...normalized,
+      dismissalKind: normalizedKind,
+    };
+  }
+
+  if (normalizedKind === "run out") {
+    return {
+      ok: true,
+      ...normalized,
+      dismissalKind: normalizedKind,
+    };
+  }
+
+  if (normalizedKind === "stumped") {
+    if (normalized.runsOffBat > 0) {
+      return {
+        ok: false,
+        message: "Stumped deliveries cannot include completed bat runs in the current model.",
+        ...normalized,
+        dismissalKind: normalizedKind,
+      };
+    }
+
+    if (normalized.extraType && normalized.extraType !== "wide") {
+      return {
+        ok: false,
+        message: "Only a base wide is supported as an extra on a stumped delivery in the current model.",
+        ...normalized,
+        dismissalKind: normalizedKind,
+      };
+    }
+
+    if (normalized.extraType === "wide" && normalized.extraRuns !== 2) {
+      return {
+        ok: false,
+        message: "Stumped wides cannot include completed runs in the current model.",
+        ...normalized,
+        dismissalKind: normalizedKind,
+      };
+    }
+
+    return {
+      ok: true,
+      ...normalized,
+      dismissalKind: normalizedKind,
+    };
+  }
+
+  if (normalized.runsOffBat > 0) {
+    return {
+      ok: false,
+      message: "Only run out deliveries can include completed bat runs with a wicket.",
+      ...normalized,
+      dismissalKind: normalizedKind,
+    };
+  }
+
+  if (normalized.extraType || normalized.extraRuns > 0) {
+    return {
+      ok: false,
+      message: "Only run out deliveries currently support wicket-plus-extras.",
+      ...normalized,
+      dismissalKind: normalizedKind,
+    };
+  }
+
+  return {
+    ok: true,
+    ...normalized,
+    dismissalKind: normalizedKind,
+  };
+}
+
+export function deriveWicketPostState({
+  strikerId = "",
+  nonStrikerId = "",
+  incomingBatterId = "",
+  dismissedPlayerId = "",
+  dismissalKind = "bowled",
+  totalRunsOnBall = 0,
+  crossed = false,
+  overFinishedAfter = false,
+  inningsComplete = false,
+  bowlerId = "",
+  getTurnFor = () => 1,
+} = {}) {
+  const normalizedKind = String(dismissalKind || "bowled").trim().toLowerCase();
+  const normalizedRuns = Math.max(0, toInt(totalRunsOnBall, 0));
+  const outWasStriker = dismissedPlayerId === strikerId;
+
+  if (!dismissedPlayerId || (dismissedPlayerId !== strikerId && dismissedPlayerId !== nonStrikerId)) {
+    throw new Error("Dismissed player must match the current striker or non-striker.");
+  }
+
+  if (!inningsComplete && !incomingBatterId) {
+    throw new Error("An incoming batter is required for wicket events before the innings is complete.");
+  }
+
+  let nextStrikerId = strikerId;
+  let nextNonStrikerId = nonStrikerId;
+  let nextBowlerId = bowlerId;
+  let needsNextBowler = false;
+
+  if (normalizedKind === "run out") {
+    const postRunStrikerId = normalizedRuns % 2 === 1 ? nonStrikerId : strikerId;
+    const postRunNonStrikerId = normalizedRuns % 2 === 1 ? strikerId : nonStrikerId;
+
+    nextStrikerId = postRunStrikerId;
+    nextNonStrikerId = postRunNonStrikerId;
+
+    if (!inningsComplete) {
+      if (dismissedPlayerId === postRunStrikerId) {
+        nextStrikerId = incomingBatterId;
+      } else if (dismissedPlayerId === postRunNonStrikerId) {
+        nextNonStrikerId = incomingBatterId;
+      } else {
+        throw new Error("Run-out dismissal did not resolve to a current batting end.");
+      }
+    }
+
+    if (overFinishedAfter && !inningsComplete) {
+      [nextStrikerId, nextNonStrikerId] = [nextNonStrikerId, nextStrikerId];
+      nextBowlerId = "";
+      needsNextBowler = true;
+    }
+  } else {
+    const survivorId = outWasStriker ? nonStrikerId : strikerId;
+    const crossedApplies = crossed && outWasStriker;
+
+    if (overFinishedAfter && !inningsComplete) {
+      if (outWasStriker) {
+        if (crossedApplies) {
+          nextStrikerId = survivorId;
+          nextNonStrikerId = incomingBatterId;
+        } else {
+          nextStrikerId = incomingBatterId;
+          nextNonStrikerId = survivorId;
+        }
+      } else {
+        nextStrikerId = strikerId;
+        nextNonStrikerId = incomingBatterId;
+      }
+      nextBowlerId = "";
+      needsNextBowler = true;
+    } else if (outWasStriker) {
+      if (crossedApplies) {
+        nextStrikerId = survivorId;
+        nextNonStrikerId = incomingBatterId;
+      } else {
+        nextStrikerId = incomingBatterId;
+        nextNonStrikerId = survivorId;
+      }
+    } else {
+      nextStrikerId = strikerId;
+      nextNonStrikerId = incomingBatterId;
+    }
+  }
+
+  return buildScorerPostState({
+    strikerId: inningsComplete ? strikerId : nextStrikerId,
+    nonStrikerId: inningsComplete ? nonStrikerId : nextNonStrikerId,
+    strikerTurn: getTurnFor(inningsComplete ? strikerId : nextStrikerId),
+    nonStrikerTurn: getTurnFor(inningsComplete ? nonStrikerId : nextNonStrikerId),
+    bowlerId: inningsComplete ? bowlerId : nextBowlerId,
+    needsNextBowler: inningsComplete ? false : needsNextBowler,
+  });
 }
 
 export function isCompetitiveBall(ball) {
@@ -230,17 +459,14 @@ export function applyBallPatch(ball, patch, allBalls = []) {
     next.dismissed_player_id = patch.dismissed_player_id || null;
   }
 
-  if (next.extra_type === "wide") {
-    next.runs_off_bat = 0;
-    next.extra_runs = Math.max(2, toInt(next.extra_runs, 2));
-  } else if (next.extra_type === "noball") {
-    next.extra_runs = Math.max(1, toInt(next.extra_runs, 1));
-  } else if (next.extra_type === "bye" || next.extra_type === "legbye") {
-    next.runs_off_bat = 0;
-    next.extra_runs = Math.max(0, toInt(next.extra_runs, 0));
-  } else {
-    next.extra_runs = 0;
-  }
+  const normalized = normalizeDeliveryValues({
+    runsOffBat: next.runs_off_bat,
+    extraType: next.extra_type,
+    extraRuns: next.extra_runs,
+  });
+  next.runs_off_bat = normalized.runsOffBat;
+  next.extra_type = normalized.extraType;
+  next.extra_runs = normalized.extraRuns;
 
   if (!next.wicket) {
     next.dismissal_kind = null;

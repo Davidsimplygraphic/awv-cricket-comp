@@ -1,4 +1,5 @@
 import {
+  DELIVERY_RECORDED_EVENT_TYPE,
   buildInningsTotals,
   buildScorerPostState,
   computeNextPosition,
@@ -105,10 +106,10 @@ function buildBallPayload({
   const previewEvent = {
     created_at: action.created_at,
     event_id: action.preview_event_id,
-    event_type: "add_ball",
+    event_type: DELIVERY_RECORDED_EVENT_TYPE,
     innings_id: readyState.innings.id,
     match_id: "match-1",
-    payload: { ball: payload },
+    payload: { delivery: payload },
   };
   const nextBalls = applyEventOptimistically({
     balls: readyState.balls,
@@ -266,11 +267,11 @@ export function simulateScenario({
     const event = {
       created_at: createdAt,
       event_id: eventId,
-      event_type: "add_ball",
+      event_type: DELIVERY_RECORDED_EVENT_TYPE,
       innings_id: inningsState.innings.id,
       match_id: "match-1",
       payload: {
-        ball: built.payload,
+        delivery: built.payload,
         post_state: built.postState,
       },
     };
@@ -359,7 +360,7 @@ export function simulateScenario({
   if (queue.length) {
     for (const event of queue) {
       innings2State = applyServerAddBall(innings2State, event, {
-        ...event.payload.ball,
+        ...(event.payload.delivery || event.payload.ball || {}),
         id: `server-ball-${nextServerBallId()}`,
         source_event_id: event.event_id,
         created_at: event.created_at,
