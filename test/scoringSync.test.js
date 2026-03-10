@@ -3,7 +3,10 @@ import { test } from "./test-helpers.js";
 
 import {
   applyRpcResultToState,
+  deriveQueuedScorerState,
   enqueuePendingEvent,
+  isAuthoritativeScoringRejection,
+  removePendingEventsForInnings,
   replayPendingEventsOnState,
 } from "../src/lib/scoringSync.js";
 
@@ -83,4 +86,124 @@ test("duplicate RPC results reuse the stored canonical ball payload", () => {
   assert.equal(state.balls.length, 1);
   assert.equal(state.balls[0].id, "server-ball-1");
   assert.equal(state.balls[0].source_event_id, "evt-1");
+});
+
+test("queued scorer state overrides stale server recovery state after refresh", () => {
+  const derived = deriveQueuedScorerState({
+    inningsId: "inn-1",
+    basePostState: {
+      striker_id: "bat-1",
+      non_striker_id: "bat-2",
+      bowler_id: "bowl-1",
+      needs_next_bowler: false,
+    },
+    queue: [
+      {
+        event_id: "evt-queued",
+        event_type: "add_ball",
+        innings_id: "inn-1",
+        created_at: "2026-03-10T12:00:01.000Z",
+        payload: {
+          post_state: {
+            striker_id: "bat-2",
+            non_striker_id: "bat-1",
+            bowler_id: "bowl-1",
+            needs_next_bowler: false,
+          },
+        },
+      },
+    ],
+  });
+
+  assert.equal(derived.invalidatesPostState, false);
+  assert.equal(derived.postState.striker_id, "bat-2");
+  assert.equal(derived.postState.non_striker_id, "bat-1");
+});
+
+test("legacy queued balls and queued edits fail closed for scorer state recovery", () => {
+  const legacyQueuedState = deriveQueuedScorerState({
+    inningsId: "inn-1",
+    basePostState: {
+      striker_id: "bat-1",
+      non_striker_id: "bat-2",
+      bowler_id: "bowl-1",
+      needs_next_bowler: false,
+    },
+    queue: [
+      {
+        event_id: "evt-legacy",
+        event_type: "add_ball",
+        innings_id: "inn-1",
+        created_at: "2026-03-10T12:00:01.000Z",
+        payload: { ball: { over_no: 0, delivery_in_over: 2 } },
+      },
+    ],
+  });
+
+  assert.equal(legacyQueuedState.invalidatesPostState, true);
+  assert.equal(legacyQueuedState.postState, null);
+
+  const editedQueuedState = deriveQueuedScorerState({
+    inningsId: "inn-1",
+    queue: [
+      {
+        event_id: "evt-add",
+        event_type: "add_ball",
+        innings_id: "inn-1",
+        created_at: "2026-03-10T12:00:01.000Z",
+        payload: {
+          post_state: {
+            striker_id: "bat-2",
+            non_striker_id: "bat-1",
+            bowler_id: "bowl-1",
+            needs_next_bowler: false,
+          },
+        },
+      },
+      {
+        event_id: "evt-edit",
+        event_type: "edit_ball",
+        innings_id: "inn-1",
+        created_at: "2026-03-10T12:00:02.000Z",
+        payload: {},
+      },
+    ],
+  });
+
+  assert.equal(editedQueuedState.invalidatesPostState, true);
+  assert.equal(editedQueuedState.postState, null);
+});
+
+test("authoritative replay failures are detected and can discard the affected innings queue slice", () => {
+  const queue = [
+    {
+      event_id: "evt-inn-1-a",
+      event_type: "add_ball",
+      innings_id: "inn-1",
+      created_at: "2026-03-10T12:00:00.000Z",
+      client_order: 1,
+    },
+    {
+      event_id: "evt-inn-2-a",
+      event_type: "add_ball",
+      innings_id: "inn-2",
+      created_at: "2026-03-10T12:00:01.000Z",
+      client_order: 2,
+    },
+    {
+      event_id: "evt-inn-1-b",
+      event_type: "edit_ball",
+      innings_id: "inn-1",
+      created_at: "2026-03-10T12:00:02.000Z",
+      client_order: 3,
+    },
+  ];
+
+  const filtered = removePendingEventsForInnings(queue, "inn-1");
+  assert.deepEqual(filtered.map((event) => event.event_id), ["evt-inn-2-a"]);
+
+  assert.equal(isAuthoritativeScoringRejection(new Error("Cannot add a ball to a completed innings")), true);
+  assert.equal(isAuthoritativeScoringRejection(new Error("Only the latest ball in an innings can be edited safely")), true);
+  assert.equal(isAuthoritativeScoringRejection(new Error("duplicate key value violates unique constraint \"balls_unique_position\"")), true);
+  assert.equal(isAuthoritativeScoringRejection(new Error("Match is locked by another scorer session")), false);
 });

@@ -9,6 +9,42 @@ alter table public.match_scorer_sessions enable row level security;
 alter table public.match_session_events enable row level security;
 alter table public.balls add column if not exists updated_at timestamp with time zone not null default now();
 
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'balls_source_event_id_fkey'
+      and conrelid = 'public.balls'::regclass
+  ) then
+    alter table public.balls
+      add constraint balls_source_event_id_fkey
+      foreign key (source_event_id)
+      references public.match_session_events(event_id)
+      on delete cascade
+      not valid;
+  end if;
+end;
+$$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'balls_source_event_id_required_check'
+      and conrelid = 'public.balls'::regclass
+  ) then
+    alter table public.balls
+      add constraint balls_source_event_id_required_check
+      check (source_event_id is not null)
+      not valid;
+  end if;
+end;
+$$;
+
+alter table public.balls validate constraint balls_source_event_id_fkey;
+
 revoke all on table public.match_scorer_sessions from anon;
 revoke all on table public.match_scorer_sessions from authenticated;
 revoke all on table public.match_session_events from anon;
@@ -258,6 +294,65 @@ begin
       raise exception 'Cannot add a ball to a completed innings';
     end if;
 
+    select
+      coalesce(sum(case when b.legal_ball = false then 0 else 1 end), 0),
+      coalesce(sum(case when coalesce(b.wicket, false) then 1 else 0 end), 0),
+      coalesce(sum(coalesce(b.runs_off_bat, 0) + coalesce(b.extra_runs, 0)), 0)
+      into v_legal_balls, v_wickets, v_total_runs
+    from public.balls b
+    where b.match_id = p_match_id
+      and b.innings_id = p_innings_id;
+
+    if v_innings.innings_no = 2 then
+      select coalesce(sum(coalesce(b.runs_off_bat, 0) + coalesce(b.extra_runs, 0)), 0)
+        into v_first_innings_runs
+      from public.balls b
+      join public.innings i on i.id = b.innings_id
+      where b.match_id = p_match_id
+        and i.match_id = p_match_id
+        and i.innings_no = 1;
+    else
+      v_first_innings_runs := 0;
+    end if;
+
+    select event_type
+      into v_boundary_event_type
+    from public.match_session_events
+    where match_id = p_match_id
+      and innings_id = p_innings_id
+      and status = 'applied'
+      and event_type in ('end_innings', 'reopen_innings')
+    order by applied_at desc nulls last, created_at desc
+    limit 1;
+
+    v_should_complete := (
+      v_legal_balls >= greatest(1, coalesce(v_match.overs_limit, 20)) * 6
+      or v_wickets >= greatest(1, coalesce(v_match.wicket_cap, 10))
+      or (v_innings.innings_no = 2 and v_total_runs >= (v_first_innings_runs + 1))
+    );
+
+    if coalesce(v_boundary_event_type, '') = 'end_innings' then
+      v_should_complete := true;
+    end if;
+
+    if v_should_complete then
+      update public.innings
+      set completed = true
+      where id = p_innings_id
+        and match_id = p_match_id
+      returning * into v_innings;
+
+      update public.matches
+      set status = case
+        when v_innings.innings_no = 2 then 'completed'
+        else 'playing'
+      end
+      where id = p_match_id
+      returning * into v_match;
+
+      raise exception 'Cannot add a ball to a completed innings';
+    end if;
+
     insert into public.balls (
       match_id,
       innings_id,
@@ -406,6 +501,19 @@ begin
 
     if v_ball.id is null then
       raise exception 'Target ball not found for edit event %', p_event_id;
+    end if;
+
+    if exists (
+      select 1
+      from public.balls later_ball
+      where later_ball.match_id = p_match_id
+        and later_ball.innings_id = p_innings_id
+        and (
+          later_ball.over_no > v_ball.over_no
+          or (later_ball.over_no = v_ball.over_no and later_ball.delivery_in_over > v_ball.delivery_in_over)
+        )
+    ) then
+      raise exception 'Only the latest ball in an innings can be edited safely';
     end if;
 
     v_effective_extra_type := case

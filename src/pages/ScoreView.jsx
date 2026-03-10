@@ -21,11 +21,14 @@ import {
   applyEventOptimistically,
   applyRpcResultToState,
   createEventId,
+  deriveQueuedScorerState,
   enqueuePendingEvent,
+  isAuthoritativeScoringRejection,
   isLockConflictError,
   isMissingRpcError,
   isNetworkLikeError,
   removePendingEvent,
+  removePendingEventsForInnings,
   replayPendingEventsOnState,
 } from "../lib/scoringSync";
 
@@ -295,6 +298,7 @@ export default function ScoreView() {
   const savingRef = useRef(false);
   const flushingQueueRef = useRef(false);
   const matchSnapshotScope = fixtureId || canonicalFixtureId || matchId || "unknown";
+  const persistenceScope = clientSessionId || "shared";
 
   // CURRENT innings totals
   const totalRuns = useMemo(() => sumRuns(balls), [balls]);
@@ -556,6 +560,18 @@ const applyRecoveredScorerState = (state) => {
   return true;
 };
 
+const applyStoredScorerState = (state) => {
+  if (!state || typeof state !== "object") return false;
+
+  if (state.strikerId) setStrikerSelection(state.strikerId);
+  if (state.nonStrikerId) setNonStrikerSelection(state.nonStrikerId);
+  if (typeof state.strikerTurn === "number") setStrikerTurn(state.strikerTurn);
+  if (typeof state.nonStrikerTurn === "number") setNonStrikerTurn(state.nonStrikerTurn);
+  if (state.bowlerId !== undefined) setBowlerId(state.bowlerId || "");
+  setNeedsNextBowler(!!state.needsNextBowler);
+  return true;
+};
+
 const loadCanonicalRecoveryState = async (resolvedMatchId, resolvedInningsId) => {
   if (!resolvedMatchId || !resolvedInningsId || !isOnline) {
     return { recoveryState: null, stateInvalidated: false, missing: false };
@@ -589,7 +605,7 @@ const loadCanonicalRecoveryState = async (resolvedMatchId, resolvedInningsId) =>
 const readStoredPendingQueue = (resolvedMatchId) => {
   if (!resolvedMatchId) return [];
 
-  const fromStorage = (readPendingEvents(resolvedMatchId) || []).reduce(
+  const fromStorage = (readPendingEvents(resolvedMatchId, persistenceScope) || []).reduce(
     (queue, event) => enqueuePendingEvent(queue, { ...event, match_id: event?.match_id || resolvedMatchId }),
     []
   );
@@ -601,6 +617,38 @@ const readStoredPendingQueue = (resolvedMatchId) => {
 
   clearLegacyPendingBallQueues(resolvedMatchId);
   return legacy;
+};
+
+const restorePreferredScorerState = ({
+  inningsId,
+  recoveryState = null,
+  stateInvalidated = false,
+  storedScorerState = null,
+  pendingQueue = pendingEventsRef.current,
+} = {}) => {
+  const hasPendingEvents = (pendingQueue || []).some((event) => event?.innings_id === inningsId);
+  const queuedState = deriveQueuedScorerState({
+    queue: pendingQueue,
+    inningsId,
+    basePostState: stateInvalidated ? null : recoveryState,
+  });
+
+  if (stateInvalidated || queuedState.invalidatesPostState) {
+    if (matchId && inningsId) clearScorerState(matchId, inningsId, persistenceScope);
+    clearLiveSelections();
+    return { restored: false, invalidated: true, hasPendingEvents };
+  }
+
+  if (applyRecoveredScorerState(queuedState.postState)) {
+    return { restored: true, invalidated: false, hasPendingEvents };
+  }
+
+  if (!hasPendingEvents && applyStoredScorerState(storedScorerState)) {
+    return { restored: true, invalidated: false, hasPendingEvents };
+  }
+
+  clearLiveSelections();
+  return { restored: false, invalidated: false, hasPendingEvents };
 };
 
 const restoreSnapshot = (snapshot) => {
@@ -794,9 +842,27 @@ const flushPendingQueue = async () => {
         }
 
         const message = String(error?.message || error || "");
-        if (/balls_unique_position/i.test(message)) {
+        if (isAuthoritativeScoringRejection(error)) {
+          const nextQueue = removePendingEventsForInnings(pendingEventsRef.current, event.innings_id);
+          setPendingEvents(nextQueue);
           await reloadCurrentInningsState(event.innings_id);
-          setErr("Pending scoring replay hit a delivery-position conflict. Canonical innings state has been reloaded.");
+          if (event.innings_id === inningsRef.current?.id) {
+            const recovery = await loadCanonicalRecoveryState(matchId, event.innings_id);
+            const scorerState = restorePreferredScorerState({
+              inningsId: event.innings_id,
+              recoveryState: recovery.recoveryState,
+              stateInvalidated: recovery.stateInvalidated,
+              storedScorerState: null,
+              pendingQueue: nextQueue,
+            });
+
+            setInfo(
+              scorerState.invalidated
+                ? "Pending local scoring changes were discarded because the server rejected them. Re-select striker, non-striker, and bowler before scoring again."
+                : "Pending local scoring changes were discarded because the server rejected them. Canonical innings state was reloaded."
+            );
+          }
+          setErr(`Pending sync failed: ${message}`);
           break;
         }
 
@@ -804,7 +870,16 @@ const flushPendingQueue = async () => {
         break;
       }
 
-      applyServerEventState(event, data || {});
+      const nextState = applyServerEventState(event, data || {});
+      if (event.innings_id === inningsRef.current?.id) {
+        if (nextState.invalidatesPostState) {
+          clearScorerState(matchId, event.innings_id, persistenceScope);
+          clearLiveSelections();
+          setInfo("A pending delivery edit synced. Re-select striker, non-striker, and bowler before scoring again.");
+        } else if (nextState.postState && typeof nextState.postState === "object") {
+          applyRecoveredScorerState(nextState.postState);
+        }
+      }
       setPendingEvents((prev) => removePendingEvent(prev, event.event_id));
     }
   } finally {
@@ -869,19 +944,19 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
   setPendingEvents([]);
 
   if (resolvedMatchId) {
-    clearPendingEvents(resolvedMatchId);
+    clearPendingEvents(resolvedMatchId, persistenceScope);
 
     const inningsIds = [inningsRef.current?.id, innings1Row?.id, innings2RowForResult?.id].filter(Boolean);
-    [...new Set(inningsIds)].forEach((inningsId) => clearScorerState(resolvedMatchId, inningsId));
+    [...new Set(inningsIds)].forEach((inningsId) => clearScorerState(resolvedMatchId, inningsId, persistenceScope));
   }
 
-  clearScoringSnapshot(matchSnapshotScope);
+  clearScoringSnapshot(matchSnapshotScope, persistenceScope);
 };
 
 // Load the single match row for this fixture_id
   useEffect(() => {
     let alive = true;
-    const storedSnapshot = readScoringSnapshot(matchSnapshotScope);
+    const storedSnapshot = readScoringSnapshot(matchSnapshotScope, persistenceScope);
 
     (async () => {
       setLoading(true);
@@ -1028,7 +1103,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       setLoading(true);
       setErr("");
       setInfo("");
-      const storedSnapshot = readScoringSnapshot(matchSnapshotScope);
+      const storedSnapshot = readScoringSnapshot(matchSnapshotScope, persistenceScope);
 
       clearLiveSelections();
       setNeedsWicketModal(false);
@@ -1120,23 +1195,25 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
         setInfo("Innings 2 is marked completed but has no balls. Click ‘Reopen innings’ to start scoring.");
       }
 
-      const storedScorerState = readScorerState(matchId, inn.data.id);
-      if (recovery.stateInvalidated) {
-        clearScorerState(matchId, inn.data.id);
-        clearLiveSelections();
-        setInfo("Last delivery was edited. Re-select striker, non-striker, and bowler before scoring again.");
-      } else if (applyRecoveredScorerState(recovery.recoveryState)) {
-        // Canonical scorer state recovered from persisted event history.
-      } else if (storedScorerState) {
-        if (storedScorerState.strikerId) setStrikerSelection(storedScorerState.strikerId);
-        if (storedScorerState.nonStrikerId) setNonStrikerSelection(storedScorerState.nonStrikerId);
-        if (typeof storedScorerState.strikerTurn === "number") setStrikerTurn(storedScorerState.strikerTurn);
-        if (typeof storedScorerState.nonStrikerTurn === "number") setNonStrikerTurn(storedScorerState.nonStrikerTurn);
-        if (storedScorerState.bowlerId !== undefined) setBowlerId(storedScorerState.bowlerId || "");
-        setNeedsNextBowler(!!storedScorerState.needsNextBowler);
-      } else if (sorted.length && !recovery.missing) {
-        clearLiveSelections();
-        setInfo("Scoring totals were recovered, but the active batter/bowler state could not be proven. Re-select them before scoring.");
+      const storedScorerState = readScorerState(matchId, inn.data.id, persistenceScope);
+      const scorerState = restorePreferredScorerState({
+        inningsId: inn.data.id,
+        recoveryState: recovery.recoveryState,
+        stateInvalidated: recovery.stateInvalidated,
+        storedScorerState,
+      });
+      if (scorerState.invalidated) {
+        setInfo(
+          scorerState.hasPendingEvents
+            ? "Pending local scoring changes were restored, but the active batter/bowler state could not be proven. Re-select them before scoring or syncing."
+            : "Last delivery was edited. Re-select striker, non-striker, and bowler before scoring again."
+        );
+      } else if (!scorerState.restored && (scorerState.hasPendingEvents || (sorted.length && !recovery.missing))) {
+        setInfo(
+          scorerState.hasPendingEvents
+            ? "Pending local scoring changes were restored, but the active batter/bowler state could not be proven. Re-select them before scoring or syncing."
+            : "Scoring totals were recovered, but the active batter/bowler state could not be proven. Re-select them before scoring."
+        );
       }
 
       channel = supabase
@@ -1212,9 +1289,9 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
   useEffect(() => {
     pendingEventsRef.current = pendingEvents;
     if (matchId) {
-      writePendingEvents(matchId, pendingEvents);
+      writePendingEvents(matchId, pendingEvents, persistenceScope);
     }
-  }, [matchId, pendingEvents]);
+  }, [matchId, pendingEvents, persistenceScope]);
 
   useEffect(() => {
     savingRef.current = saving;
@@ -1262,7 +1339,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       lockReady,
       lockFeatureAvailable,
       pendingEvents,
-    });
+    }, persistenceScope);
   }, [
     balls,
     battingPlayers,
@@ -1282,6 +1359,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
     match,
     matchId,
     matchSnapshotScope,
+    persistenceScope,
     needsNextBowler,
     nonStrikerId,
     nonStrikerTurn,
@@ -1348,8 +1426,8 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       nonStrikerTurn,
       bowlerId,
       needsNextBowler,
-    });
-  }, [bowlerId, innings?.id, matchId, needsNextBowler, nonStrikerId, nonStrikerTurn, strikerId, strikerTurn]);
+    }, persistenceScope);
+  }, [bowlerId, innings?.id, matchId, needsNextBowler, nonStrikerId, nonStrikerTurn, persistenceScope, strikerId, strikerTurn]);
 
   // Batting order (for scorecard)
   const battingOrderIds = useMemo(() => {
@@ -1568,15 +1646,6 @@ const battingScorecardRows = useMemo(() => {
       const currentNonStrikerId = nonStrikerIdRef.current;
       const currentBowlerId = bowlerIdRef.current;
       const currentLegalBalls = legalBallsCount(currentBalls);
-      const currentChaseComplete =
-        currentInnings?.innings_no === 2 &&
-        !!innings1Row?.completed &&
-        sumRuns(currentBalls) >= (toInt(innings1Runs, 0) + 1);
-      const currentInningsComplete =
-        currentLegalBalls >= maxLegal
-        || sumWkts(currentBalls) >= wicketCap
-        || currentChaseComplete
-        || !!currentInnings?.completed;
       const pos = computeNextPosition(currentBalls);
 
       const overCountsBefore = getOverCounts(currentBalls, pos.over_no);
@@ -1716,39 +1785,24 @@ const battingScorecardRows = useMemo(() => {
         successInfo: "Saved ✅",
       });
 
-      const nextBalls = applyEventOptimistically({
-        balls: currentBalls,
-        innings: currentInnings,
-        event,
-      }).balls;
+      
 
-      const total_runs_on_ball = (payload.runs_off_bat || 0) + (payload.extra_runs || 0);
-
-      let s = currentStrikerId;
-      let ns = currentNonStrikerId;
-
-      if (!payload.wicket && total_runs_on_ball % 2 === 1) {
-        [s, ns] = [ns, s];
+      if (!payload.wicket) {
+        setStrikerSelection(postState.striker_id || "");
+        setNonStrikerSelection(postState.non_striker_id || "");
+        setBowlerId(postState.bowler_id || "");
+        setNeedsNextBowler(!!postState.needs_next_bowler);
       }
 
-      const overCountsAfter = getOverCounts(nextBalls, payload.over_no);
-      const overFinishedAfter = isOverFinished(overCountsAfter);
-
-      if (!payload.wicket && overFinishedAfter && !currentInningsComplete) {
-        [s, ns] = [ns, s];
-        setNeedsNextBowler(true);
-        setBowlerId("");
-        setInfo("Over complete — select a new bowler ✅");
+      if (postState.needs_next_bowler) {
+        setInfo("Over complete - select a new bowler.");
       }
 
-      setStrikerSelection(s);
-      setNonStrikerSelection(ns);
+      if (!postState.needs_next_bowler && !overFinishedAfter) setInfo("Saved.");
 
-      if (!overFinishedAfter) setInfo("Saved ✅");
-
-      return { overFinishedAfter, saved: true };
+      return { overFinishedAfter, postState, saved: true };
     } catch {
-      return { overFinishedAfter: false, saved: false };
+      return { overFinishedAfter: false, postState: null, saved: false };
     } finally {
       savingRef.current = false;
       setSaving(false);
@@ -1804,60 +1858,82 @@ const battingScorecardRows = useMemo(() => {
       return;
     }
 
-    const { overFinishedAfter, saved } = await insertBall({
+    const outWasStriker = dismissedPlayerId === strikerId;
+    const survivor = outWasStriker ? nonStrikerId : strikerId;
+    const crossedApplies = wicketCrossed && outWasStriker;
+    const projectedLegalBalls = legalBallsCount(ballsRef.current) + 1;
+    const projectedWickets = sumWkts(ballsRef.current) + 1;
+    const projectedRuns = sumRuns(ballsRef.current);
+    const projectedChaseComplete =
+      inningsRef.current?.innings_no === 2 &&
+      !!innings1Row?.completed &&
+      projectedRuns >= (toInt(innings1Runs, 0) + 1);
+    const projectedInningsComplete =
+      projectedLegalBalls >= maxLegal
+      || projectedWickets >= wicketCap
+      || projectedChaseComplete
+      || !!inningsRef.current?.completed;
+
+    let nextStrikerId = strikerId;
+    let nextNonStrikerId = nonStrikerId;
+    let nextBowlerId = bowlerId;
+    let nextNeedsNextBowler = false;
+
+    if (wicketEndedOver && !projectedInningsComplete) {
+      if (crossedApplies) {
+        nextStrikerId = survivor;
+        nextNonStrikerId = incomingBatterId;
+      } else {
+        nextStrikerId = incomingBatterId;
+        nextNonStrikerId = survivor;
+      }
+      nextBowlerId = "";
+      nextNeedsNextBowler = true;
+    } else if (outWasStriker) {
+      if (crossedApplies) {
+        nextStrikerId = survivor;
+        nextNonStrikerId = incomingBatterId;
+      } else {
+        nextStrikerId = incomingBatterId;
+        nextNonStrikerId = survivor;
+      }
+    } else {
+      nextStrikerId = strikerId;
+      nextNonStrikerId = incomingBatterId;
+    }
+
+    const wicketPostState = buildScorerPostState({
+      strikerId: nextStrikerId,
+      nonStrikerId: nextNonStrikerId,
+      strikerTurn: getTurnFor(nextStrikerId),
+      nonStrikerTurn: getTurnFor(nextNonStrikerId),
+      bowlerId: nextBowlerId,
+      needsNextBowler: nextNeedsNextBowler,
+    });
+
+    const { postState, saved } = await insertBall({
       runs_off_bat: 0,
       extra_type: null,
       wicket: true,
       dismissal_kind: dismissalKind,
       dismissed_player_id: dismissedPlayerId,
+      postStateOverride: wicketPostState,
     });
 
     if (!saved) return;
 
     setNeedsWicketModal(false);
 
-    const outWasStriker = dismissedPlayerId === strikerId;
+    const resolvedPostState = postState || wicketPostState;
+    setStrikerSelection(resolvedPostState.striker_id || "");
+    setNonStrikerSelection(resolvedPostState.non_striker_id || "");
+    setBowlerId(resolvedPostState.bowler_id || "");
+    setNeedsNextBowler(!!resolvedPostState.needs_next_bowler);
 
-    // Who survives at the crease after the wicket?
-    const survivor = outWasStriker ? nonStrikerId : strikerId;
-
-    // Only meaningful when the STRIKER is the one dismissed (e.g., caught / run-out after crossing)
-    const crossedApplies = wicketCrossed && outWasStriker;
-
-    if (overFinishedAfter && !inningsComplete) {
+    if (resolvedPostState.needs_next_bowler) {
       // End of over + wicket: apply "crossed?" + force new bowler
-      if (crossedApplies) {
-        // Survivor takes strike next over if crossed
-        setStrikerSelection(survivor);
-        // Incoming becomes non-striker
-        setNonStrikerSelection(incomingBatterId);
-      } else {
-        // Incoming takes strike next over if not crossed (or if non-striker was dismissed)
-        setStrikerSelection(incomingBatterId);
-        setNonStrikerSelection(survivor);
-      }
+      setInfo("Over complete - select a new bowler.");
 
-      setNeedsNextBowler(true);
-      setBowlerId("");
-      setInfo("Over complete — select a new bowler ✅");
-    } else {
-      // Mid-over wicket:
-      // - If striker dismissed: "crossed?" decides who faces next ball
-      // - If non-striker dismissed: striker remains on strike
-      if (outWasStriker) {
-        if (crossedApplies) {
-          // They crossed before the wicket fell -> survivor (former non-striker) is now on strike
-          setStrikerSelection(survivor);
-          setNonStrikerSelection(incomingBatterId);
-        } else {
-          // No crossing -> incoming is on strike, survivor stays non-striker
-          setStrikerSelection(incomingBatterId);
-          // nonStriker stays as-is
-        }
-      } else {
-        // Non-striker out -> incoming becomes non-striker, striker stays on strike
-        setNonStrikerSelection(incomingBatterId);
-      }
     }
   };
 
@@ -1926,30 +2002,7 @@ const battingScorecardRows = useMemo(() => {
     }
   };
 
-  // Auto mark innings completed if overs done or all out
-  useEffect(() => {
-    if (!innings?.id) return;
-    if (innings?.completed) return;
-    if (!oversDone && !allOut) return;
-
-    (async () => {
-      await applySessionEvent(
-        {
-          created_at: new Date().toISOString(),
-          event_id: `auto-end-${innings.id}`,
-          event_type: "end_innings",
-          innings_id: innings.id,
-          match_id: matchId,
-          payload: {},
-        },
-        {
-          failurePrefix: "Auto-complete innings",
-          successInfo: "",
-          optimisticQueuedInfo: "",
-        }
-      ).catch(() => {});
-    })();
-  }, [allOut, innings?.completed, innings?.id, matchId, oversDone]);
+  // Innings auto-completion is handled by the scoring RPC so reopen/edit flows do not double-end innings.
 
   // Scorer-only: reset the match so you can test scoring again
   const resetMatchData = async () => {
@@ -2944,7 +2997,7 @@ You can then start scoring again from ball 1.`
                       },
                       {
                         failurePrefix: "Edit delivery",
-                        successInfo: "Updated ✅",
+                        successInfo: "",
                         optimisticQueuedInfo: "Offline: delivery edit queued locally.",
                       }
                     );
@@ -2952,7 +3005,13 @@ You can then start scoring again from ball 1.`
 
 
 
-                    setInfo("Updated ✅");
+                    if (!innings.completed) {
+                      clearScorerState(matchId, innings.id, persistenceScope);
+                      clearLiveSelections();
+                      setInfo("Delivery updated. Re-select striker, non-striker, and bowler before scoring again.");
+                    } else {
+                      setInfo("Delivery updated.");
+                    }
                     setEditOpen(false);
                   } finally {
                     setSaving(false);

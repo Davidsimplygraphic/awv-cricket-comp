@@ -11,32 +11,141 @@ function safeParse(raw, fallback) {
   }
 }
 
-export function getPendingEventsKey(matchId) {
+function legacyPendingEventsKey(matchId) {
   return `awv_pending_events_${matchId || "unknown"}`;
 }
 
-export function readPendingEvents(matchId) {
-  const storage = safeStorage("local");
-  if (!storage) return [];
-  const parsed = safeParse(storage.getItem(getPendingEventsKey(matchId)), []);
-  return Array.isArray(parsed) ? parsed : [];
+export function getPendingEventsKey(matchId, scope = "shared") {
+  return `awv_pending_events_${scope || "shared"}_${matchId || "unknown"}`;
 }
 
-export function writePendingEvents(matchId, queue) {
+export function readPendingEvents(matchId, scope = null) {
+  const storage = safeStorage("local");
+  if (!storage) return [];
+
+  const scopedKey = scope ? getPendingEventsKey(matchId, scope) : legacyPendingEventsKey(matchId);
+  const parsed = safeParse(storage.getItem(scopedKey), null);
+  if (Array.isArray(parsed)) return parsed;
+
+  if (scope) {
+    const legacy = safeParse(storage.getItem(legacyPendingEventsKey(matchId)), []);
+    return Array.isArray(legacy) ? legacy : [];
+  }
+
+  return [];
+}
+
+export function writePendingEvents(matchId, queue, scope = null) {
   const storage = safeStorage("local");
   if (!storage) return;
-  const key = getPendingEventsKey(matchId);
+  const key = scope ? getPendingEventsKey(matchId, scope) : legacyPendingEventsKey(matchId);
+  const legacyKey = scope ? legacyPendingEventsKey(matchId) : null;
   if (!queue?.length) {
     storage.removeItem(key);
+    if (legacyKey) storage.removeItem(legacyKey);
     return;
   }
   storage.setItem(key, JSON.stringify(queue));
+  if (legacyKey) storage.removeItem(legacyKey);
 }
 
-export function clearPendingEvents(matchId) {
+export function clearPendingEvents(matchId, scope = null) {
   const storage = safeStorage("local");
   if (!storage) return;
-  storage.removeItem(getPendingEventsKey(matchId));
+  storage.removeItem(scope ? getPendingEventsKey(matchId, scope) : legacyPendingEventsKey(matchId));
+  if (scope) storage.removeItem(legacyPendingEventsKey(matchId));
+}
+
+function legacyScorerStateKey(matchId, inningsId) {
+  return `awv_scorer_state_${matchId || "unknown"}_${inningsId || "unknown"}`;
+}
+
+export function getScorerStateKey(matchId, inningsId, scope = "shared") {
+  return `awv_scorer_state_${scope || "shared"}_${matchId || "unknown"}_${inningsId || "unknown"}`;
+}
+
+function legacyScoringSnapshotKey(scope) {
+  return `awv_score_snapshot_${scope || "unknown"}`;
+}
+
+export function getScoringSnapshotKey(scope, sessionScope = "shared") {
+  return `awv_score_snapshot_${sessionScope || "shared"}_${scope || "unknown"}`;
+}
+
+export function readScorerState(matchId, inningsId, scope = null) {
+  const storage = safeStorage("local");
+  if (!storage) return null;
+  const scopedKey = scope ? getScorerStateKey(matchId, inningsId, scope) : legacyScorerStateKey(matchId, inningsId);
+  const parsed = safeParse(storage.getItem(scopedKey), null);
+  if (parsed && typeof parsed === "object") return parsed;
+
+  if (scope) {
+    const legacy = safeParse(storage.getItem(legacyScorerStateKey(matchId, inningsId)), null);
+    return legacy && typeof legacy === "object" ? legacy : null;
+  }
+
+  return null;
+}
+
+export function writeScorerState(matchId, inningsId, state, scope = null) {
+  const storage = safeStorage("local");
+  if (!storage || !matchId || !inningsId) return;
+
+  const key = scope ? getScorerStateKey(matchId, inningsId, scope) : legacyScorerStateKey(matchId, inningsId);
+  const legacyKey = scope ? legacyScorerStateKey(matchId, inningsId) : null;
+  if (!state) {
+    storage.removeItem(key);
+    if (legacyKey) storage.removeItem(legacyKey);
+    return;
+  }
+
+  storage.setItem(key, JSON.stringify(state));
+  if (legacyKey) storage.removeItem(legacyKey);
+}
+
+export function clearScorerState(matchId, inningsId, scope = null) {
+  const storage = safeStorage("local");
+  if (!storage || !matchId || !inningsId) return;
+  storage.removeItem(scope ? getScorerStateKey(matchId, inningsId, scope) : legacyScorerStateKey(matchId, inningsId));
+  if (scope) storage.removeItem(legacyScorerStateKey(matchId, inningsId));
+}
+
+export function readScoringSnapshot(scope, sessionScope = null) {
+  const storage = safeStorage("local");
+  if (!storage) return null;
+  const key = sessionScope ? getScoringSnapshotKey(scope, sessionScope) : legacyScoringSnapshotKey(scope);
+  const parsed = safeParse(storage.getItem(key), null);
+  if (parsed && typeof parsed === "object") return parsed;
+
+  if (sessionScope) {
+    const legacy = safeParse(storage.getItem(legacyScoringSnapshotKey(scope)), null);
+    return legacy && typeof legacy === "object" ? legacy : null;
+  }
+
+  return null;
+}
+
+export function writeScoringSnapshot(scope, snapshot, sessionScope = null) {
+  const storage = safeStorage("local");
+  if (!storage || !scope) return;
+
+  const key = sessionScope ? getScoringSnapshotKey(scope, sessionScope) : legacyScoringSnapshotKey(scope);
+  const legacyKey = sessionScope ? legacyScoringSnapshotKey(scope) : null;
+  if (!snapshot) {
+    storage.removeItem(key);
+    if (legacyKey) storage.removeItem(legacyKey);
+    return;
+  }
+
+  storage.setItem(key, JSON.stringify(snapshot));
+  if (legacyKey) storage.removeItem(legacyKey);
+}
+
+export function clearScoringSnapshot(scope, sessionScope = null) {
+  const storage = safeStorage("local");
+  if (!storage || !scope) return;
+  storage.removeItem(sessionScope ? getScoringSnapshotKey(scope, sessionScope) : legacyScoringSnapshotKey(scope));
+  if (sessionScope) storage.removeItem(legacyScoringSnapshotKey(scope));
 }
 
 export function readLegacyPendingBallQueues(matchId) {
@@ -83,66 +192,6 @@ export function clearLegacyPendingBallQueues(matchId) {
   }
 
   keys.forEach((key) => storage.removeItem(key));
-}
-
-export function getScorerStateKey(matchId, inningsId) {
-  return `awv_scorer_state_${matchId || "unknown"}_${inningsId || "unknown"}`;
-}
-
-export function getScoringSnapshotKey(scope) {
-  return `awv_score_snapshot_${scope || "unknown"}`;
-}
-
-export function readScorerState(matchId, inningsId) {
-  const storage = safeStorage("local");
-  if (!storage) return null;
-  const parsed = safeParse(storage.getItem(getScorerStateKey(matchId, inningsId)), null);
-  return parsed && typeof parsed === "object" ? parsed : null;
-}
-
-export function writeScorerState(matchId, inningsId, state) {
-  const storage = safeStorage("local");
-  if (!storage || !matchId || !inningsId) return;
-
-  const key = getScorerStateKey(matchId, inningsId);
-  if (!state) {
-    storage.removeItem(key);
-    return;
-  }
-
-  storage.setItem(key, JSON.stringify(state));
-}
-
-export function clearScorerState(matchId, inningsId) {
-  const storage = safeStorage("local");
-  if (!storage || !matchId || !inningsId) return;
-  storage.removeItem(getScorerStateKey(matchId, inningsId));
-}
-
-export function readScoringSnapshot(scope) {
-  const storage = safeStorage("local");
-  if (!storage) return null;
-  const parsed = safeParse(storage.getItem(getScoringSnapshotKey(scope)), null);
-  return parsed && typeof parsed === "object" ? parsed : null;
-}
-
-export function writeScoringSnapshot(scope, snapshot) {
-  const storage = safeStorage("local");
-  if (!storage || !scope) return;
-
-  const key = getScoringSnapshotKey(scope);
-  if (!snapshot) {
-    storage.removeItem(key);
-    return;
-  }
-
-  storage.setItem(key, JSON.stringify(snapshot));
-}
-
-export function clearScoringSnapshot(scope) {
-  const storage = safeStorage("local");
-  if (!storage || !scope) return;
-  storage.removeItem(getScoringSnapshotKey(scope));
 }
 
 export function getOrCreateScorerSessionId(scope) {

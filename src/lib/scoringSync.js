@@ -57,6 +57,11 @@ export function removePendingEvent(queue, eventId) {
   return sortPendingEvents((queue || []).filter((item) => item?.event_id !== eventId));
 }
 
+export function removePendingEventsForInnings(queue, inningsId) {
+  if (!inningsId) return sortPendingEvents(queue || []);
+  return sortPendingEvents((queue || []).filter((item) => item?.innings_id !== inningsId));
+}
+
 export function sortPendingEvents(queue) {
   return [...(queue || [])]
     .filter(Boolean)
@@ -68,6 +73,45 @@ export function sortPendingEvents(queue) {
       if (createdDiff !== 0) return createdDiff;
       return String(a?.event_id || "").localeCompare(String(b?.event_id || ""));
     });
+}
+
+export function isAuthoritativeScoringRejection(error) {
+  const message = String(error?.message || error || "");
+  return /balls_unique_position|Cannot add a ball to a completed innings|Only the latest ball in an innings can be edited safely|Target ball not found for edit event/i.test(message);
+}
+
+export function deriveQueuedScorerState({ queue = [], inningsId = null, basePostState = null } = {}) {
+  let postState = basePostState && typeof basePostState === "object" ? basePostState : null;
+  let invalidatesPostState = false;
+
+  for (const rawEvent of sortPendingEvents(queue)) {
+    const event = normalizePendingEvent(rawEvent);
+    if (!event) continue;
+    if (inningsId && event.innings_id !== inningsId) continue;
+
+    if (event.event_type === "edit_ball") {
+      postState = null;
+      invalidatesPostState = true;
+      continue;
+    }
+
+    if (event.event_type !== "add_ball") continue;
+
+    const nextPostState = event.payload?.post_state;
+    if (nextPostState && typeof nextPostState === "object") {
+      postState = nextPostState;
+      invalidatesPostState = false;
+      continue;
+    }
+
+    postState = null;
+    invalidatesPostState = true;
+  }
+
+  return {
+    postState: invalidatesPostState ? null : postState,
+    invalidatesPostState,
+  };
 }
 
 export function applyEventOptimistically({ balls = [], innings = null, event }) {
