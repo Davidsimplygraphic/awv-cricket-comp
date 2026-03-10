@@ -107,7 +107,14 @@ export default function App() {
         <Route path="/fixtures" element={<Fixtures />} />
         <Route path="/leaderboards" element={<Leaderboards />} />
         <Route path="/teams" element={<Teams />} />
-        <Route path="/teams/:teamId" element={<TeamRoster />} />
+        <Route
+          path="/teams/:teamId"
+          element={
+            <RequireAuth>
+              <TeamRoster />
+            </RequireAuth>
+          }
+        />
         <Route path="/login" element={<Login />} />
 
         {/* Fixture-level match centre */}

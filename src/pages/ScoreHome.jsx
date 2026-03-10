@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "../lib/supabase";
+import { isMissingRpcError } from "../lib/scoringSync";
 
 export default function ScoreHome() {
   const [user, setUser] = useState(null);
@@ -32,6 +33,7 @@ export default function ScoreHome() {
   // - live: in progress
   // - completed: finished
   const statusOptions = useMemo(() => ["scheduled", "live", "completed"], []);
+  const isMatchOwner = (match) => !!user?.id && match?.scorer_user_id === user.id;
 
   const load = async () => {
     setLoading(true);

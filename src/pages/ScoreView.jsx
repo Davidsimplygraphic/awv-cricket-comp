@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 import {
+  clearPendingEvents,
+  clearScorerState,
+  clearScoringSnapshot,
   clearLegacyPendingBallQueues,
   describeScorerDevice,
   getOrCreateScorerSessionId,
@@ -13,6 +16,18 @@ import {
   writeScoringSnapshot,
   writeScorerState,
 } from "../lib/scoringPersistence";
+import { didBatterFaceBall, mergeBallIntoList, runsConcededByBowler } from "../lib/scoring";
+import {
+  applyEventOptimistically,
+  applyRpcResultToState,
+  createEventId,
+  enqueuePendingEvent,
+  isLockConflictError,
+  isMissingRpcError,
+  isNetworkLikeError,
+  removePendingEvent,
+  replayPendingEventsOnState,
+} from "../lib/scoringSync";
 
 function toInt(n, fallback = 0) {
   const x = Number(n);
@@ -144,7 +159,20 @@ async function getOrCreateInnings({ matchId, inningsNo, match }) {
     .select("*")
     .single();
 
-  if (createInn.error) return { data: null, error: createInn.error };
+  if (createInn.error) {
+    const message = String(createInn.error?.message || "");
+    if (/duplicate key|unique/i.test(message)) {
+      const existingInn = await supabase
+        .from("innings")
+        .select("*")
+        .eq("match_id", matchId)
+        .eq("innings_no", inningsNo)
+        .maybeSingle();
+      if (!existingInn.error && existingInn.data) return { data: existingInn.data, error: null };
+    }
+
+    return { data: null, error: createInn.error };
+  }
   return { data: createInn.data, error: null };
 }
 
@@ -183,23 +211,6 @@ async function loadSquadPlayers({ fixtureId, teamId }) {
   return { data: p2.data || [], error: null };
 }
 
-function createEventId(prefix = "event") {
-  if (typeof crypto !== "undefined" && crypto?.randomUUID) {
-    return `${prefix}-${crypto.randomUUID()}`;
-  }
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function isNetworkLikeError(error) {
-  const message = String(error?.message || error || "");
-  return /network|fetch|offline|failed to fetch|load failed|timeout/i.test(message);
-}
-
-function isMissingRpcError(error) {
-  const message = String(error?.message || error || "");
-  return /function|rpc|does not exist|could not find/i.test(message);
-}
-
 export default function ScoreView() {
   const { fixtureId } = useParams();
 
@@ -208,7 +219,6 @@ export default function ScoreView() {
   const [matchId, setMatchId] = useState("");
   const [canonicalFixtureId, setCanonicalFixtureId] = useState("");
 
-  const [user, setUser] = useState({ id: "dev" });
   const [match, setMatch] = useState(null);
   const [clientSessionId] = useState(() => getOrCreateScorerSessionId(fixtureId || "unknown"));
   const [deviceLabel] = useState(() => describeScorerDevice());
@@ -273,6 +283,18 @@ export default function ScoreView() {
   const [activeScorerSession, setActiveScorerSession] = useState(null);
   const [lockFeatureAvailable, setLockFeatureAvailable] = useState(true);
   const [takingControl, setTakingControl] = useState(false);
+
+  const ballsRef = useRef([]);
+  const inningsRef = useRef(null);
+  const strikerIdRef = useRef("");
+  const nonStrikerIdRef = useRef("");
+  const strikerTurnRef = useRef(1);
+  const nonStrikerTurnRef = useRef(1);
+  const bowlerIdRef = useRef("");
+  const pendingEventsRef = useRef([]);
+  const savingRef = useRef(false);
+  const flushingQueueRef = useRef(false);
+  const matchSnapshotScope = fixtureId || canonicalFixtureId || matchId || "unknown";
 
   // CURRENT innings totals
   const totalRuns = useMemo(() => sumRuns(balls), [balls]);
@@ -368,8 +390,8 @@ export default function ScoreView() {
 
     if (i2Runs === i1Runs) return "RESULT: Match tied.";
     if (i2Runs > i1Runs) {
-      const margin = i2Runs - i1Runs;
-      return `RESULT: ${team2Name} won by ${margin} run${margin === 1 ? "" : "s"}.`;
+      const wicketsRemaining = Math.max(0, wicketCap - i2Wkts);
+      return `RESULT: ${team2Name} won by ${wicketsRemaining} wicket${wicketsRemaining === 1 ? "" : "s"}.`;
     }
 
     const runsBy = i1Runs - i2Runs;
@@ -386,7 +408,7 @@ export default function ScoreView() {
     innings2LegalForResult,
   ]);
 
-  // If scoring has started and match is still scheduled, flip it to LIVE.
+  /* Match status is derived from innings and balls. Do not rewrite stored match status from a potentially stale client view.
   useEffect(() => {
     if (!match?.id) return;
     const status = String(match.status || "").toLowerCase();
@@ -478,7 +500,7 @@ useEffect(() => {
   innings2RunsForResult,
   innings2WktsForResult,
   innings2LegalForResult,
-]);
+]); */
 
 
   // ✅ FIX: dismissal counts MUST use dismissed_player_id (not striker_id)
@@ -510,16 +532,307 @@ const setNonStrikerSelection = (playerId) => {
   setNonStrikerTurn(getTurnFor(playerId));
 };
 
+const readStoredPendingQueue = (resolvedMatchId) => {
+  if (!resolvedMatchId) return [];
+
+  const fromStorage = (readPendingEvents(resolvedMatchId) || []).reduce(
+    (queue, event) => enqueuePendingEvent(queue, { ...event, match_id: event?.match_id || resolvedMatchId }),
+    []
+  );
+
+  const legacy = readLegacyPendingBallQueues(resolvedMatchId).reduce(
+    (queue, event) => enqueuePendingEvent(queue, { ...event, match_id: resolvedMatchId }),
+    fromStorage
+  );
+
+  clearLegacyPendingBallQueues(resolvedMatchId);
+  return legacy;
+};
+
+const restoreSnapshot = (snapshot) => {
+  if (!snapshot || typeof snapshot !== "object") return false;
+  if (!snapshot.matchId || !snapshot.match) return false;
+
+  setMatch(snapshot.match || null);
+  setMatchId(snapshot.matchId || "");
+  setCanonicalFixtureId(snapshot.canonicalFixtureId || snapshot.match?.fixture_id || snapshot.matchId);
+  setInningsNo(toInt(snapshot.inningsNo, 1) || 1);
+  setInnings(snapshot.innings || null);
+  setInnings1Row(snapshot.innings1Row || null);
+  setInnings1Runs(toInt(snapshot.innings1Runs, 0));
+  setInnings1Wkts(toInt(snapshot.innings1Wkts, 0));
+  setInnings1Legal(toInt(snapshot.innings1Legal, 0));
+  setInnings2RowForResult(snapshot.innings2RowForResult || null);
+  setInnings2RunsForResult(toInt(snapshot.innings2RunsForResult, 0));
+  setInnings2WktsForResult(toInt(snapshot.innings2WktsForResult, 0));
+  setInnings2LegalForResult(toInt(snapshot.innings2LegalForResult, 0));
+  setBalls(sortBallsByPosition(snapshot.balls || []));
+  setBattingPlayers(Array.isArray(snapshot.battingPlayers) ? snapshot.battingPlayers : []);
+  setBowlingPlayers(Array.isArray(snapshot.bowlingPlayers) ? snapshot.bowlingPlayers : []);
+  setStrikerId(snapshot.strikerId || "");
+  setNonStrikerId(snapshot.nonStrikerId || "");
+  setStrikerTurn(toInt(snapshot.strikerTurn, 1) || 1);
+  setNonStrikerTurn(toInt(snapshot.nonStrikerTurn, 1) || 1);
+  setBowlerId(snapshot.bowlerId || "");
+  setNeedsNextBowler(!!snapshot.needsNextBowler);
+  setLockReady(!!snapshot.lockReady);
+  setLockFeatureAvailable(snapshot.lockFeatureAvailable !== false);
+  setPendingEvents(Array.isArray(snapshot.pendingEvents) ? snapshot.pendingEvents : readStoredPendingQueue(snapshot.matchId));
+  setInfo("Offline snapshot restored. Pending scoring changes will sync when the connection returns.");
+  return true;
+};
+
+const applyOptimisticEventState = (event) => {
+  const nextState = applyEventOptimistically({
+    balls: ballsRef.current,
+    innings: inningsRef.current,
+    event,
+  });
+
+  setBalls(nextState.balls);
+  if (nextState.innings !== inningsRef.current) {
+    setInnings(nextState.innings);
+  }
+
+  return nextState;
+};
+
+const applyServerEventState = (event, result) => {
+  const nextState = applyRpcResultToState({
+    balls: ballsRef.current,
+    innings: inningsRef.current,
+    event,
+    result,
+  });
+
+  setBalls(nextState.balls);
+  if (nextState.innings !== inningsRef.current) {
+    setInnings(nextState.innings);
+  }
+
+  return nextState;
+};
+
+const reloadCurrentInningsState = async (targetInningsId = inningsRef.current?.id) => {
+  if (!matchId || !targetInningsId) return;
+
+  const [ballsRes, inningsRes] = await Promise.all([
+    supabase
+      .from("balls")
+      .select("*")
+      .eq("match_id", matchId)
+      .eq("innings_id", targetInningsId)
+      .order("over_no", { ascending: true })
+      .order("delivery_in_over", { ascending: true }),
+    supabase.from("innings").select("*").eq("id", targetInningsId).maybeSingle(),
+  ]);
+
+  if (!ballsRes.error) {
+    setBalls(sortBallsByPosition(ballsRes.data || []));
+  }
+
+  if (!inningsRes.error && inningsRes.data) {
+    setInnings((prev) => (prev?.id === inningsRes.data.id ? inningsRes.data : prev));
+  }
+};
+
+const applySessionEvent = async (
+  event,
+  {
+    optimisticQueuedInfo = "Offline: scoring change queued locally.",
+    successInfo = "Saved ✅",
+    failurePrefix = "Save",
+  } = {}
+) => {
+  const normalizedEvent = {
+    created_at: event?.created_at || new Date().toISOString(),
+    event_id: event?.event_id || createEventId(event?.event_type || "event"),
+    event_type: event?.event_type,
+    innings_id: event?.innings_id || inningsRef.current?.id || "",
+    match_id: event?.match_id || matchId,
+    payload: event?.payload || {},
+  };
+
+  if (!normalizedEvent.match_id || !normalizedEvent.innings_id || !normalizedEvent.event_type) {
+    throw new Error("Incomplete scoring event payload.");
+  }
+
+  if (!isOnline) {
+    setPendingEvents((prev) => enqueuePendingEvent(prev, normalizedEvent));
+    applyOptimisticEventState(normalizedEvent);
+    setInfo(optimisticQueuedInfo);
+    return { queued: true, result: null, event: normalizedEvent };
+  }
+
+  const { data, error } = await supabase.rpc("apply_match_session_event", {
+    p_event_id: normalizedEvent.event_id,
+    p_match_id: normalizedEvent.match_id,
+    p_innings_id: normalizedEvent.innings_id,
+    p_client_session_id: clientSessionId,
+    p_event_type: normalizedEvent.event_type,
+    p_payload: normalizedEvent.payload,
+  });
+
+  if (error) {
+    if (isMissingRpcError(error)) {
+      setErr("The database is missing the required scoring RPC. Apply the latest Supabase migrations before scoring.");
+      throw error;
+    }
+
+    if (isLockConflictError(error)) {
+      setScoringLocked(true);
+      setErr("Another scorer session currently holds the match lock for this fixture.");
+      throw error;
+    }
+
+    if (isNetworkLikeError(error)) {
+      setPendingEvents((prev) => enqueuePendingEvent(prev, normalizedEvent));
+      applyOptimisticEventState(normalizedEvent);
+      setInfo(optimisticQueuedInfo);
+      return { queued: true, result: null, event: normalizedEvent };
+    }
+
+    const message = String(error?.message || error || "");
+    if (/balls_unique_position/i.test(message)) {
+      await reloadCurrentInningsState(normalizedEvent.innings_id);
+      setErr("A scoring conflict was detected for that delivery. Canonical innings state has been reloaded.");
+      throw error;
+    }
+
+    setErr(`${failurePrefix} failed: ${message}`);
+    throw error;
+  }
+
+  applyServerEventState(normalizedEvent, data || {});
+  setPendingEvents((prev) => removePendingEvent(prev, normalizedEvent.event_id));
+  if (successInfo) setInfo(successInfo);
+  return { queued: false, result: data || null, event: normalizedEvent };
+};
+
+const flushPendingQueue = async () => {
+  if (!matchId || !isOnline || !pendingEventsRef.current.length || flushingQueueRef.current) return;
+  if (lockFeatureAvailable && scoringLocked) return;
+
+  flushingQueueRef.current = true;
+  setIsFlushingQueue(true);
+
+  try {
+    for (const event of pendingEventsRef.current) {
+      const { data, error } = await supabase.rpc("apply_match_session_event", {
+        p_event_id: event.event_id,
+        p_match_id: event.match_id || matchId,
+        p_innings_id: event.innings_id,
+        p_client_session_id: clientSessionId,
+        p_event_type: event.event_type,
+        p_payload: event.payload || {},
+      });
+
+      if (error) {
+        if (isNetworkLikeError(error)) break;
+        if (isLockConflictError(error)) {
+          setScoringLocked(true);
+          setErr("Pending scoring changes could not sync because another scorer session now holds the match lock.");
+          break;
+        }
+        if (isMissingRpcError(error)) {
+          setErr("Pending scoring changes cannot sync because the scoring RPC is missing from the database.");
+          break;
+        }
+
+        const message = String(error?.message || error || "");
+        if (/balls_unique_position/i.test(message)) {
+          await reloadCurrentInningsState(event.innings_id);
+          setErr("Pending scoring replay hit a delivery-position conflict. Canonical innings state has been reloaded.");
+          break;
+        }
+
+        setErr(`Pending sync failed: ${message}`);
+        break;
+      }
+
+      applyServerEventState(event, data || {});
+      setPendingEvents((prev) => removePendingEvent(prev, event.event_id));
+    }
+  } finally {
+    flushingQueueRef.current = false;
+    setIsFlushingQueue(false);
+  }
+};
+
+const acquireScorerLock = async (override = false) => {
+  if (!matchId || !isOnline) return false;
+
+  const { data, error } = await supabase.rpc("acquire_match_scorer_lock", {
+    p_match_id: matchId,
+    p_client_session_id: clientSessionId,
+    p_override: override,
+    p_device_label: deviceLabel,
+  });
+
+  if (error) {
+    if (isMissingRpcError(error)) {
+      setLockFeatureAvailable(false);
+      setLockReady(true);
+      setScoringLocked(false);
+      return false;
+    }
+
+    if (!isNetworkLikeError(error)) {
+      setErr(`Scorer lock error: ${error.message}`);
+    }
+
+    return false;
+  }
+
+  if (data?.ok === false && data?.locked_by_other) {
+    setLockReady(false);
+    setScoringLocked(true);
+    setActiveScorerSession(data.active_session || null);
+    return false;
+  }
+
+  setActiveScorerSession(data?.session || null);
+  setScoringLocked(false);
+  setLockReady(true);
+  return true;
+};
+
+const takeScorerControl = async () => {
+  setTakingControl(true);
+  try {
+    const ok = await acquireScorerLock(true);
+    if (ok) {
+      setInfo("Scorer control acquired for this browser session.");
+      flushPendingQueue();
+    }
+  } finally {
+    setTakingControl(false);
+  }
+};
+
+const clearLocalMatchState = (resolvedMatchId = matchId) => {
+  pendingEventsRef.current = [];
+  setPendingEvents([]);
+
+  if (resolvedMatchId) {
+    clearPendingEvents(resolvedMatchId);
+
+    const inningsIds = [inningsRef.current?.id, innings1Row?.id, innings2RowForResult?.id].filter(Boolean);
+    [...new Set(inningsIds)].forEach((inningsId) => clearScorerState(resolvedMatchId, inningsId));
+  }
+
+  clearScoringSnapshot(matchSnapshotScope);
+};
+
 // Load the single match row for this fixture_id
   useEffect(() => {
     let alive = true;
+    const storedSnapshot = readScoringSnapshot(matchSnapshotScope);
 
     (async () => {
       setLoading(true);
       setErr("");
       setInfo("");
-
-      setUser({ id: "dev" });
 
       const m = await supabase
         .from("matches")
@@ -539,6 +852,10 @@ const setNonStrikerSelection = (playerId) => {
       if (!alive) return;
 
       if (m.error) {
+        if (isNetworkLikeError(m.error) && restoreSnapshot(storedSnapshot)) {
+          setLoading(false);
+          return;
+        }
         setErr(`Match load error: ${m.error.message}`);
         setMatch(null);
         setMatchId("");
@@ -547,6 +864,10 @@ const setNonStrikerSelection = (playerId) => {
       }
 
       if (!m.data) {
+        if (restoreSnapshot(storedSnapshot)) {
+          setLoading(false);
+          return;
+        }
         setErr("No match found for this fixture.");
         setMatch(null);
         setMatchId("");
@@ -566,6 +887,11 @@ const setNonStrikerSelection = (playerId) => {
       // If this match has no fixture_id (older data), normalise it so all routes work consistently.
       if (!m.data.fixture_id) {
         await supabase.from("matches").update({ fixture_id: m.data.id }).eq("id", m.data.id);
+      }
+
+      const restoredQueue = readStoredPendingQueue(m.data.id);
+      if (alive) {
+        setPendingEvents(restoredQueue);
       }
 
       setLoading(false);
@@ -648,6 +974,7 @@ const setNonStrikerSelection = (playerId) => {
       setLoading(true);
       setErr("");
       setInfo("");
+      const storedSnapshot = readScoringSnapshot(matchSnapshotScope);
 
       setStrikerSelection("");
       setNonStrikerSelection("");
@@ -667,20 +994,28 @@ const setNonStrikerSelection = (playerId) => {
 
       const batPlayersRes = await loadSquadPlayers({ fixtureId: canonicalFixtureId || fixtureId, teamId: inn.data.batting_team_id });
       if (batPlayersRes.error) {
-        setErr(`Batting roster error: ${batPlayersRes.error.message}`);
-        setLoading(false);
-        return;
+        if (isNetworkLikeError(batPlayersRes.error) && Array.isArray(storedSnapshot?.battingPlayers)) {
+          setBattingPlayers(storedSnapshot.battingPlayers);
+        } else {
+          setErr(`Batting roster error: ${batPlayersRes.error.message}`);
+          setLoading(false);
+          return;
+        }
       }
 
       const bowlPlayersRes = await loadSquadPlayers({ fixtureId: canonicalFixtureId || fixtureId, teamId: inn.data.bowling_team_id });
       if (bowlPlayersRes.error) {
-        setErr(`Bowling roster error: ${bowlPlayersRes.error.message}`);
-        setLoading(false);
-        return;
+        if (isNetworkLikeError(bowlPlayersRes.error) && Array.isArray(storedSnapshot?.bowlingPlayers)) {
+          setBowlingPlayers(storedSnapshot.bowlingPlayers);
+        } else {
+          setErr(`Bowling roster error: ${bowlPlayersRes.error.message}`);
+          setLoading(false);
+          return;
+        }
       }
 
-      setBattingPlayers(batPlayersRes.data || []);
-      setBowlingPlayers(bowlPlayersRes.data || []);
+      if (!batPlayersRes.error) setBattingPlayers(batPlayersRes.data || []);
+      if (!bowlPlayersRes.error) setBowlingPlayers(bowlPlayersRes.data || []);
 
       const b = await supabase
         .from("balls")
@@ -691,24 +1026,45 @@ const setNonStrikerSelection = (playerId) => {
         .order("delivery_in_over", { ascending: true });
 
       if (b.error) {
+        if (isNetworkLikeError(b.error) && storedSnapshot?.innings?.id === inn.data.id) {
+          const restoredState = replayPendingEventsOnState({
+            balls: storedSnapshot.balls || [],
+            innings: storedSnapshot.innings || inn.data,
+            queue: pendingEventsRef.current,
+            inningsId: inn.data.id,
+          });
+
+          setInnings(restoredState.innings || storedSnapshot.innings || inn.data);
+          setBalls(restoredState.balls);
+          setInfo("Offline snapshot restored for this innings. Pending events will sync when the network returns.");
+          setLoading(false);
+          return;
+        }
+
         setErr(`Balls load error: ${b.error.message}`);
         setLoading(false);
         return;
       }
 
-      const sorted = sortBallsByPosition(b.data || []);
+      const restoredState = replayPendingEventsOnState({
+        balls: b.data || [],
+        innings: inn.data,
+        queue: pendingEventsRef.current,
+        inningsId: inn.data.id,
+      });
+      const sorted = sortBallsByPosition(restoredState.balls || []);
+      setInnings(restoredState.innings || inn.data);
       setBalls(sorted);
 
-      // Safety: if an innings was left "completed" from a previous run but has no balls,
-      // automatically reopen it so scoring can start immediately.
+      /* Do not reopen innings implicitly from the client.
       if (inn.data?.completed && sorted.length === 0) {
         const reopen = await supabase.from("innings").update({ completed: false }).eq("id", inn.data.id).select("*").single();
         if (!reopen.error && reopen.data) {
           setInnings(reopen.data);
         }
-      }
+      } */
 
-      if (inningsNo === 2 && inn.data?.completed && sorted.length === 0) {
+      if ((restoredState.innings || inn.data)?.completed && sorted.length === 0) {
         setInfo("Innings 2 is marked completed but has no balls. Click ‘Reopen innings’ to start scoring.");
       }
 
@@ -736,15 +1092,18 @@ const setNonStrikerSelection = (playerId) => {
           { event: "*", schema: "public", table: "balls", filter: `innings_id=eq.${inn.data.id}` },
           (payload) => {
             if (payload.eventType === "DELETE") {
-              setBalls((prev) => prev.filter((ball) => ball.id !== payload.old?.id));
+              setBalls((prev) =>
+                prev.filter(
+                  (ball) =>
+                    ball.id !== payload.old?.id &&
+                    ball.source_event_id !== payload.old?.source_event_id
+                )
+              );
               return;
             }
 
             if (!payload.new) return;
-            setBalls((prev) => {
-              const next = prev.filter((ball) => ball.id !== payload.new.id);
-              return sortBallsByPosition([...next, payload.new]);
-            });
+            setBalls((prev) => mergeBallIntoList(prev, payload.new));
           }
         )
         .subscribe();
@@ -779,6 +1138,152 @@ const setNonStrikerSelection = (playerId) => {
       setInnings2LegalForResult(legal);
     }
   }, [balls, innings]);
+
+  useEffect(() => {
+    ballsRef.current = balls;
+  }, [balls]);
+
+  useEffect(() => {
+    inningsRef.current = innings;
+  }, [innings]);
+
+  useEffect(() => {
+    strikerIdRef.current = strikerId;
+    nonStrikerIdRef.current = nonStrikerId;
+    strikerTurnRef.current = strikerTurn;
+    nonStrikerTurnRef.current = nonStrikerTurn;
+    bowlerIdRef.current = bowlerId;
+  }, [bowlerId, nonStrikerId, nonStrikerTurn, strikerId, strikerTurn]);
+
+  useEffect(() => {
+    pendingEventsRef.current = pendingEvents;
+    if (matchId) {
+      writePendingEvents(matchId, pendingEvents);
+    }
+  }, [matchId, pendingEvents]);
+
+  useEffect(() => {
+    savingRef.current = saving;
+  }, [saving]);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!matchId || !match) return;
+
+    writeScoringSnapshot(matchSnapshotScope, {
+      match,
+      matchId,
+      canonicalFixtureId,
+      inningsNo,
+      innings,
+      innings1Row,
+      innings1Runs,
+      innings1Wkts,
+      innings1Legal,
+      innings2RowForResult,
+      innings2RunsForResult,
+      innings2WktsForResult,
+      innings2LegalForResult,
+      balls,
+      battingPlayers,
+      bowlingPlayers,
+      strikerId,
+      nonStrikerId,
+      strikerTurn,
+      nonStrikerTurn,
+      bowlerId,
+      needsNextBowler,
+      lockReady,
+      lockFeatureAvailable,
+      pendingEvents,
+    });
+  }, [
+    balls,
+    battingPlayers,
+    bowlingPlayers,
+    bowlerId,
+    canonicalFixtureId,
+    innings,
+    innings1Legal,
+    innings1Row,
+    innings1Runs,
+    innings1Wkts,
+    innings2LegalForResult,
+    innings2RowForResult,
+    innings2RunsForResult,
+    innings2WktsForResult,
+    inningsNo,
+    match,
+    matchId,
+    matchSnapshotScope,
+    needsNextBowler,
+    nonStrikerId,
+    nonStrikerTurn,
+    lockFeatureAvailable,
+    lockReady,
+    pendingEvents,
+    strikerId,
+    strikerTurn,
+  ]);
+
+  useEffect(() => {
+    if (!matchId || !lockFeatureAvailable || !isOnline) return;
+    acquireScorerLock(false);
+  }, [isOnline, lockFeatureAvailable, matchId]);
+
+  useEffect(() => {
+    if (!matchId || !lockFeatureAvailable || !lockReady || scoringLocked || !isOnline) return;
+
+    const intervalId = window.setInterval(async () => {
+      const { data, error } = await supabase.rpc("heartbeat_match_scorer_lock", {
+        p_match_id: matchId,
+        p_client_session_id: clientSessionId,
+      });
+
+      if (error) {
+        if (isMissingRpcError(error)) {
+          setLockFeatureAvailable(false);
+        } else if (!isNetworkLikeError(error)) {
+          setErr(`Scorer heartbeat error: ${error.message}`);
+        }
+        return;
+      }
+
+      if (data?.has_lock === false) {
+        setScoringLocked(true);
+        setLockReady(false);
+      }
+    }, 15000);
+
+    return () => window.clearInterval(intervalId);
+  }, [clientSessionId, isOnline, lockFeatureAvailable, lockReady, matchId, scoringLocked]);
+
+  useEffect(() => {
+    return () => {
+      if (!matchId || !lockFeatureAvailable || !lockReady) return;
+      supabase.rpc("release_match_scorer_lock", {
+        p_match_id: matchId,
+        p_client_session_id: clientSessionId,
+      });
+    };
+  }, [clientSessionId, lockFeatureAvailable, lockReady, matchId]);
+
+  useEffect(() => {
+    if (!isOnline || !pendingEvents.length) return;
+    flushPendingQueue();
+  }, [isOnline, pendingEvents.length, matchId, lockFeatureAvailable, lockReady, scoringLocked]);
 
   useEffect(() => {
     if (!matchId || !innings?.id) return;
@@ -859,7 +1364,7 @@ const battingScorecardRows = useMemo(() => {
     if (!p) continue;
 
     const facedAsStriker = balls.filter((b) => b.striker_id === ap.playerId && toInt(b.batting_turn, 1) === ap.turn);
-    const ballsFaced = facedAsStriker.filter((b) => b.extra_type !== "wide").length;
+    const ballsFaced = facedAsStriker.filter((b) => didBatterFaceBall(b)).length;
     const runs = facedAsStriker.reduce((acc, b) => acc + (b.runs_off_bat || 0), 0);
     const fours = facedAsStriker.filter((b) => (b.runs_off_bat || 0) === 4).length;
     const sixes = facedAsStriker.filter((b) => (b.runs_off_bat || 0) === 6).length;
@@ -899,7 +1404,7 @@ const battingScorecardRows = useMemo(() => {
   return rows.filter((r) => r.isAtCrease || r.balls > 0);
 }, [battingPlayers, balls, strikerId, nonStrikerId, strikerTurn, nonStrikerTurn, dismissalsByBatter]);
 
-  const canScore = () => {
+  const canScoreLegacy = () => {
     if (!innings?.id) return { ok: false, msg: "Innings not loaded." };
 
     if (inningsComplete) return { ok: false, msg: "Innings complete." };
@@ -930,6 +1435,50 @@ const battingScorecardRows = useMemo(() => {
     return { ok: true, msg: "" };
   };
 
+  const canScore = () => {
+    const currentInnings = inningsRef.current;
+    const currentBalls = ballsRef.current;
+    const currentStrikerId = strikerIdRef.current;
+    const currentNonStrikerId = nonStrikerIdRef.current;
+    const currentBowlerId = bowlerIdRef.current;
+    const currentNextPos = computeNextPosition(currentBalls);
+    const currentLastOverBowlerId = currentBalls[currentBalls.length - 1]?.bowler_id || "";
+    const currentInningsComplete =
+      legalBallsCount(currentBalls) >= maxLegal || sumWkts(currentBalls) >= wicketCap || !!currentInnings?.completed;
+
+    if (!currentInnings?.id) return { ok: false, msg: "Innings not loaded." };
+    if (lockFeatureAvailable && scoringLocked) return { ok: false, msg: "Scoring is locked by another active scorer session." };
+    if (!isOnline && lockFeatureAvailable && !lockReady) {
+      return { ok: false, msg: "Cannot score offline before the scorer lock has been acquired at least once." };
+    }
+
+    if (currentInningsComplete) return { ok: false, msg: "Innings complete." };
+    if (savingRef.current) return { ok: false, msg: "Saving..." };
+
+    if (!currentStrikerId || !currentNonStrikerId) return { ok: false, msg: "Select striker and non-striker." };
+    if (currentStrikerId === currentNonStrikerId) return { ok: false, msg: "Striker and non-striker must be different." };
+
+    if (!currentBowlerId) return { ok: false, msg: "Select current bowler." };
+
+    if (currentNextPos.newOver) {
+      if (currentBowlerId === currentLastOverBowlerId && currentLastOverBowlerId) {
+        return { ok: false, msg: "Bowler cannot bowl two overs in a row. Choose a different bowler." };
+      }
+
+      const legalBowled = countLegalBallsBowledBy(currentBalls, currentBowlerId);
+      if (legalBowled >= 24) {
+        return { ok: false, msg: "That bowler has already bowled 4 overs (24 legal balls)." };
+      }
+    } else {
+      const last = currentBalls[currentBalls.length - 1];
+      if (last?.bowler_id && currentBowlerId !== last.bowler_id) {
+        return { ok: false, msg: "Bowler cannot change mid-over." };
+      }
+    }
+
+    return { ok: true, msg: "" };
+  };
+
   const insertBall = async ({
     runs_off_bat = 0,
     extra_type = null,
@@ -944,15 +1493,24 @@ const battingScorecardRows = useMemo(() => {
     const ok = canScore();
     if (!ok.ok) {
       setErr(ok.msg);
-      return { overFinishedAfter: false };
+      return { overFinishedAfter: false, saved: false };
     }
 
+    savingRef.current = true;
     setSaving(true);
 
     try {
-      const pos = computeNextPosition(balls);
+      const currentBalls = ballsRef.current;
+      const currentInnings = inningsRef.current;
+      const currentStrikerId = strikerIdRef.current;
+      const currentNonStrikerId = nonStrikerIdRef.current;
+      const currentBowlerId = bowlerIdRef.current;
+      const currentLegalBalls = legalBallsCount(currentBalls);
+      const currentInningsComplete =
+        currentLegalBalls >= maxLegal || sumWkts(currentBalls) >= wicketCap || !!currentInnings?.completed;
+      const pos = computeNextPosition(currentBalls);
 
-      const overCountsBefore = getOverCounts(balls, pos.over_no);
+      const overCountsBefore = getOverCounts(currentBalls, pos.over_no);
       const overAlreadyHadIllegal = !!overCountsBefore?.hasIllegal;
 
       let extra_runs_calc = 0;
@@ -974,27 +1532,29 @@ const battingScorecardRows = useMemo(() => {
         legal_ball = true;
       }
 
-      if (legal_ball && legalBalls + 1 > maxLegal) {
+      if (legal_ball && currentLegalBalls + 1 > maxLegal) {
         setErr(`Cannot add: overs limit reached (${oversLimit} overs).`);
-        return { overFinishedAfter: false };
+        return { overFinishedAfter: false, saved: false };
       }
 
       if (legal_ball) {
-        const legalBowled = countLegalBallsBowledBy(balls, bowlerId);
+        const legalBowled = countLegalBallsBowledBy(currentBalls, currentBowlerId);
         if (legalBowled + 1 > 24) {
           setErr("That bowler would exceed 4 overs (24 legal balls). Choose another bowler.");
-          return { overFinishedAfter: false };
+          return { overFinishedAfter: false, saved: false };
         }
       }
 
       // batting_turn tracks the STRIKER's current batting stint in this innings (1 = first time batting, 2 = second, etc.)
       // IMPORTANT: even if the NON-STRIKER is dismissed (run out), batting_turn still belongs to the striker's stint.
-      const prevDismissals = (strikerId && dismissalsByBatter.get(strikerId)) || 0;
+      const prevDismissals = currentStrikerId
+        ? currentBalls.filter((ball) => ball.wicket && ball.dismissed_player_id === currentStrikerId).length
+        : 0;
       const batting_turn = prevDismissals + 1;
 
       const payload = {
   match_id: matchId,
-  innings_id: innings.id,
+  innings_id: currentInnings.id,
   over_no: pos.over_no,
   delivery_in_over: pos.delivery_in_over,
   legal_ball,
@@ -1005,28 +1565,40 @@ const battingScorecardRows = useMemo(() => {
   dismissal_kind: wicket ? dismissal_kind : null,
 
   // ✅ CRITICAL FIX: store the ACTUAL dismissed player (can be striker OR non-striker)
-  dismissed_player_id: wicket ? (dismissed_player_id || strikerId) : null,
+  dismissed_player_id: wicket ? (dismissed_player_id || currentStrikerId) : null,
 
-  striker_id: strikerId,
-  non_striker_id: nonStrikerId,
-  bowler_id: bowlerId,
+  striker_id: currentStrikerId,
+  non_striker_id: currentNonStrikerId,
+  bowler_id: currentBowlerId,
   batting_turn,
 };
 
-      const { data, error } = await supabase.from("balls").insert(payload).select("*").single();
+      const event = {
+        created_at: new Date().toISOString(),
+        event_id: createEventId("ball"),
+        event_type: "add_ball",
+        innings_id: currentInnings.id,
+        match_id: matchId,
+        payload: {
+          ball: payload,
+        },
+      };
 
-      if (error) {
-        setErr(`Insert error: ${error.message}`);
-        return { overFinishedAfter: false };
-      }
+      await applySessionEvent(event, {
+        failurePrefix: "Ball save",
+        successInfo: "Saved ✅",
+      });
 
-      const nextBalls = sortBallsByPosition([...balls, data]);
-      setBalls(nextBalls);
+      const nextBalls = applyEventOptimistically({
+        balls: currentBalls,
+        innings: currentInnings,
+        event,
+      }).balls;
 
       const total_runs_on_ball = (payload.runs_off_bat || 0) + (payload.extra_runs || 0);
 
-      let s = strikerId;
-      let ns = nonStrikerId;
+      let s = currentStrikerId;
+      let ns = currentNonStrikerId;
 
       if (!payload.wicket && total_runs_on_ball % 2 === 1) {
         [s, ns] = [ns, s];
@@ -1035,7 +1607,7 @@ const battingScorecardRows = useMemo(() => {
       const overCountsAfter = getOverCounts(nextBalls, payload.over_no);
       const overFinishedAfter = isOverFinished(overCountsAfter);
 
-      if (!payload.wicket && overFinishedAfter && !inningsComplete) {
+      if (!payload.wicket && overFinishedAfter && !currentInningsComplete) {
         [s, ns] = [ns, s];
         setNeedsNextBowler(true);
         setBowlerId("");
@@ -1047,8 +1619,11 @@ const battingScorecardRows = useMemo(() => {
 
       if (!overFinishedAfter) setInfo("Saved ✅");
 
-      return { overFinishedAfter };
+      return { overFinishedAfter, saved: true };
+    } catch {
+      return { overFinishedAfter: false, saved: false };
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -1062,10 +1637,11 @@ const battingScorecardRows = useMemo(() => {
   const addLegBye = (n) => insertBall({ runs_off_bat: 0, extra_type: "legbye", extra_runs: n, wicket: false });
 
   const addWicket = async () => {
+    const currentNextPos = computeNextPosition(ballsRef.current);
     const simulated = {
-      deliveries: nextPos.counts.deliveries + 1,
-      legal: nextPos.counts.legal + 1,
-      hasIllegal: nextPos.counts.hasIllegal,
+      deliveries: currentNextPos.counts.deliveries + 1,
+      legal: currentNextPos.counts.legal + 1,
+      hasIllegal: currentNextPos.counts.hasIllegal,
     };
     const wouldFinish = isOverFinished(simulated);
 
@@ -1101,13 +1677,15 @@ const battingScorecardRows = useMemo(() => {
       return;
     }
 
-    const { overFinishedAfter } = await insertBall({
+    const { overFinishedAfter, saved } = await insertBall({
       runs_off_bat: 0,
       extra_type: null,
       wicket: true,
       dismissal_kind: dismissalKind,
       dismissed_player_id: dismissedPlayerId,
     });
+
+    if (!saved) return;
 
     setNeedsWicketModal(false);
 
@@ -1160,19 +1738,32 @@ const battingScorecardRows = useMemo(() => {
     if (!innings?.id) return;
     setErr("");
     setInfo("");
+    savingRef.current = true;
     setSaving(true);
     try {
-      const res = await supabase.from("innings").update({ completed: true }).eq("id", innings.id).select("*").single();
-      if (res.error) {
-        setErr(res.error.message);
-        return;
-      }
-      setInnings(res.data);
+      await applySessionEvent(
+        {
+          created_at: new Date().toISOString(),
+          event_id: createEventId("end-innings"),
+          event_type: "end_innings",
+          innings_id: innings.id,
+          match_id: matchId,
+          payload: {},
+        },
+        {
+          failurePrefix: "End innings",
+          successInfo: "Innings ended ✅",
+          optimisticQueuedInfo: "Offline: innings end queued locally.",
+        }
+      );
       setInfo("Innings ended ✅");
       if (inningsNo === 1) {
         setInningsNo(2);
       }
+    } catch {
+      return;
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -1181,61 +1772,32 @@ const battingScorecardRows = useMemo(() => {
     if (!innings?.id) return;
     setErr("");
     setInfo("");
+    savingRef.current = true;
     setSaving(true);
     try {
-      const res = await supabase.from("innings").update({ completed: false }).eq("id", innings.id).select("*").single();
-      if (res.error) {
-        setErr(res.error.message);
-        return;
-      }
-      setInnings(res.data);
+      await applySessionEvent(
+        {
+          created_at: new Date().toISOString(),
+          event_id: createEventId("reopen-innings"),
+          event_type: "reopen_innings",
+          innings_id: innings.id,
+          match_id: matchId,
+          payload: {},
+        },
+        {
+          failurePrefix: "Reopen innings",
+          successInfo: "Innings reopened ✅",
+          optimisticQueuedInfo: "Offline: innings reopen queued locally.",
+        }
+      );
       setInfo("Innings reopened ✅");
+    } catch {
+      return;
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
-
-  // mark match completed once decided in innings 2
-  useEffect(() => {
-    if (!match?.id) return;
-    if (inningsNo !== 2) return;
-    const i1Runs = toInt(innings1Runs, 0);
-    const i2Runs = toInt(innings2RunsForResult, 0);
-    const i2Wkts = toInt(innings2WktsForResult, 0);
-    const i2Legal = toInt(innings2LegalForResult, 0);
-    const maxLegal = toInt(match?.overs_limit, 20) * 6;
-
-    const innings2Exhausted =
-      !!innings2RowForResult?.completed || i2Legal >= maxLegal || i2Wkts >= wicketCap;
-    const decided = innings2Exhausted;
-    if (!decided) return;
-
-    (async () => {
-      const upd = await supabase
-        .from("matches")
-        .update({ status: "completed" })
-        .eq("id", match.id)
-        .select(
-          `
-          *,
-          team_a:teams!matches_team_a_id_fkey(id,name,short_name),
-          team_b:teams!matches_team_b_id_fkey(id,name,short_name)
-          `
-        )
-        .maybeSingle();
-      if (!upd.error && upd.data) setMatch(upd.data);
-    })();
-  }, [
-    match?.id,
-    match?.overs_limit,
-    inningsNo,
-    wicketCap,
-    innings1Runs,
-    innings2RowForResult?.completed,
-    innings2RunsForResult,
-    innings2WktsForResult,
-    innings2LegalForResult,
-  ]);
 
   // Auto mark innings completed if overs done or all out
   useEffect(() => {
@@ -1244,10 +1806,23 @@ const battingScorecardRows = useMemo(() => {
     if (!oversDone && !allOut) return;
 
     (async () => {
-      await supabase.from("innings").update({ completed: true }).eq("id", innings.id);
-      setInnings((prev) => (prev ? { ...prev, completed: true } : prev));
+      await applySessionEvent(
+        {
+          created_at: new Date().toISOString(),
+          event_id: `auto-end-${innings.id}`,
+          event_type: "end_innings",
+          innings_id: innings.id,
+          match_id: matchId,
+          payload: {},
+        },
+        {
+          failurePrefix: "Auto-complete innings",
+          successInfo: "",
+          optimisticQueuedInfo: "",
+        }
+      ).catch(() => {});
     })();
-  }, [innings?.id, innings?.completed, oversDone, allOut, inningsNo, target, totalRuns]);
+  }, [allOut, innings?.completed, innings?.id, matchId, oversDone]);
 
   // Scorer-only: reset the match so you can test scoring again
   const resetMatchData = async () => {
@@ -1267,40 +1842,53 @@ You can then start scoring again from ball 1.`
     setErr("");
     setInfo("");
 
-    // 1) delete balls
-    const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
-    if (delBalls.error) {
-      setErr(`Reset failed (balls): ${delBalls.error.message}`);
+    const legacyResetMatchData = async () => {
+      const delBalls = await supabase.from("balls").delete().eq("match_id", match.id);
+      if (delBalls.error) {
+        throw new Error(`Reset failed (balls): ${delBalls.error.message}`);
+      }
+
+      const delInn = await supabase.from("innings").delete().eq("match_id", match.id);
+      if (delInn.error) {
+        throw new Error(`Reset failed (innings): ${delInn.error.message}`);
+      }
+
+      const fid = canonicalFixtureId || fixtureId;
+      if (fid) {
+        const delSq = await supabase.from("match_squads").delete().eq("fixture_id", fid);
+        if (delSq.error) console.warn("Reset: match_squads delete blocked", delSq.error.message);
+      }
+
+      const upd = await supabase.from("matches").update({ status: "scheduled", wicket_cap: null }).eq("id", match.id);
+      if (upd.error) {
+        throw new Error(`Reset failed (match): ${upd.error.message}`);
+      }
+    };
+
+    try {
+      const { error } = await supabase.rpc("reset_match_state", {
+        p_match_id: match.id,
+        p_client_session_id: clientSessionId,
+        p_clear_squads: true,
+      });
+
+      if (error) {
+        if (isMissingRpcError(error)) {
+          await legacyResetMatchData();
+        } else {
+          throw new Error(`Reset failed: ${error.message}`);
+        }
+      }
+
+      clearLocalMatchState(match.id);
+      window.location.reload();
+    } catch (error) {
+      setErr(String(error?.message || error || "Reset failed."));
       setSaving(false);
       return;
     }
 
-    // 2) delete innings
-    const delInn = await supabase.from("innings").delete().eq("match_id", match.id);
-    if (delInn.error) {
-      setErr(`Reset failed (innings): ${delInn.error.message}`);
-      setSaving(false);
-      return;
-    }
-
-    // 3) clear selected squads (optional but makes testing clean)
-    const fid = canonicalFixtureId || fixtureId;
-    if (fid) {
-      const delSq = await supabase.from("match_squads").delete().eq("fixture_id", fid);
-      // Don't hard-fail if RLS blocks this table in your setup
-      if (delSq.error) console.warn("Reset: match_squads delete blocked", delSq.error.message);
-    }
-
-    // 4) reset match status
-    const upd = await supabase.from("matches").update({ status: "scheduled", wicket_cap: null }).eq("id", match.id);
-    if (upd.error) {
-      setErr(`Reset failed (match): ${upd.error.message}`);
-      setSaving(false);
-      return;
-    }
-
-    // Reload to re-run the normal match startup flow
-    window.location.reload();
+    setSaving(false);
   };
 
   // Bowling overview
@@ -1318,7 +1906,7 @@ You can then start scoring again from ball 1.`
       if (!s) return;
 
       if (b.legal_ball) s.legalBalls += 1;
-      s.runs += (b.runs_off_bat || 0) + (b.extra_runs || 0);
+        s.runs += runsConcededByBowler(b);
       if (b.wicket) s.wickets += 1;
 
       const overNo = toInt(b.over_no, 0);
@@ -1326,7 +1914,7 @@ You can then start scoring again from ball 1.`
       const o = s.perOver.get(overNo);
       o.deliveries += 1;
       if (b.legal_ball) o.legal += 1;
-      o.runs += (b.runs_off_bat || 0) + (b.extra_runs || 0);
+        o.runs += runsConcededByBowler(b);
     });
 
     const rows = [];
@@ -1488,6 +2076,39 @@ You can then start scoring again from ball 1.`
             }}
           >
             {info}
+          </div>
+        )}
+
+        {(!isOnline || pendingEvents.length || isFlushingQueue || scoringLocked) && (
+          <div
+            style={{
+              marginTop: 10,
+              padding: 10,
+              borderRadius: 12,
+              background: "rgba(255, 204, 102, 0.10)",
+              border: "1px solid rgba(255,204,102,0.25)",
+              color: "#ffe4b0",
+              display: "flex",
+              gap: 10,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontWeight: 900 }}>
+              {!isOnline ? "Offline" : scoringLocked ? "Scoring locked" : isFlushingQueue ? "Syncing" : "Pending sync"}
+            </div>
+            {!isOnline ? <div>{pendingEvents.length} queued event{pendingEvents.length === 1 ? "" : "s"} will replay when online.</div> : null}
+            {isOnline && pendingEvents.length ? <div>{pendingEvents.length} queued event{pendingEvents.length === 1 ? "" : "s"} waiting to sync.</div> : null}
+            {scoringLocked && activeScorerSession ? (
+              <div>
+                Active session: {activeScorerSession.device_label || activeScorerSession.client_session_id || "another browser"}
+              </div>
+            ) : null}
+            {scoringLocked ? (
+              <button onClick={takeScorerControl} disabled={takingControl || !isOnline} style={modalBtnGhost}>
+                {takingControl ? "Taking control..." : "Take control"}
+              </button>
+            ) : null}
           </div>
         )}
 
@@ -2159,40 +2780,51 @@ You can then start scoring again from ball 1.`
 
                     if (!innings) return;
 
-                    const nextBatRuns =
+                    let nextBatRuns =
                       editExtraType === "wide" || editExtraType === "bye" || editExtraType === "legbye"
                         ? 0
                         : toInt(editBatRuns, 0);
 
-                    const nextExtraRuns = Math.max(0, toInt(editExtraRuns, 0));
-
-                    const up = await supabase
-                      .from("balls")
-                      .update({
-                        runs_off_bat: nextBatRuns,
-                        extra_type: editExtraType || null,
-                        extra_runs: nextExtraRuns,
-                        wicket: !!editIsWicket,
-                        dismissal_kind: editIsWicket ? editDismissalKind : null,
-                        dismissed_player_id: editIsWicket ? (editDismissedPlayerId || null) : null,
-                      })
-                      .eq("id", editBall.id)
-                      .select("*")
-                      .single();
-
-                    if (up.error) {
-                      setErr(`Update failed: ${up.error.message}`);
-                      return;
+                    let nextExtraRuns = Math.max(0, toInt(editExtraRuns, 0));
+                    if (editExtraType === "wide") {
+                      nextBatRuns = 0;
+                      nextExtraRuns = Math.max(2, nextExtraRuns);
+                    } else if (editExtraType === "noball") {
+                      nextExtraRuns = Math.max(1, nextExtraRuns);
+                    } else if (!editExtraType) {
+                      nextExtraRuns = 0;
                     }
 
-                    const bRes = await supabase.from("balls").select("*").eq("match_id", matchId).eq("innings_id", innings.id);
+                    await applySessionEvent(
+                      {
+                        created_at: new Date().toISOString(),
+                        event_id: createEventId("edit-ball"),
+                        event_type: "edit_ball",
+                        innings_id: innings.id,
+                        match_id: matchId,
+                        payload: {
+                          ball_id: editBall.id || null,
+                          target_source_event_id: editBall.source_event_id || editBall.local_temp_id || null,
+                          patch: {
+                            runs_off_bat: nextBatRuns,
+                            extra_type: editExtraType || null,
+                            extra_runs: nextExtraRuns,
+                            wicket: !!editIsWicket,
+                            dismissal_kind: editIsWicket ? editDismissalKind : null,
+                            dismissed_player_id: editIsWicket ? (editDismissedPlayerId || null) : null,
+                          },
+                        },
+                      },
+                      {
+                        failurePrefix: "Edit delivery",
+                        successInfo: "Updated ✅",
+                        optimisticQueuedInfo: "Offline: delivery edit queued locally.",
+                      }
+                    );
 
-                    if (bRes.error) {
-                      setErr(`Reload failed: ${bRes.error.message}`);
-                      return;
-                    }
 
-                    setBalls(sortBallsByPosition(bRes.data || []));
+
+
                     setInfo("Updated ✅");
                     setEditOpen(false);
                   } finally {

@@ -33,6 +33,12 @@ export function writePendingEvents(matchId, queue) {
   storage.setItem(key, JSON.stringify(queue));
 }
 
+export function clearPendingEvents(matchId) {
+  const storage = safeStorage("local");
+  if (!storage) return;
+  storage.removeItem(getPendingEventsKey(matchId));
+}
+
 export function readLegacyPendingBallQueues(matchId) {
   const storage = safeStorage("local");
   if (!storage || !matchId) return [];
@@ -107,6 +113,12 @@ export function writeScorerState(matchId, inningsId, state) {
   storage.setItem(key, JSON.stringify(state));
 }
 
+export function clearScorerState(matchId, inningsId) {
+  const storage = safeStorage("local");
+  if (!storage || !matchId || !inningsId) return;
+  storage.removeItem(getScorerStateKey(matchId, inningsId));
+}
+
 export function readScoringSnapshot(scope) {
   const storage = safeStorage("local");
   if (!storage) return null;
@@ -125,6 +137,12 @@ export function writeScoringSnapshot(scope, snapshot) {
   }
 
   storage.setItem(key, JSON.stringify(snapshot));
+}
+
+export function clearScoringSnapshot(scope) {
+  const storage = safeStorage("local");
+  if (!storage || !scope) return;
+  storage.removeItem(getScoringSnapshotKey(scope));
 }
 
 export function getOrCreateScorerSessionId(scope) {

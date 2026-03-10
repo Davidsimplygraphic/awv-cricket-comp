@@ -9,8 +9,10 @@ import ScorecardTables from "../components/ScorecardTables";
 import {
   buildCompletedResultText,
   buildInningsTotals,
+  didBatterFaceBall,
   deriveMatchDisplayStatus,
   oversTextFromLegal,
+  runsConcededByBowler,
   sortBallsByPosition,
   toInt,
 } from "../lib/scoring";
@@ -39,7 +41,7 @@ function batterStats(balls, batterId, turn = 1) {
   // Balls faced: legal deliveries faced by this batsman; wides do not count as faced balls.
   // (Older rows may not have is_wide; extra_type === 'wide' is also supported.)
   const ballsFaced = facedAsStriker.filter(
-    (b) => b.legal_ball !== false && !b.is_wide && b.extra_type !== "wide"
+    (b) => didBatterFaceBall(b)
   ).length;
 
   const runs = facedAsStriker.reduce((acc, b) => acc + toInt(b.runs_off_bat, 0), 0);
@@ -56,7 +58,7 @@ function bowlerStats(balls, bowlerId) {
   const legal = by.filter((b) => b.legal_ball !== false).length;
 
   // runs conceded includes extras; keep it simple: extra_runs + runs_off_bat
-  const runs = by.reduce((acc, b) => acc + toInt(b.runs_off_bat, 0) + toInt(b.extra_runs, 0), 0);
+  const runs = by.reduce((acc, b) => acc + runsConcededByBowler(b), 0);
   const wkts = by.filter((b) => !!b.wicket).length;
 
   const overs = oversTextFromLegal(legal);
@@ -318,6 +320,7 @@ export default function SpectatorView() {
       innings2Team: inn2Row?.batting_team_id ? teamById.get(inn2Row.batting_team_id) : teamB,
       innings1: innings1Totals,
       innings2: innings2Totals,
+      wicketCap: match?.wicket_cap,
     });
   }, [derivedStatus, teamA, teamB, inn1Row, inn2Row, innings1Totals, innings2Totals]);
 

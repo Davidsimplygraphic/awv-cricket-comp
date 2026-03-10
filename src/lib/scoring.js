@@ -20,6 +20,37 @@ export function sumRuns(balls) {
   }, 0);
 }
 
+export function runsConcededByBowler(ball) {
+  if (isAdministrativeBall(ball)) return 0;
+
+  const batRuns = toInt(ball?.runs_off_bat, 0);
+  const extraRuns = toInt(ball?.extra_runs, 0);
+
+  if (ball?.extra_type === "bye" || ball?.extra_type === "legbye") {
+    return batRuns;
+  }
+
+  return batRuns + extraRuns;
+}
+
+export function didBatterFaceBall(ball) {
+  if (isAdministrativeBall(ball)) return false;
+  return ball?.extra_type !== "wide" && ball?.is_wide !== true;
+}
+
+export function deriveLegalBallForExtraType(extraType, priorOverBalls = []) {
+  const normalizedExtraType = extraType || null;
+  const overAlreadyHadIllegal = (priorOverBalls || []).some(
+    (ball) => !isAdministrativeBall(ball) && ball?.legal_ball === false
+  );
+
+  if (normalizedExtraType === "wide" || normalizedExtraType === "noball") {
+    return overAlreadyHadIllegal;
+  }
+
+  return true;
+}
+
 export function sumWkts(balls) {
   return (balls || []).reduce((total, ball) => {
     if (!ball?.wicket) return total;
@@ -126,7 +157,9 @@ export function mergeBallIntoList(previousBalls, nextBall) {
 
 export function updateBallInList(previousBalls, target, patch) {
   return sortBallsByPosition(
-    (previousBalls || []).map((ball) => (matchesBallTarget(ball, target) ? applyBallPatch(ball, patch) : ball))
+    (previousBalls || []).map((ball) => (
+      matchesBallTarget(ball, target) ? applyBallPatch(ball, patch, previousBalls || []) : ball
+    ))
   );
 }
 
@@ -138,7 +171,7 @@ export function matchesBallTarget(ball, target) {
   return false;
 }
 
-export function applyBallPatch(ball, patch) {
+export function applyBallPatch(ball, patch, allBalls = []) {
   if (!ball) return ball;
 
   const next = { ...ball };
@@ -152,14 +185,34 @@ export function applyBallPatch(ball, patch) {
     next.dismissed_player_id = patch.dismissed_player_id || null;
   }
 
-  if (next.extra_type === "wide" || next.extra_type === "bye" || next.extra_type === "legbye") {
+  if (next.extra_type === "wide") {
     next.runs_off_bat = 0;
+    next.extra_runs = Math.max(2, toInt(next.extra_runs, 2));
+  } else if (next.extra_type === "noball") {
+    next.extra_runs = Math.max(1, toInt(next.extra_runs, 1));
+  } else if (next.extra_type === "bye" || next.extra_type === "legbye") {
+    next.runs_off_bat = 0;
+    next.extra_runs = Math.max(0, toInt(next.extra_runs, 0));
+  } else {
+    next.extra_runs = 0;
   }
 
   if (!next.wicket) {
     next.dismissal_kind = null;
     next.dismissed_player_id = null;
   }
+
+  const target = {
+    id: ball.id || null,
+    source_event_id: ball.source_event_id || null,
+    local_temp_id: ball.local_temp_id || null,
+  };
+  const priorOverBalls = (allBalls || []).filter((candidate) => {
+    if (!candidate || matchesBallTarget(candidate, target)) return false;
+    if (toInt(candidate?.over_no, 0) !== toInt(ball?.over_no, 0)) return false;
+    return toInt(candidate?.delivery_in_over, 0) < toInt(ball?.delivery_in_over, 0);
+  });
+  next.legal_ball = deriveLegalBallForExtraType(next.extra_type, priorOverBalls);
 
   return next;
 }
@@ -210,7 +263,7 @@ export function deriveMatchDisplayStatus({
   return raw || "scheduled";
 }
 
-export function buildCompletedResultText({ matchStatus, innings1Team, innings2Team, innings1, innings2 }) {
+export function buildCompletedResultText({ matchStatus, innings1Team, innings2Team, innings1, innings2, wicketCap }) {
   const status = String(matchStatus || "").toLowerCase();
   if (status !== "completed") return "";
   if (!innings1 || !innings2) return "";
@@ -221,8 +274,13 @@ export function buildCompletedResultText({ matchStatus, innings1Team, innings2Te
 
   if (innings1.runs === innings2.runs) return "Match tied";
 
-  const winner = innings2.runs > innings1.runs ? innings2Team : innings1Team;
+  if (innings2.runs > innings1.runs) {
+    const wicketsRemaining = Math.max(0, Math.max(1, toInt(wicketCap, 10)) - toInt(innings2.wkts, 0));
+    const name = innings2Team?.name || innings2Team?.short_name || "Winning team";
+    return `${name} won by ${wicketsRemaining} wicket${wicketsRemaining === 1 ? "" : "s"}`;
+  }
+
   const margin = Math.abs(innings2.runs - innings1.runs);
-  const name = winner?.name || winner?.short_name || "Winning team";
+  const name = innings1Team?.name || innings1Team?.short_name || "Winning team";
   return `${name} won by ${margin} run${margin === 1 ? "" : "s"}`;
 }

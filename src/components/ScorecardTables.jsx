@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { didBatterFaceBall, runsConcededByBowler } from "../lib/scoring";
 
 function toInt(n, fallback = 0) {
   const x = Number(n);
@@ -32,7 +33,7 @@ function buildBattingStats(balls, playerId, turn = 1) {
   for (const x of balls || []) {
     if (x.striker_id === playerId && toInt(x.batting_turn, 1) === toInt(turn, 1)) {
       r += toInt(x.runs_off_bat, 0);
-      if (x?.legal_ball !== false) b += 1;
+      if (didBatterFaceBall(x)) b += 1;
       if (toInt(x.runs_off_bat, 0) === 4) fours += 1;
       if (toInt(x.runs_off_bat, 0) === 6) sixes += 1;
     }
@@ -54,7 +55,7 @@ function buildBowlingStats(balls, playerId) {
 
   for (const x of balls || []) {
     if (x.bowler_id !== playerId) continue;
-    runs += toInt(x.runs_off_bat, 0) + toInt(x.extra_runs, 0);
+    runs += runsConcededByBowler(x);
     if (x.wicket) wkts += 1;
     if (x?.legal_ball !== false) legal += 1;
   }

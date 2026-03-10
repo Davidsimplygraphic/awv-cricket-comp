@@ -189,6 +189,7 @@ export default function Fixtures() {
         innings2Team: inn2Team,
         innings1: inn1,
         innings2: inn2,
+        wicketCap: m.wicket_cap,
       });
 
       out.push({

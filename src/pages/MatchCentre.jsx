@@ -242,6 +242,7 @@ export default function MatchCentre() {
       innings2Team: inn2Team,
       innings1: inn1,
       innings2: inn2,
+      wicketCap: match?.wicket_cap,
     });
   }, [derivedStatus, inn1Team, inn2Team, inn1, inn2]);
 

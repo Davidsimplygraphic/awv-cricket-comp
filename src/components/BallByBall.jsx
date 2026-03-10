@@ -12,7 +12,7 @@ export default function BallByBall({ balls }) {
   const lastFive = (() => {
     if (!sorted.length) return [];
     const maxOver = sorted[sorted.length - 1].over_no;
-    const minOver = Math.max(1, maxOver - 4);
+    const minOver = Math.max(0, maxOver - 4);
     return sorted.filter((b) => b.over_no >= minOver);
   })();
 
