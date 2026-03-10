@@ -301,6 +301,67 @@ export default function ScoreView() {
     return "assigned_elsewhere";
   }, [currentUserId, match?.scorer_user_id]);
   const canClaimScorerRole = scorerAssignmentState === "unassigned" || scorerAssignmentState === "assigned_elsewhere";
+  const scorerStatusBanner = useMemo(() => {
+    if (!match) return null;
+
+    let title = "Assigned to you";
+    let tone = {
+      background: "rgba(0, 200, 120, 0.10)",
+      border: "1px solid rgba(0,200,120,0.25)",
+      color: "#d8ffee",
+    };
+    let message = "You are the assigned scorer for this match.";
+
+    if (scorerAssignmentState === "unauthenticated") {
+      title = "Sign in required";
+      tone = {
+        background: "rgba(255, 204, 102, 0.10)",
+        border: "1px solid rgba(255,204,102,0.25)",
+        color: "#ffe4b0",
+      };
+      message = "You must be signed in before you can claim scorer ownership or start scoring.";
+    } else if (scorerAssignmentState === "unassigned") {
+      title = "Unassigned";
+      tone = {
+        background: "rgba(96, 165, 250, 0.10)",
+        border: "1px solid rgba(96,165,250,0.28)",
+        color: "#dbeafe",
+      };
+      message = "No scorer is assigned yet. Assign yourself before scoring this match.";
+    } else if (scorerAssignmentState === "assigned_elsewhere") {
+      title = "Assigned to another scorer";
+      tone = {
+        background: "rgba(96, 165, 250, 0.10)",
+        border: "1px solid rgba(96,165,250,0.28)",
+        color: "#dbeafe",
+      };
+      message = "This match is assigned to another scorer account. Take over explicitly if you need to score it from this account.";
+    }
+
+    if (scorerAssignmentState === "mine" && scoringLocked) {
+      title = "Lock held elsewhere";
+      tone = {
+        background: "rgba(255, 204, 102, 0.10)",
+        border: "1px solid rgba(255,204,102,0.25)",
+        color: "#ffe4b0",
+      };
+      message = activeScorerSession
+        ? `Another active scorer session currently holds the lock: ${activeScorerSession.device_label || activeScorerSession.client_session_id || "another browser"}.`
+        : "Another active scorer session currently holds the match lock.";
+    }
+
+    const badges = [];
+    badges.push(!isOnline ? "Offline" : scoringLocked ? "Locked elsewhere" : "Ready");
+    if (isOnline && pendingEvents.length) badges.push(`${pendingEvents.length} pending sync`);
+    if (isFlushingQueue) badges.push("Syncing");
+
+    return {
+      title,
+      message,
+      tone,
+      badges,
+    };
+  }, [activeScorerSession, isFlushingQueue, isOnline, match, pendingEvents.length, scorerAssignmentState, scoringLocked]);
 
   const allOut = useMemo(() => wickets >= wicketCap, [wickets, wicketCap]);
   const oversDone = useMemo(() => legalBalls >= maxLegal, [legalBalls, maxLegal]);
@@ -2514,34 +2575,51 @@ You can then start scoring again from ball 1.`
           </div>
         )}
 
-        {match && scorerAssignmentState !== "mine" ? (
+        {scorerStatusBanner ? (
           <div
             style={{
               marginTop: 10,
               padding: 12,
               borderRadius: 12,
-              background: "rgba(96, 165, 250, 0.10)",
-              border: "1px solid rgba(96,165,250,0.28)",
-              color: "#dbeafe",
+              background: scorerStatusBanner.tone.background,
+              border: scorerStatusBanner.tone.border,
+              color: scorerStatusBanner.tone.color,
               display: "flex",
               gap: 12,
-              alignItems: "center",
+              alignItems: "flex-start",
               flexWrap: "wrap",
             }}
           >
-            <div style={{ fontWeight: 900 }}>
-              {scorerAssignmentState === "unauthenticated"
-                ? "Sign in required"
-                : scorerAssignmentState === "unassigned"
-                  ? "No scorer assigned"
-                  : "Assigned to another scorer"}
+            <div style={{ minWidth: 160 }}>
+              <div style={{ fontWeight: 900 }}>{scorerStatusBanner.title}</div>
+              <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {scorerStatusBanner.badges.map((badge) => (
+                  <span
+                    key={badge}
+                    style={{
+                      padding: "3px 8px",
+                      borderRadius: 999,
+                      fontSize: 11,
+                      fontWeight: 800,
+                      background: "rgba(255,255,255,0.08)",
+                      border: "1px solid rgba(255,255,255,0.12)",
+                      color: "inherit",
+                    }}
+                  >
+                    {badge}
+                  </span>
+                ))}
+              </div>
             </div>
-            <div style={{ flex: "1 1 280px", color: "rgba(219,234,254,0.82)" }}>
-              {scorerAssignmentState === "unauthenticated"
-                ? "You must be signed in to score this match."
-                : scorerAssignmentState === "unassigned"
-                  ? "Assign yourself as the scorer for this fixture before scoring."
-                  : "Take over scorer ownership explicitly if you need to score this match from this account."}
+            <div style={{ flex: "1 1 320px", color: "rgba(255,255,255,0.82)" }}>
+              {scorerStatusBanner.message}
+              {!isOnline ? (
+                <div style={{ marginTop: 6, fontSize: 12, color: "rgba(255,255,255,0.68)" }}>
+                  {pendingEvents.length
+                    ? `${pendingEvents.length} queued event${pendingEvents.length === 1 ? "" : "s"} will replay when the connection returns.`
+                    : "You can view the scorer, but new online actions will wait for connectivity."}
+                </div>
+              ) : null}
             </div>
             {scorerAssignmentState === "unassigned" ? (
               <button onClick={assignSelfAsScorer} disabled={claimingScorerRole || !isOnline} style={modalBtnGhost}>
@@ -2553,41 +2631,13 @@ You can then start scoring again from ball 1.`
                 {claimingScorerRole ? "Taking over..." : "Take over scoring"}
               </button>
             ) : null}
-          </div>
-        ) : null}
-
-        {(!isOnline || pendingEvents.length || isFlushingQueue || scoringLocked) && (
-          <div
-            style={{
-              marginTop: 10,
-              padding: 10,
-              borderRadius: 12,
-              background: "rgba(255, 204, 102, 0.10)",
-              border: "1px solid rgba(255,204,102,0.25)",
-              color: "#ffe4b0",
-              display: "flex",
-              gap: 10,
-              alignItems: "center",
-              flexWrap: "wrap",
-            }}
-          >
-            <div style={{ fontWeight: 900 }}>
-              {!isOnline ? "Offline" : scoringLocked ? "Scoring locked" : isFlushingQueue ? "Syncing" : "Pending sync"}
-            </div>
-            {!isOnline ? <div>{pendingEvents.length} queued event{pendingEvents.length === 1 ? "" : "s"} will replay when online.</div> : null}
-            {isOnline && pendingEvents.length ? <div>{pendingEvents.length} queued event{pendingEvents.length === 1 ? "" : "s"} waiting to sync.</div> : null}
-            {scoringLocked && activeScorerSession ? (
-              <div>
-                Active session: {activeScorerSession.device_label || activeScorerSession.client_session_id || "another browser"}
-              </div>
-            ) : null}
-            {scoringLocked ? (
+            {scorerAssignmentState === "mine" && scoringLocked ? (
               <button onClick={takeScorerControl} disabled={takingControl || !isOnline} style={modalBtnGhost}>
                 {takingControl ? "Taking control..." : "Take control"}
               </button>
             ) : null}
           </div>
-        )}
+        ) : null}
 
         {/* Score header */}
         <div

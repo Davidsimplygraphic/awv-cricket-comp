@@ -55,6 +55,8 @@ test("ScoreView uses the hardened scorer-claim RPC instead of directly reassigni
   assert.match(scoreView, /rpc\("claim_match_scorer_ownership"/);
   assert.match(scoreView, /Assign myself/);
   assert.match(scoreView, /Take over scoring/);
+  assert.match(scoreView, /Assigned to you/);
+  assert.match(scoreView, /Lock held elsewhere/);
   assert.doesNotMatch(scoreView, /\.from\("matches"\)\.update\(\{\s*scorer_user_id:/);
 });
 
