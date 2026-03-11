@@ -56,15 +56,15 @@ function BallChip({ ball }) {
     <div
       title={`Over ${toInt(ball.over_no, 0) + 1}.${toInt(ball.delivery_in_over, 0)}${ball.extra_type ? ` - ${ball.extra_type}` : ""}`}
       style={{
-        minWidth: 34,
-        height: 34,
+        minWidth: 38,
+        height: 38,
         padding: "0 10px",
         borderRadius: 999,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         fontWeight: 900,
-        fontSize: 13,
+        fontSize: 14,
         background: tone.background,
         color: tone.color,
         border: tone.border,
@@ -117,7 +117,17 @@ export default function BallByBall({ balls, groupByOver = false }) {
     <div style={{ display: "grid", gap: 12 }}>
       {overs.length ? (
         overs.map((over) => (
-          <div key={`over-${over.overNo}`} style={{ display: "grid", gap: 8 }}>
+          <div
+            key={`over-${over.overNo}`}
+            style={{
+              display: "grid",
+              gap: 10,
+              padding: "10px 12px",
+              borderRadius: 14,
+              border: "1px solid rgba(255,255,255,0.08)",
+              background: "rgba(255,255,255,0.03)",
+            }}
+          >
             <div
               style={{
                 display: "flex",
@@ -125,7 +135,7 @@ export default function BallByBall({ balls, groupByOver = false }) {
                 alignItems: "center",
                 gap: 10,
                 flexWrap: "wrap",
-                fontSize: 12,
+                fontSize: 13,
                 fontWeight: 900,
                 color: "rgba(232,238,252,0.72)",
               }}

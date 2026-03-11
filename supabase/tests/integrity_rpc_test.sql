@@ -1,5 +1,5 @@
 BEGIN;
-SELECT plan(30);
+SELECT plan(35);
 
 SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000111', true);
 SELECT set_config('request.jwt.claim.role', 'authenticated', true);
@@ -146,6 +146,22 @@ VALUES
     '00000000-0000-0000-0000-000000000202',
     '00000000-0000-0000-0000-000000000201',
     false
+  ),
+  (
+    '00000000-0000-0000-0000-000000000513',
+    '00000000-0000-0000-0000-000000000407',
+    1,
+    '00000000-0000-0000-0000-000000000201',
+    '00000000-0000-0000-0000-000000000202',
+    true
+  ),
+  (
+    '00000000-0000-0000-0000-000000000514',
+    '00000000-0000-0000-0000-000000000407',
+    2,
+    '00000000-0000-0000-0000-000000000202',
+    '00000000-0000-0000-0000-000000000201',
+    false
   );
 
 SELECT is(
@@ -244,6 +260,129 @@ SELECT throws_ok(
   $$,
   'Only the assigned scorer can create or access innings for this match',
   'get_or_create_match_innings rejects non-owner access'
+);
+
+SELECT is(
+  public.apply_match_session_event(
+    'evt-chase-win-1',
+    '00000000-0000-0000-0000-000000000407',
+    '00000000-0000-0000-0000-000000000514',
+    'session-main',
+    'delivery_recorded',
+    jsonb_build_object(
+      'delivery',
+      jsonb_build_object(
+        'over_no', 0,
+        'delivery_in_over', 1,
+        'runs_off_bat', 1,
+        'extra_type', null,
+        'extra_runs', 0,
+        'wicket', false,
+        'striker_id', '00000000-0000-0000-0000-000000000301',
+        'non_striker_id', '00000000-0000-0000-0000-000000000302',
+        'bowler_id', '00000000-0000-0000-0000-000000000303',
+        'batting_turn', 1
+      ),
+      'post_state',
+      jsonb_build_object(
+        'striker_id', '00000000-0000-0000-0000-000000000302',
+        'non_striker_id', '00000000-0000-0000-0000-000000000301',
+        'striker_turn', 1,
+        'non_striker_turn', 1,
+        'bowler_id', '00000000-0000-0000-0000-000000000303',
+        'needs_next_bowler', false
+      )
+    )
+  ) -> 'innings' ->> 'completed',
+  'true',
+  'a normal chase completion still marks the innings completed'
+);
+
+SELECT throws_ok(
+  $$
+    SELECT public.apply_match_session_event(
+      'evt-after-chase-before-reopen',
+      '00000000-0000-0000-0000-000000000407',
+      '00000000-0000-0000-0000-000000000514',
+      'session-main',
+      'delivery_recorded',
+      jsonb_build_object(
+        'delivery',
+        jsonb_build_object(
+          'over_no', 0,
+          'delivery_in_over', 2,
+          'runs_off_bat', 1,
+          'extra_type', null,
+          'extra_runs', 0,
+          'wicket', false,
+          'striker_id', '00000000-0000-0000-0000-000000000302',
+          'non_striker_id', '00000000-0000-0000-0000-000000000301',
+          'bowler_id', '00000000-0000-0000-0000-000000000303',
+          'batting_turn', 1
+        )
+      )
+    );
+  $$,
+  'Cannot add a ball to a completed innings',
+  'a chase-completed innings remains blocked until it is explicitly reopened'
+);
+
+SELECT is(
+  public.apply_match_session_event(
+    'evt-reopen-chase-1',
+    '00000000-0000-0000-0000-000000000407',
+    '00000000-0000-0000-0000-000000000514',
+    'session-main',
+    'reopen_innings',
+    '{}'::jsonb
+  ) ->> 'event_type',
+  'reopen_innings',
+  'a completed chase innings can be reopened explicitly'
+);
+
+SELECT is(
+  public.get_innings_reopen_status(
+    '00000000-0000-0000-0000-000000000407',
+    '00000000-0000-0000-0000-000000000514'
+  ) ->> 'reopened_for_continuation',
+  'true',
+  'recovery can detect that a reopened chase should continue scoring'
+);
+
+SELECT is(
+  public.apply_match_session_event(
+    'evt-after-reopen-1',
+    '00000000-0000-0000-0000-000000000407',
+    '00000000-0000-0000-0000-000000000514',
+    'session-main',
+    'delivery_recorded',
+    jsonb_build_object(
+      'delivery',
+      jsonb_build_object(
+        'over_no', 0,
+        'delivery_in_over', 2,
+        'runs_off_bat', 2,
+        'extra_type', null,
+        'extra_runs', 0,
+        'wicket', false,
+        'striker_id', '00000000-0000-0000-0000-000000000302',
+        'non_striker_id', '00000000-0000-0000-0000-000000000301',
+        'bowler_id', '00000000-0000-0000-0000-000000000303',
+        'batting_turn', 1
+      ),
+      'post_state',
+      jsonb_build_object(
+        'striker_id', '00000000-0000-0000-0000-000000000302',
+        'non_striker_id', '00000000-0000-0000-0000-000000000301',
+        'striker_turn', 1,
+        'non_striker_turn', 1,
+        'bowler_id', '00000000-0000-0000-0000-000000000303',
+        'needs_next_bowler', false
+      )
+    )
+  ) -> 'innings' ->> 'completed',
+  'false',
+  'scoring can continue after reopening a chase-completed innings'
 );
 
 SELECT is(

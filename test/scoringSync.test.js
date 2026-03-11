@@ -3,6 +3,7 @@ import { test } from "./test-helpers.js";
 
 import {
   applyRpcResultToState,
+  canAutoFlushPendingQueue,
   deriveQueuedScorerState,
   enqueuePendingEvent,
   isAuthoritativeScoringRejection,
@@ -13,6 +14,68 @@ import {
   ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE,
   DELIVERY_RECORDED_EVENT_TYPE,
 } from "../src/lib/scoring.js";
+
+test("pending queues auto-flush only when reconnect and lock state are safe", () => {
+  assert.equal(
+    canAutoFlushPendingQueue({
+      matchId: "match-1",
+      isOnline: true,
+      pendingCount: 2,
+      lockFeatureAvailable: true,
+      scoringLocked: false,
+      isFlushing: false,
+    }),
+    true
+  );
+
+  assert.equal(
+    canAutoFlushPendingQueue({
+      matchId: "match-1",
+      isOnline: false,
+      pendingCount: 2,
+      lockFeatureAvailable: true,
+      scoringLocked: false,
+      isFlushing: false,
+    }),
+    false
+  );
+
+  assert.equal(
+    canAutoFlushPendingQueue({
+      matchId: "match-1",
+      isOnline: true,
+      pendingCount: 2,
+      lockFeatureAvailable: true,
+      scoringLocked: true,
+      isFlushing: false,
+    }),
+    false
+  );
+
+  assert.equal(
+    canAutoFlushPendingQueue({
+      matchId: "match-1",
+      isOnline: true,
+      pendingCount: 2,
+      lockFeatureAvailable: true,
+      scoringLocked: false,
+      isFlushing: true,
+    }),
+    false
+  );
+
+  assert.equal(
+    canAutoFlushPendingQueue({
+      matchId: "match-1",
+      isOnline: true,
+      pendingCount: 2,
+      lockFeatureAvailable: true,
+      scoringLocked: false,
+      isFlushing: false,
+    }),
+    true
+  );
+});
 
 test("pending events keep insertion order when timestamps collide", () => {
   const createdAt = "2026-03-10T12:00:00.000Z";

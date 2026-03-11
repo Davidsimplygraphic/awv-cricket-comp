@@ -10,6 +10,7 @@ const ballByBall = fs.readFileSync(new URL("../src/components/BallByBall.jsx", i
 const partnerships = fs.readFileSync(new URL("../src/components/Partnerships.jsx", import.meta.url), "utf8");
 const wormGraph = fs.readFileSync(new URL("../src/components/WormGraph.jsx", import.meta.url), "utf8");
 const leaderboards = fs.readFileSync(new URL("../src/pages/Leaderboards.jsx", import.meta.url), "utf8");
+const matchCentre = fs.readFileSync(new URL("../src/pages/MatchCentre.jsx", import.meta.url), "utf8");
 const spectator = fs.readFileSync(new URL("../src/views/SpectatorView.jsx", import.meta.url), "utf8");
 const integrationTypes = fs.readFileSync(new URL("../src/integrations/supabase/types.ts", import.meta.url), "utf8").trim();
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
@@ -76,21 +77,40 @@ test("latest-ball edits reconcile actor state through the shared edit-selection 
   assert.doesNotMatch(scoreView, /Delivery updated\. Re-select striker, non-striker, and bowler before scoring again\."\);/);
 });
 
+test("reopened innings suppress chase-complete gating through the shared scorer helper and reopen-status RPC", () => {
+  assert.match(scoreView, /isChaseCompleteForScoring/);
+  assert.match(scoreView, /rpc\("get_innings_reopen_status"/);
+});
+
+test("ScoreView auto-retries pending sync after transient reconnect failures through the shared queue guard", () => {
+  assert.match(scoreView, /canAutoFlushPendingQueue/);
+  assert.match(scoreView, /schedulePendingSyncRetry/);
+  assert.match(scoreView, /pendingSyncRetryTick/);
+});
+
 test("ScoreView relies on shared scoring helpers instead of redefining scorer math locally", () => {
   assert.match(scoreView, /from "\.\.\/lib\/scoring"/);
   assert.doesNotMatch(scoreView, /^function (toInt|isAdministrativeBall|isCompetitiveBall|sumRuns|sumWkts|legalBallsCount|oversTextFromLegal|getOverBalls|getOverCounts|isOverFinished|computeNextPosition|sortBallsByPosition|countLegalBallsBowledBy)\(/m);
 });
 
 test("display read-model components rely on the shared ball sorter", () => {
-  for (const source of [scorecardTables, ballByBall, partnerships]) {
+  for (const source of [scorecardTables, ballByBall]) {
     assert.match(source, /sortBallsByPosition/);
     assert.doesNotMatch(source, /^function sortBalls\(/m);
     assert.doesNotMatch(source, /\.sort\(\(a, b\) => .*over_no.*delivery_in_over/m);
   }
+
+  assert.match(partnerships, /selectPartnerships/);
+  assert.doesNotMatch(partnerships, /^function sortBalls\(/m);
+  assert.doesNotMatch(partnerships, /\.sort\(\(a, b\) => .*over_no.*delivery_in_over/m);
 });
 
-test("WormGraph relies on the shared worm-series selector", () => {
+test("WormGraph relies on shared selectors for run flow, wicket markers, and over guides", () => {
   assert.match(wormGraph, /selectWormSeries/);
+  assert.match(wormGraph, /selectWormWicketPoints/);
+  assert.match(wormGraph, /selectOverBoundaryTicks/);
+  assert.match(wormGraph, /data-worm-wicket=/);
+  assert.match(wormGraph, /data-worm-over-guide=/);
   assert.doesNotMatch(wormGraph, /^function buildCumulativeSeries\(/m);
 });
 
@@ -162,7 +182,64 @@ test("fixture and match-centre cards also prefer fixture-level wicket caps for d
 
 test("spectator stats use compact partnerships and worm graph modes", () => {
   assert.match(spectator, /<Partnerships balls={tabBalls} playersById={playersById} theme="dark" compact/);
-  assert.match(spectator, /<WormGraph[\s\S]*compact/);
+  assert.match(spectator, /<WormGraph[\s\S]*playersById={playersById}[\s\S]*compact/);
+});
+
+test("worm graph keeps compact mobile sizing while exposing marker and guide affordances", () => {
+  assert.match(wormGraph, /const W = compact \? 420 : 720;/);
+  assert.match(wormGraph, /const H = compact \? 196 : 220;/);
+  assert.match(wormGraph, /minWidth: compact \? 300 : 520/);
+  assert.match(wormGraph, /const wicketRadius = compact \? 4\.5 : 5\.5;/);
+  assert.match(wormGraph, /preserveAspectRatio="xMinYMin meet"/);
+  assert.match(wormGraph, /Wicket/);
+  assert.match(matchCentre, /<WormGraph[\s\S]*playersById={playersById}/);
+});
+
+test("mobile read models keep retired-hurt state in a display timeline sourced from session events", () => {
+  assert.match(scoreView, /from\("match_session_events"\)/);
+  assert.match(scoreView, /materializeAdministrativeStateBalls/);
+  assert.match(spectator, /from\("match_session_events"\)/);
+  assert.match(spectator, /materializeAdministrativeStateBalls/);
+  assert.match(matchCentre, /from\("match_session_events"\)/);
+  assert.match(matchCentre, /materializeAdministrativeStateBalls/);
+  assert.match(partnerships, /selectPartnerships/);
+  assert.match(partnerships, /endedByRetiredHurt/);
+});
+
+test("MatchCentre feeds scorecards, partnerships, summaries, and worm graphs from the materialized innings timeline", () => {
+  assert.match(matchCentre, /const inn1Balls = useMemo\(\(\) => materializeAdministrativeStateBalls/);
+  assert.match(matchCentre, /const inn2Balls = useMemo\(\(\) => materializeAdministrativeStateBalls/);
+  assert.match(matchCentre, /buildInningsTotals\(inn1Row, inn1Balls\)/);
+  assert.match(matchCentre, /buildInningsTotals\(inn2Row, inn2Balls\)/);
+  assert.match(matchCentre, /deriveMatchDisplayStatus\(\{[\s\S]*innings1Balls: inn1Balls,[\s\S]*innings2Balls: inn2Balls/);
+  assert.match(matchCentre, /buildAutomaticMatchSummary\(\{[\s\S]*innings1Balls: inn1Balls,[\s\S]*innings2Balls: inn2Balls/);
+  assert.match(matchCentre, /const activeBalls = useMemo\(\(\) => \{[\s\S]*if \(activeInnings === 2\) return inn2Balls;[\s\S]*return inn1Balls;/);
+  assert.match(matchCentre, /<ScorecardTables[\s\S]*balls={inn1Balls}/);
+  assert.match(matchCentre, /<ScorecardTables[\s\S]*balls={inn2Balls}/);
+  assert.match(matchCentre, /<Partnerships balls={activeBalls} playersById={playersById} theme="light" \/>/);
+  assert.match(matchCentre, /<WormGraph[\s\S]*innings1Balls={inn1Balls}[\s\S]*innings2Balls={inn2Balls}/);
+});
+
+test("scorecard display uses shared batter-status selectors instead of raw Out x counters", () => {
+  assert.match(scorecardTables, /selectBatterStatus/);
+  assert.doesNotMatch(scorecardTables, /Out x\s*\d+/);
+  assert.match(scoreView, /selectBatterStatus/);
+  assert.doesNotMatch(scoreView, /Out x\s*\d+/);
+});
+
+test("mobile score surfaces keep compact sticky headers and phone-first scorecard cards", () => {
+  assert.match(scoreView, /function ScorerStickyHeader/);
+  assert.match(scoreView, /scorerQuickBadges/);
+  assert.match(scorecardTables, /useIsPhoneViewport/);
+  assert.match(scorecardTables, /MobileStatGrid/);
+  assert.match(spectator, /function SpectatorStickyHeader/);
+});
+
+test("spectator live outcome effect runs only after latestCompetitiveBall is initialized", () => {
+  const normalizedSpectator = spectator.replace(/\r\n/g, "\n");
+  assert.ok(
+    normalizedSpectator.indexOf("const latestCompetitiveBall") < normalizedSpectator.indexOf("useEffect(() => {\n    const nextKey = latestCompetitiveBall")
+  );
 });
 
 test("partnership displays use batter names instead of generic stand labels", () => {
@@ -175,6 +252,22 @@ test("spectator commentary shows grouped over summaries with over totals", () =>
   assert.match(ballByBall, /function buildOverSummary/);
   assert.match(ballByBall, /Over \{over\.overNo \+ 1\}/);
   assert.match(ballByBall, /buildOverSummary\(over\.balls\)/);
+});
+
+test("scorer and spectator live views use shared current-over selectors and transient outcome badges", () => {
+  assert.match(scoreView, /selectCurrentOverSummary/);
+  assert.match(scoreView, /LiveOutcomeBadge/);
+  assert.match(scoreView, /formatBallOutcomeToken/);
+
+  assert.match(spectator, /selectCurrentOverSummary/);
+  assert.match(spectator, /LiveOutcomeBadge/);
+  assert.match(spectator, /formatBallOutcomeToken/);
+});
+
+test("completed match displays use the shared automatic match summary helper", () => {
+  const matchCentre = fs.readFileSync(new URL("../src/pages/MatchCentre.jsx", import.meta.url), "utf8");
+  assert.match(spectator, /buildAutomaticMatchSummary/);
+  assert.match(matchCentre, /buildAutomaticMatchSummary/);
 });
 
 test("stale scorer backup files are not kept in the repository", () => {

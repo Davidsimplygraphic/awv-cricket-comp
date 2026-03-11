@@ -1,33 +1,41 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 
-import BallByBall from "../components/BallByBall";
-import Partnerships from "../components/Partnerships";
-import WormGraph from "../components/WormGraph";
-import ScorecardTables from "../components/ScorecardTables";
+import LiveOutcomeBadge from "../components/LiveOutcomeBadge";
 import {
+  buildAutomaticMatchSummary,
   buildCompletedResultText,
   buildInningsTotals,
+  countBattingExitsForPlayer,
+  describeBallOutcomeBadge,
   didBatterFaceBall,
   deriveMatchDisplayStatus,
   isAdministrativeBall,
   isBattingSideWicket,
   isBowlerCreditedWicket,
   deriveRosterWicketCap,
-  legalBallsCount,
+  formatBallOutcomeToken,
+  formatOverSummaryText,
+  materializeAdministrativeStateBalls,
   oversTextFromLegal,
   resolveDisplayWicketCap,
   runsConcededByBowler,
+  selectCurrentPartnership,
+  selectCurrentOverSummary,
   sortBallsByPosition,
   sumRuns,
   toInt,
 } from "../lib/scoring";
 
+const BallByBall = lazy(() => import("../components/BallByBall"));
+const Partnerships = lazy(() => import("../components/Partnerships"));
+const WormGraph = lazy(() => import("../components/WormGraph"));
+const ScorecardTables = lazy(() => import("../components/ScorecardTables"));
+
 function currentTurnForPlayer(balls, playerId) {
   if (!playerId) return 1;
-  const outs = (balls || []).filter((b) => b.wicket && b.dismissed_player_id === playerId).length;
-  return outs + 1;
+  return countBattingExitsForPlayer(balls, playerId) + 1;
 }
 
 function formatRate(value, digits = 2) {
@@ -64,12 +72,6 @@ function compactTeamName(team) {
   }
 
   return `${full.slice(0, 15).trim()}…`;
-}
-
-function describeBallValue(ball) {
-  if (!ball) return "";
-  if (ball.wicket) return "W";
-  return String(toInt(ball.runs_off_bat, 0) + toInt(ball.extra_runs, 0));
 }
 
 function batterStats(balls, batterId, turn = 1) {
@@ -121,34 +123,6 @@ function bowlerStats(balls, bowlerId) {
   };
 }
 
-function buildLastBallsStrip(balls, limit = 6) {
-  const recent = sortBallsByPosition((balls || []).filter((ball) => !isAdministrativeBall(ball))).slice(-limit);
-  return recent.map((ball) => ({
-    id: ball.id || `${ball.over_no}.${ball.delivery_in_over}.${ball.created_at || ""}`,
-    label: describeBallValue(ball),
-    wicket: !!ball.wicket,
-    runs: toInt(ball.runs_off_bat, 0) + toInt(ball.extra_runs, 0),
-    extraType: ball.extra_type || null,
-  }));
-}
-
-function buildCurrentPartnership(balls) {
-  const sorted = sortBallsByPosition((balls || []).filter((ball) => !isAdministrativeBall(ball)));
-  let standStart = 0;
-
-  for (let i = 0; i < sorted.length; i += 1) {
-    if (isBattingSideWicket(sorted[i])) standStart = i + 1;
-  }
-
-  const standBalls = sorted.slice(standStart);
-  if (!standBalls.length) return null;
-
-  return {
-    runs: sumRuns(standBalls),
-    balls: legalBallsCount(standBalls),
-  };
-}
-
 function buildRecentHighlights(balls, playersById) {
   const sorted = sortBallsByPosition((balls || []).filter((ball) => !isAdministrativeBall(ball)));
   if (!sorted.length) return [];
@@ -194,20 +168,37 @@ async function loadFixtureWicketCap(fixtureId) {
   return cap.data?.wicket_cap ?? null;
 }
 
+async function loadAppliedSessionEvents(matchId, inningsId) {
+  if (!matchId || !inningsId) return [];
+
+  const response = await supabase
+    .from("match_session_events")
+    .select("event_id,event_type,created_at,applied_at,payload,result,status,innings_id,match_id")
+    .eq("match_id", matchId)
+    .eq("innings_id", inningsId)
+    .eq("status", "applied")
+    .order("applied_at", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: true });
+
+  if (response.error) return [];
+  return response.data || [];
+}
+
 function SpectatorStickyHeader({
   visible,
   teamLabel,
   score,
   oversText,
   context,
+  isPhoneViewport = false,
 }) {
   return (
     <div
       style={{
         position: "sticky",
-        top: 10,
+        top: isPhoneViewport ? 6 : 10,
         zIndex: 30,
-        height: visible ? 62 : 0,
+        height: visible ? (isPhoneViewport ? 68 : 62) : 0,
         overflow: "hidden",
         transition: "height 180ms ease",
         pointerEvents: visible ? "auto" : "none",
@@ -218,21 +209,21 @@ function SpectatorStickyHeader({
           opacity: visible ? 1 : 0,
           transform: visible ? "translateY(0)" : "translateY(-8px)",
           transition: "opacity 180ms ease, transform 180ms ease",
-          borderRadius: 16,
+          borderRadius: isPhoneViewport ? 14 : 16,
           border: "1px solid rgba(255,255,255,0.10)",
           background: "rgba(8,14,26,0.88)",
           backdropFilter: "blur(12px)",
           boxShadow: "0 10px 28px rgba(0,0,0,0.28)",
-          padding: "10px 12px",
+          padding: isPhoneViewport ? "7px 9px" : "10px 12px",
           display: "grid",
-          gap: 4,
+          gap: isPhoneViewport ? 3 : 4,
         }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
           <div
             style={{
               minWidth: 0,
-              fontSize: 12,
+              fontSize: isPhoneViewport ? 10.5 : 12,
               fontWeight: 900,
               color: "rgba(232,238,252,0.82)",
               overflow: "hidden",
@@ -242,34 +233,68 @@ function SpectatorStickyHeader({
           >
             {teamLabel}
           </div>
-          <div style={{ fontSize: 19, fontWeight: 1050, whiteSpace: "nowrap", color: "rgba(255,255,255,0.96)" }}>
+          <div style={{ fontSize: isPhoneViewport ? 18 : 19, fontWeight: 1050, whiteSpace: "nowrap", color: "rgba(255,255,255,0.96)" }}>
             {score}
           </div>
         </div>
 
         <div
           style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            gap: 12,
-            fontSize: 11,
+            display: "grid",
+            gridTemplateColumns: "auto minmax(0, 1fr)",
+            alignItems: "start",
+            gap: isPhoneViewport ? 8 : 12,
+            fontSize: isPhoneViewport ? 10 : 11,
             color: "rgba(232,238,252,0.70)",
-            whiteSpace: "nowrap",
           }}
         >
-          <span>{oversText} overs</span>
+          <span style={{ whiteSpace: "nowrap" }}>{oversText} overs</span>
           <span
             style={{
               minWidth: 0,
               overflow: "hidden",
               textOverflow: "ellipsis",
+              whiteSpace: isPhoneViewport ? "normal" : "nowrap",
+              textAlign: "right",
+              display: isPhoneViewport ? "-webkit-box" : "block",
+              WebkitLineClamp: isPhoneViewport ? 2 : undefined,
+              WebkitBoxOrient: isPhoneViewport ? "vertical" : undefined,
+              lineHeight: isPhoneViewport ? 1.2 : undefined,
             }}
           >
             {context}
           </span>
         </div>
       </div>
+    </div>
+  );
+}
+
+function TabSectionFallback({
+  title = "Loading...",
+  detail = "Preparing this section.",
+  dark = true,
+  compact = false,
+}) {
+  const text = dark ? "rgba(255,255,255,0.92)" : "#0f172a";
+  const subText = dark ? "rgba(232,238,252,0.70)" : "rgba(15,23,42,0.65)";
+  const border = dark ? "1px solid rgba(255,255,255,0.10)" : "1px solid rgba(15,23,42,0.10)";
+  const background = dark ? "rgba(255,255,255,0.04)" : "rgba(15,23,42,0.03)";
+
+  return (
+    <div
+      style={{
+        borderRadius: compact ? 14 : 16,
+        border,
+        background,
+        padding: compact ? 12 : 14,
+        display: "grid",
+        gap: 6,
+        color: text,
+      }}
+    >
+      <div style={{ fontWeight: 1000 }}>{title}</div>
+      <div style={{ fontSize: 13, color: subText }}>{detail}</div>
     </div>
   );
 }
@@ -285,6 +310,7 @@ export default function SpectatorView() {
   const [fixtureWicketCap, setFixtureWicketCap] = useState(null);
   const [inningsByNo, setInningsByNo] = useState({});
   const [ballsByInnings, setBallsByInnings] = useState({});
+  const [sessionEventsByInnings, setSessionEventsByInnings] = useState({});
   const [players, setPlayers] = useState([]);
   const [activeTab, setActiveTab] = useState("live");
   const [activeInnings, setActiveInnings] = useState(1);
@@ -292,6 +318,29 @@ export default function SpectatorView() {
   const [isCompactViewport, setIsCompactViewport] = useState(
     typeof window !== "undefined" ? window.innerWidth <= 960 : false
   );
+  const [isPhoneViewport, setIsPhoneViewport] = useState(
+    typeof window !== "undefined" ? window.innerWidth <= 720 : false
+  );
+  const [liveOutcomeBadge, setLiveOutcomeBadge] = useState(null);
+  const latestOutcomeBallKeyRef = useRef("");
+  const liveOutcomeTimerRef = useRef(null);
+
+  const clearLiveOutcomeBadge = () => {
+    if (liveOutcomeTimerRef.current) {
+      window.clearTimeout(liveOutcomeTimerRef.current);
+      liveOutcomeTimerRef.current = null;
+    }
+  };
+
+  const showLiveOutcomeBadge = (outcome) => {
+    if (!outcome) return;
+    clearLiveOutcomeBadge();
+    setLiveOutcomeBadge(outcome);
+    liveOutcomeTimerRef.current = window.setTimeout(() => {
+      liveOutcomeTimerRef.current = null;
+      setLiveOutcomeBadge(null);
+    }, 1600);
+  };
 
   useEffect(() => {
     let alive = true;
@@ -366,6 +415,7 @@ export default function SpectatorView() {
       setInningsByNo(byNo);
 
       const ballsMap = {};
+      const sessionEventMap = {};
       for (const row of inn.data || []) {
         const b = await supabase
           .from("balls")
@@ -376,8 +426,10 @@ export default function SpectatorView() {
           .order("delivery_in_over", { ascending: true });
 
         if (!b.error) ballsMap[row.id] = sortBallsByPosition(b.data || []);
+        sessionEventMap[row.id] = await loadAppliedSessionEvents(m.data.id, row.id);
       }
       setBallsByInnings(ballsMap);
+      setSessionEventsByInnings(sessionEventMap);
 
       const inn1 = byNo[1] ? ballsMap[byNo[1].id] || [] : [];
       const inn2 = byNo[2] ? ballsMap[byNo[2].id] || [] : [];
@@ -416,6 +468,14 @@ export default function SpectatorView() {
               .order("delivery_in_over", { ascending: true });
 
             if (!b.error) setBallsByInnings((prev) => ({ ...prev, [inningsId]: sortBallsByPosition(b.data || []) }));
+          }
+        )
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "match_session_events", filter: `innings_id=eq.${inningsId}` },
+          async () => {
+            const events = await loadAppliedSessionEvents(match.id, inningsId);
+            setSessionEventsByInnings((prev) => ({ ...prev, [inningsId]: events }));
           }
         )
         .subscribe()
@@ -470,6 +530,7 @@ export default function SpectatorView() {
 
     const handleResize = () => {
       setIsCompactViewport(window.innerWidth <= 960);
+      setIsPhoneViewport(window.innerWidth <= 720);
     };
 
     handleResize();
@@ -507,6 +568,12 @@ export default function SpectatorView() {
     return () => window.removeEventListener("scroll", onScroll);
   }, [isCompactViewport, loading]);
 
+  useEffect(() => {
+    return () => {
+      clearLiveOutcomeBadge();
+    };
+  }, []);
+
   const playersById = useMemo(() => {
     const map = {};
     (players || []).forEach((player) => {
@@ -532,11 +599,20 @@ export default function SpectatorView() {
   const inn1Row = inningsByNo?.[1] || null;
   const inn2Row = inningsByNo?.[2] || null;
 
-  const inn1Balls = inn1Row ? (ballsByInnings?.[inn1Row.id] || []) : [];
-  const inn2Balls = inn2Row ? (ballsByInnings?.[inn2Row.id] || []) : [];
+  const inn1SourceBalls = inn1Row ? (ballsByInnings?.[inn1Row.id] || []) : [];
+  const inn2SourceBalls = inn2Row ? (ballsByInnings?.[inn2Row.id] || []) : [];
+  const inn1SessionEvents = inn1Row ? (sessionEventsByInnings?.[inn1Row.id] || []) : [];
+  const inn2SessionEvents = inn2Row ? (sessionEventsByInnings?.[inn2Row.id] || []) : [];
+  const inn1Balls = useMemo(() => materializeAdministrativeStateBalls({
+    balls: inn1SourceBalls,
+    sessionEvents: inn1SessionEvents,
+  }), [inn1SessionEvents, inn1SourceBalls]);
+  const inn2Balls = useMemo(() => materializeAdministrativeStateBalls({
+    balls: inn2SourceBalls,
+    sessionEvents: inn2SessionEvents,
+  }), [inn2SessionEvents, inn2SourceBalls]);
 
-  const tabRow = activeInnings === 2 ? inn2Row : inn1Row;
-  const tabBalls = tabRow ? (ballsByInnings?.[tabRow.id] || []) : [];
+  const tabBalls = activeInnings === 2 ? inn2Balls : inn1Balls;
 
   const oversLimit = toInt(match?.overs_limit, 20);
   const wicketCap = resolveDisplayWicketCap({
@@ -573,6 +649,8 @@ export default function SpectatorView() {
   const liveRow = liveInnings === 2 ? inn2Row : inn1Row;
   const liveBalls = liveInnings === 2 ? inn2Balls : inn1Balls;
   const liveTotals = useMemo(() => buildInningsTotals(liveRow, liveBalls), [liveRow, liveBalls]);
+  const latestCompetitiveBall = useMemo(() => [...liveBalls].reverse().find((ball) => !isAdministrativeBall(ball)) || null, [liveBalls]);
+  const currentOverSummary = useMemo(() => selectCurrentOverSummary(liveBalls), [liveBalls]);
   const liveOversText = oversTextFromLegal(liveTotals.legalBalls);
   const crr = liveTotals.legalBalls ? (liveTotals.runs / (liveTotals.legalBalls / 6)) : 0;
 
@@ -591,6 +669,17 @@ export default function SpectatorView() {
       wicketCap,
     });
   }, [derivedStatus, innings1Team, innings2Team, innings1Totals, innings2Totals, wicketCap]);
+  const matchSummary = useMemo(() => buildAutomaticMatchSummary({
+    matchStatus: derivedStatus,
+    innings1Team,
+    innings2Team,
+    innings1: innings1Totals,
+    innings2: innings2Totals,
+    innings1Balls: inn1Balls,
+    innings2Balls: inn2Balls,
+    playersById,
+    wicketCap,
+  }), [derivedStatus, innings1Team, innings2Team, innings1Totals, innings2Totals, inn1Balls, inn2Balls, playersById, wicketCap]);
 
   const lastLiveBall = liveBalls.length ? liveBalls[liveBalls.length - 1] : null;
   const striker = lastLiveBall ? playersById[lastLiveBall.striker_id] : null;
@@ -603,8 +692,7 @@ export default function SpectatorView() {
   const strikerStats = batterStats(liveBalls, striker?.id, strikerTurnNow);
   const nonStrikerStats = batterStats(liveBalls, nonStriker?.id, nonStrikerTurnNow);
   const bowlerS = bowlerStats(liveBalls, bowler?.id);
-  const lastBalls = useMemo(() => buildLastBallsStrip(liveBalls, 6), [liveBalls]);
-  const partnership = useMemo(() => buildCurrentPartnership(liveBalls), [liveBalls]);
+  const partnership = useMemo(() => selectCurrentPartnership(liveBalls), [liveBalls]);
   const highlights = useMemo(() => buildRecentHighlights(liveBalls, playersById), [liveBalls, playersById]);
   const stickyTeamLabel = `${compactTeamName(teamA)} vs ${compactTeamName(teamB)}`;
   const stickyContext = useMemo(() => {
@@ -627,48 +715,128 @@ export default function SpectatorView() {
     };
   }, [liveOversText, liveTotals.legalBalls, oversLimit]);
 
+  useEffect(() => {
+    const nextKey = latestCompetitiveBall
+      ? String(latestCompetitiveBall.id || latestCompetitiveBall.source_event_id || latestCompetitiveBall.local_temp_id || `${latestCompetitiveBall.over_no}.${latestCompetitiveBall.delivery_in_over}`)
+      : "";
+
+    if (!nextKey) {
+      latestOutcomeBallKeyRef.current = "";
+      return;
+    }
+
+    if (!latestOutcomeBallKeyRef.current) {
+      latestOutcomeBallKeyRef.current = nextKey;
+      return;
+    }
+
+    if (latestOutcomeBallKeyRef.current === nextKey) return;
+
+    latestOutcomeBallKeyRef.current = nextKey;
+    showLiveOutcomeBadge(describeBallOutcomeBadge(latestCompetitiveBall));
+  }, [latestCompetitiveBall]);
+
   const themeText = "rgba(255,255,255,0.92)";
   const subText = "rgba(232,238,252,0.72)";
   const surface = "rgba(255,255,255,0.05)";
   const surfaceStrong = "rgba(255,255,255,0.08)";
   const border = "1px solid rgba(255,255,255,0.10)";
+  const ballTokenStyle = (ball) => {
+    const tone = describeBallOutcomeBadge(ball)?.tone;
+
+    if (tone === "wicket") {
+      return { background: "#b91c1c", color: "#fff7f7", border: "1px solid rgba(254,202,202,0.22)" };
+    }
+    if (tone === "boundary") {
+      return { background: "rgba(22,163,74,0.94)", color: "#f0fdf4", border: "1px solid rgba(187,247,208,0.22)" };
+    }
+    if (tone === "extra") {
+      return { background: "rgba(37,99,235,0.94)", color: "#eff6ff", border: "1px solid rgba(191,219,254,0.22)" };
+    }
+    if (tone === "dot") {
+      return { background: "rgba(71,85,105,0.68)", color: "#f8fafc", border: "1px solid rgba(203,213,225,0.18)" };
+    }
+    return { background: "rgba(255,255,255,0.10)", color: themeText, border: "1px solid rgba(255,255,255,0.12)" };
+  };
 
   const liveCardStyle = {
-    borderRadius: 16,
+    borderRadius: isPhoneViewport ? 14 : 16,
     border,
     background: surface,
-    padding: 14,
+    padding: isPhoneViewport ? 12 : 14,
+  };
+  const infoPillStyle = {
+    borderRadius: 999,
+    border,
+    background: "rgba(255,255,255,0.06)",
+    padding: isPhoneViewport ? "6px 10px" : "7px 11px",
+    fontSize: isPhoneViewport ? 11 : 12,
+    fontWeight: 900,
+    color: themeText,
+    whiteSpace: "nowrap",
+  };
+  const tabButtonBaseStyle = {
+    borderRadius: 999,
+    padding: isPhoneViewport ? "11px 10px" : "8px 12px",
+    minHeight: isPhoneViewport ? 42 : undefined,
+    cursor: "pointer",
+    border,
+    color: themeText,
+    fontWeight: 900,
+    fontSize: isPhoneViewport ? 13 : 12,
+    textAlign: "center",
   };
 
   if (loading) {
     return (
-      <div style={{ padding: 18, color: "rgba(255,255,255,0.88)" }}>
-        <div style={{ opacity: 0.8 }}>Loading…</div>
+      <div style={{ minHeight: "100vh", padding: 16, color: "rgba(255,255,255,0.88)", background: "#0b1220" }}>
+        <div style={{ maxWidth: 980, margin: "0 auto" }}>
+          <div style={{ borderRadius: 16, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(255,255,255,0.04)", padding: 14, display: "grid", gap: 6 }}>
+            <div style={{ fontWeight: 1000 }}>Loading match...</div>
+            <div style={{ fontSize: 13, color: "rgba(232,238,252,0.70)" }}>Preparing live score, current batters, and commentary.</div>
+          </div>
+        </div>
       </div>
     );
   }
 
   if (err) {
     return (
-      <div style={{ padding: 18, color: "rgba(255,255,255,0.88)" }}>
-        <div style={{ fontWeight: 900, marginBottom: 8 }}>Error</div>
-        <div style={{ opacity: 0.85 }}>{err}</div>
+      <div style={{ minHeight: "100vh", padding: 16, color: "rgba(255,255,255,0.88)", background: "#0b1220" }}>
+        <div style={{ maxWidth: 980, margin: "0 auto" }}>
+          <div style={{ borderRadius: 16, border: "1px solid rgba(248,113,113,0.22)", background: "rgba(127,29,29,0.18)", padding: 14, display: "grid", gap: 6 }}>
+            <div style={{ fontWeight: 900 }}>Error</div>
+            <div style={{ opacity: 0.85 }}>{err}</div>
+          </div>
+        </div>
       </div>
     );
   }
 
   return (
-    <div style={{ padding: 18, color: themeText, background: "#0b1220", minHeight: "100vh" }}>
+    <div style={{ padding: isPhoneViewport ? 12 : 18, color: themeText, background: "#0b1220", minHeight: "100vh" }}>
       <div style={{ maxWidth: 980, margin: "0 auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: isPhoneViewport ? "flex-start" : "baseline", gap: 10, flexWrap: "wrap" }}>
           <div>
-            <div style={{ fontWeight: 1000, fontSize: 22, lineHeight: 1.2 }}>{teamLabel}</div>
-            <div style={{ opacity: 0.72, marginTop: 4, fontSize: 12 }}>
+            <div style={{ fontWeight: 1000, fontSize: isPhoneViewport ? 20 : 22, lineHeight: 1.2 }}>{teamLabel}</div>
+            <div style={{ opacity: 0.72, marginTop: 4, fontSize: isPhoneViewport ? 11 : 12 }}>
               Spectator view • Innings {liveInnings}
             </div>
           </div>
 
-          <Link to="/fixtures" style={{ color: "rgba(180,210,255,0.95)", fontWeight: 900, fontSize: 12 }}>
+          <Link
+            to="/fixtures"
+            style={{
+              color: "rgba(180,210,255,0.95)",
+              fontWeight: 900,
+              fontSize: 12,
+              padding: "8px 12px",
+              borderRadius: 999,
+              border,
+              background: "rgba(255,255,255,0.04)",
+              textDecoration: "none",
+            }}
+          >
             Back
           </Link>
         </div>
@@ -679,28 +847,41 @@ export default function SpectatorView() {
           score={`${liveTotals.runs} / ${liveTotals.wkts}`}
           oversText={liveOversText}
           context={stickyContext}
+          isPhoneViewport={isPhoneViewport}
         />
 
         <div
           ref={heroRef}
           style={{
             marginTop: 14,
-            borderRadius: 20,
-            padding: 18,
+            borderRadius: isPhoneViewport ? 18 : 20,
+            padding: isPhoneViewport ? 16 : 18,
             border,
             background: "linear-gradient(180deg, rgba(19,31,61,0.96) 0%, rgba(10,18,32,0.96) 100%)",
             boxShadow: "0 18px 40px rgba(0,0,0,0.30)",
+            position: "relative",
+            overflow: "hidden",
           }}
         >
+          {isPhoneViewport ? (
+            <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: liveOutcomeBadge ? 6 : 0 }}>
+              <LiveOutcomeBadge outcome={liveOutcomeBadge} visible={!!liveOutcomeBadge} />
+            </div>
+          ) : (
+            <div style={{ position: "absolute", top: 14, right: 14, pointerEvents: "none" }}>
+              <LiveOutcomeBadge outcome={liveOutcomeBadge} visible={!!liveOutcomeBadge} />
+            </div>
+          )}
+
           <div style={{ display: "grid", gap: 8 }}>
-            <div style={{ fontSize: 13, fontWeight: 900, color: subText }}>
+            <div style={{ fontSize: isPhoneViewport ? 12 : 13, fontWeight: 900, color: subText }}>
               {String(derivedStatus || "live").toUpperCase()}
             </div>
             <div style={{ fontSize: "clamp(3.6rem, 10vw, 5rem)", lineHeight: 0.96, fontWeight: 1100, letterSpacing: -1.5 }}>
               {liveTotals.runs} <span style={{ opacity: 0.82 }}>/</span> {liveTotals.wkts}
             </div>
-            <div style={{ fontSize: "clamp(1.15rem, 2.8vw, 1.45rem)", fontWeight: 900 }}>{liveOversText} overs</div>
-            <div style={{ fontSize: 12, color: subText, letterSpacing: 0.2 }}>
+            <div style={{ fontSize: "clamp(1.1rem, 3vw, 1.45rem)", fontWeight: 900 }}>{liveOversText} overs</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               CRR {formatRate(crr, 2)} • Wicket cap {wicketCap}
             </div>
           </div>
@@ -736,9 +917,37 @@ export default function SpectatorView() {
               {resultText}
             </div>
           ) : null}
+
+          {matchSummary ? (
+            <div
+              style={{
+                marginTop: 12,
+                display: "grid",
+                gap: 4,
+                padding: isPhoneViewport ? 11 : 12,
+                borderRadius: isPhoneViewport ? 12 : 14,
+                border: "1px solid rgba(255,255,255,0.10)",
+                background: "rgba(255,255,255,0.04)",
+              }}
+            >
+              <div style={{ fontSize: 12, fontWeight: 900, color: subText }}>Match summary</div>
+              <div style={{ fontSize: 13, fontWeight: 900 }}>{matchSummary.headline}</div>
+              {matchSummary.topBatter ? <div style={{ fontSize: 13, color: themeText }}>{matchSummary.topBatter}</div> : null}
+              {matchSummary.bestBowler ? <div style={{ fontSize: 13, color: themeText }}>{matchSummary.bestBowler}</div> : null}
+              {matchSummary.turningPoint ? <div style={{ fontSize: 13, color: subText }}>{matchSummary.turningPoint}</div> : null}
+            </div>
+          ) : null}
         </div>
 
-        <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+        <div
+          style={{
+            display: isPhoneViewport ? "grid" : "flex",
+            gridTemplateColumns: isPhoneViewport ? "repeat(2, minmax(0, 1fr))" : undefined,
+            gap: 10,
+            marginTop: 14,
+            flexWrap: "wrap",
+          }}
+        >
           {[
             { key: "live", label: "Live" },
             { key: "scorecard", label: "Scorecard" },
@@ -749,14 +958,8 @@ export default function SpectatorView() {
               key={tab.key}
               onClick={() => setActiveTab(tab.key)}
               style={{
-                borderRadius: 999,
-                padding: "8px 12px",
-                cursor: "pointer",
-                border,
                 background: activeTab === tab.key ? surfaceStrong : "rgba(0,0,0,0.18)",
-                color: themeText,
-                fontWeight: 900,
-                fontSize: 12,
+                ...tabButtonBaseStyle,
               }}
             >
               {tab.label}
@@ -765,7 +968,15 @@ export default function SpectatorView() {
         </div>
 
         {(activeTab === "commentary" || activeTab === "stats") ? (
-          <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: isPhoneViewport ? "grid" : "flex",
+              gridTemplateColumns: isPhoneViewport ? "repeat(2, minmax(0, 1fr))" : undefined,
+              gap: 10,
+              marginTop: 12,
+              flexWrap: "wrap",
+            }}
+          >
             {[1, 2].map((inningsNo) => {
               const enabled = inningsNo === 1 || !!inn2Row;
               return (
@@ -774,14 +985,10 @@ export default function SpectatorView() {
                   onClick={() => enabled && setActiveInnings(inningsNo)}
                   disabled={!enabled}
                   style={{
-                    borderRadius: 999,
-                    padding: "8px 12px",
                     cursor: enabled ? "pointer" : "not-allowed",
-                    border,
                     background: activeInnings === inningsNo ? surfaceStrong : "rgba(0,0,0,0.18)",
                     color: enabled ? themeText : "rgba(255,255,255,0.45)",
-                    fontWeight: 900,
-                    fontSize: 12,
+                    ...tabButtonBaseStyle,
                   }}
                 >
                   Innings {inningsNo}
@@ -794,29 +1001,28 @@ export default function SpectatorView() {
         <div style={{ marginTop: 14 }}>
           {activeTab === "live" ? (
             <div style={{ display: "grid", gap: 14 }}>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
                 <div style={liveCardStyle}>
                   <div style={{ display: "grid", gap: 10 }}>
                     {[
                       {
                         key: "striker",
                         name: striker?.name ? `${striker.name}*` : "—",
-                        stats: strikerStats ? `${strikerStats.r} (${strikerStats.b}) SR ${formatStrikeRate(strikerStats.sr)}` : "Waiting for first ball",
+                        stats: strikerStats,
+                        note: "On strike",
                       },
                       {
                         key: "non-striker",
                         name: nonStriker?.name || "—",
-                        stats: nonStrikerStats ? `${nonStrikerStats.r} (${nonStrikerStats.b}) SR ${formatStrikeRate(nonStrikerStats.sr)}` : "Waiting for first ball",
+                        stats: nonStrikerStats,
+                        note: "Partner",
                       },
                     ].map((batter, index) => (
                       <div
                         key={batter.key}
                         style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          gap: 12,
-                          flexWrap: "nowrap",
+                          display: "grid",
+                          gap: 8,
                           padding: "10px 12px",
                           borderTop: index === 0 ? "none" : "1px solid rgba(255,255,255,0.10)",
                           borderRadius: 12,
@@ -824,20 +1030,37 @@ export default function SpectatorView() {
                           boxShadow: index === 0 ? "inset 0 0 0 1px rgba(56,189,248,0.22)" : "none",
                         }}
                       >
-                        <div
-                          style={{
-                            fontSize: 18,
-                            fontWeight: index === 0 ? 1050 : 950,
-                            minWidth: 0,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {batter.name}
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
+                          <div style={{ minWidth: 0 }}>
+                            <div
+                              style={{
+                                fontSize: isPhoneViewport ? 17 : 18,
+                                fontWeight: index === 0 ? 1050 : 950,
+                                minWidth: 0,
+                                display: "-webkit-box",
+                                WebkitLineClamp: isPhoneViewport ? 2 : 1,
+                                WebkitBoxOrient: "vertical",
+                                overflow: "hidden",
+                                lineHeight: 1.15,
+                              }}
+                            >
+                              {batter.name}
+                            </div>
+                            <div style={{ marginTop: 4, fontSize: 11, fontWeight: 900, color: subText }}>{batter.note}</div>
+                          </div>
+
+                          <div style={{ textAlign: "right", flexShrink: 0 }}>
+                            <div style={{ fontSize: 18, fontWeight: 1000, color: themeText }}>
+                              {batter.stats ? `${batter.stats.r} (${batter.stats.b})` : "0 (0)"}
+                            </div>
+                            <div style={{ marginTop: 3, fontSize: 12, color: subText }}>
+                              {batter.stats ? `SR ${formatStrikeRate(batter.stats.sr)}` : "Waiting for first ball"}
+                            </div>
+                          </div>
                         </div>
-                        <div style={{ fontSize: 14, color: themeText, whiteSpace: "nowrap", flexShrink: 0 }}>
-                          {batter.stats}
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <div style={infoPillStyle}>Runs {batter.stats ? batter.stats.r : 0}</div>
+                          <div style={infoPillStyle}>Balls {batter.stats ? batter.stats.b : 0}</div>
                         </div>
                       </div>
                     ))}
@@ -846,7 +1069,19 @@ export default function SpectatorView() {
 
                 <div style={liveCardStyle}>
                   <div style={{ fontSize: 12, fontWeight: 900, color: subText, marginBottom: 8 }}>Bowler</div>
-                  <div style={{ fontSize: 20, fontWeight: 1000 }}>{bowler?.name || "—"}</div>
+                  <div
+                    style={{
+                      fontSize: 20,
+                      fontWeight: 1000,
+                      minWidth: 0,
+                      display: "-webkit-box",
+                      WebkitLineClamp: isPhoneViewport ? 2 : 1,
+                      WebkitBoxOrient: "vertical",
+                      overflow: "hidden",
+                    }}
+                  >
+                    {bowler?.name || "—"}
+                  </div>
                   <div style={{ marginTop: 8, fontSize: 16, fontWeight: 900, color: themeText }}>
                     {bowlerS ? bowlerS.classic : "—"}
                   </div>
@@ -865,37 +1100,29 @@ export default function SpectatorView() {
                 </div>
 
                 <div style={liveCardStyle}>
-                  <div style={{ fontSize: 12, fontWeight: 900, color: subText, marginBottom: 8 }}>Last 6 balls</div>
-                  {lastBalls.length ? (
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+                    <div style={{ fontSize: 12, fontWeight: 900, color: subText }}>This over</div>
+                    <div style={{ fontSize: 12, color: subText }}>{formatOverSummaryText(currentOverSummary)}</div>
+                  </div>
+                  {currentOverSummary?.balls?.length ? (
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                      {lastBalls.map((ball) => (
+                      {currentOverSummary.balls.map((ball) => (
                         <div
-                          key={ball.id}
+                          key={ball.id || ball.source_event_id || ball.local_temp_id || `${ball.over_no}.${ball.delivery_in_over}`}
                           style={{
-                            minWidth: 34,
-                            height: 34,
+                            minWidth: isPhoneViewport ? 38 : 34,
+                            height: isPhoneViewport ? 38 : 34,
                             padding: "0 10px",
                             borderRadius: 999,
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "center",
                             fontWeight: 1000,
-                            fontSize: 13,
-                            background: ball.wicket
-                              ? "#b91c1c"
-                              : ball.extraType
-                                ? "rgba(59,130,246,0.95)"
-                                : ball.runs === 4 || ball.runs === 6
-                                  ? "rgba(34,197,94,0.95)"
-                                  : ball.runs === 0
-                                    ? "rgba(148,163,184,0.45)"
-                                    : "rgba(255,255,255,0.10)",
-                            color: ball.wicket
-                              ? "white"
-                              : (ball.extraType || ball.runs === 4 || ball.runs === 6 ? "#0b1220" : themeText),
+                            fontSize: isPhoneViewport ? 14 : 13,
+                            ...ballTokenStyle(ball),
                           }}
                         >
-                          {ball.label}
+                          {formatBallOutcomeToken(ball)}
                         </div>
                       ))}
                     </div>
@@ -908,7 +1135,17 @@ export default function SpectatorView() {
               {highlights.length ? (
                 <div style={{ ...liveCardStyle, display: "grid", gap: 6 }}>
                   {highlights.map((item) => (
-                    <div key={item} style={{ fontSize: 13, color: themeText }}>
+                    <div
+                      key={item}
+                      style={{
+                        fontSize: 13,
+                        color: themeText,
+                        borderRadius: 12,
+                        border,
+                        background: "rgba(255,255,255,0.03)",
+                        padding: "10px 12px",
+                      }}
+                    >
                       {item}
                     </div>
                   ))}
@@ -918,54 +1155,77 @@ export default function SpectatorView() {
           ) : null}
 
           {activeTab === "scorecard" ? (
-            <div style={{ display: "grid", gap: 12 }}>
-              {(liveInnings === 2
-                ? [
-                    { inningsNo: 2, team: innings2Team, balls: inn2Balls },
-                    { inningsNo: 1, team: innings1Team, balls: inn1Balls },
-                  ]
-                : [
-                    { inningsNo: 1, team: innings1Team, balls: inn1Balls },
-                    { inningsNo: 2, team: innings2Team, balls: inn2Balls },
-                  ]
-              ).filter((entry) => entry.inningsNo === 1 || inn2Row).map((entry) => (
-                <ScorecardTables
-                  key={`scorecard-${entry.inningsNo}`}
-                  theme="dark"
-                  title={`Innings ${entry.inningsNo}${entry.team?.name ? `: ${entry.team.name}` : ""}`}
-                  balls={entry.balls}
-                  playersById={playersById}
-                />
-              ))}
-            </div>
+            <Suspense
+              fallback={(
+                <div style={{ display: "grid", gap: 12 }}>
+                  <TabSectionFallback title="Loading scorecard..." detail="Preparing innings cards." dark compact={isPhoneViewport} />
+                  {inn2Row ? <TabSectionFallback title="Loading scorecard..." detail="Preparing innings cards." dark compact={isPhoneViewport} /> : null}
+                </div>
+              )}
+            >
+              <div style={{ display: "grid", gap: 12 }}>
+                {(liveInnings === 2
+                  ? [
+                      { inningsNo: 2, team: innings2Team, balls: inn2Balls },
+                      { inningsNo: 1, team: innings1Team, balls: inn1Balls },
+                    ]
+                  : [
+                      { inningsNo: 1, team: innings1Team, balls: inn1Balls },
+                      { inningsNo: 2, team: innings2Team, balls: inn2Balls },
+                    ]
+                ).filter((entry) => entry.inningsNo === 1 || inn2Row).map((entry) => (
+                  <ScorecardTables
+                    key={`scorecard-${entry.inningsNo}`}
+                    theme="dark"
+                    title={`Innings ${entry.inningsNo}${entry.team?.name ? `: ${entry.team.name}` : ""}`}
+                    balls={entry.balls}
+                    playersById={playersById}
+                  />
+                ))}
+              </div>
+            </Suspense>
           ) : null}
 
           {activeTab === "commentary" ? (
-            <div style={{ ...liveCardStyle, padding: 14 }}>
-              <div style={{ fontWeight: 1000, marginBottom: 8 }}>Commentary</div>
-              <div style={{ fontSize: 12, color: subText, marginBottom: 12 }}>
-                Grouped by over for innings {activeInnings}
+            <Suspense
+              fallback={<TabSectionFallback title="Loading commentary..." detail={`Preparing innings ${activeInnings} over groups.`} dark compact={isPhoneViewport} />}
+            >
+              <div style={{ ...liveCardStyle, padding: isPhoneViewport ? 12 : 14 }}>
+                <div style={{ fontWeight: 1000, marginBottom: 8 }}>Commentary</div>
+                <div style={{ fontSize: 12, color: subText, marginBottom: 12 }}>
+                  Grouped by over for innings {activeInnings}
+                </div>
+                <BallByBall balls={tabBalls} groupByOver />
               </div>
-              <BallByBall balls={tabBalls} groupByOver />
-            </div>
+            </Suspense>
           ) : null}
 
           {activeTab === "stats" ? (
-            <div style={{ display: "grid", gap: 12 }}>
-              <div style={liveCardStyle}>
-                <Partnerships balls={tabBalls} playersById={playersById} theme="dark" compact />
+            <Suspense
+              fallback={(
+                <div style={{ display: "grid", gap: 12 }}>
+                  <TabSectionFallback title="Loading partnerships..." detail="Preparing stand summaries." dark compact={isPhoneViewport} />
+                  <TabSectionFallback title="Loading run flow..." detail="Preparing worm graph." dark compact={isPhoneViewport} />
+                </div>
+              )}
+            >
+              <div style={{ display: "grid", gap: 12 }}>
+                <div style={liveCardStyle}>
+                  <Partnerships balls={tabBalls} playersById={playersById} theme="dark" compact />
+                </div>
+                <div style={liveCardStyle}>
+                  <WormGraph
+                    innings1Balls={inn1Balls}
+                    innings2Balls={inn2Balls}
+                    playersById={playersById}
+                    target={inn1Balls.length ? innings1Totals.runs + 1 : null}
+                    theme="dark"
+                    maxOvers={oversLimit}
+                    compact
+                  />
+                </div>
               </div>
-              <div style={liveCardStyle}>
-                <WormGraph
-                  innings1Balls={inn1Balls}
-                  innings2Balls={inn2Balls}
-                  target={inn1Balls.length ? innings1Totals.runs + 1 : null}
-                  theme="dark"
-                  maxOvers={oversLimit}
-                  compact
-                />
-              </div>
-            </div>
+            </Suspense>
           ) : null}
         </div>
       </div>

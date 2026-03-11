@@ -2,21 +2,34 @@ import assert from "node:assert/strict";
 import { test } from "./test-helpers.js";
 
 import {
+  buildAutomaticMatchSummary,
   buildCompletedResultText,
+  countBattingExitsForPlayer,
+  countDismissalsForPlayer,
   countLegalBallsBowledBy,
+  describeBallOutcomeBadge,
   deriveRosterWicketCap,
   deriveWicketPostState,
   didBatterFaceBall,
+  formatBallOutcomeToken,
+  formatOverSummaryText,
+  isAdministrativeBall,
+  isChaseCompleteForScoring,
   isBattingSideWicket,
   isBowlerCreditedDismissalKind,
   isBowlerCreditedWicket,
   legalBallsCount,
+  materializeAdministrativeStateBalls,
   normalizeDeliveryOutcome,
   reconcileLatestBallEditSelectionState,
   resolveDisplayWicketCap,
   resolveWicketCap,
   runsConcededByBowler,
+  selectBatterStatus,
+  selectCurrentPartnership,
+  selectCurrentOverSummary,
   selectInningsSummary,
+  selectPartnerships,
   selectWormSeries,
   sortBallsByPosition,
   sumRuns,
@@ -167,6 +180,30 @@ test("match completion heuristics do not treat a missing wicket cap as zero wick
   });
 
   assert.equal(status, "live");
+});
+
+test("reopened chase innings can continue scoring without re-triggering chase completion immediately", () => {
+  assert.equal(
+    isChaseCompleteForScoring({
+      inningsNo: 2,
+      innings1Ready: true,
+      innings1Runs: 144,
+      totalRuns: 145,
+      reopenedForContinuation: false,
+    }),
+    true
+  );
+
+  assert.equal(
+    isChaseCompleteForScoring({
+      inningsNo: 2,
+      innings1Ready: true,
+      innings1Runs: 144,
+      totalRuns: 145,
+      reopenedForContinuation: true,
+    }),
+    false
+  );
 });
 
 test("run out deliveries can include completed runs and extras", () => {
@@ -431,6 +468,173 @@ test("batting-side wicket and bowler-credit semantics distinguish run out, stump
   assert.equal(sumWkts([retiredHurt]), 0);
 });
 
+test("administrative retired-hurt events materialize into display-only timeline rows and clear the live partnership", () => {
+  const balls = [
+    {
+      id: "ball-1",
+      source_event_id: "evt-ball-1",
+      over_no: 0,
+      delivery_in_over: 1,
+      striker_id: "bat-a",
+      non_striker_id: "bat-b",
+      bowler_id: "bowl-1",
+      batting_turn: 1,
+      runs_off_bat: 1,
+      extra_runs: 0,
+      extra_type: null,
+      wicket: false,
+      legal_ball: true,
+      created_at: "2026-03-11T10:00:00.000Z",
+    },
+  ];
+
+  const timeline = materializeAdministrativeStateBalls({
+    balls,
+    sessionEvents: [
+      {
+        event_id: "evt-rh-1",
+        event_type: "administrative_state_changed",
+        created_at: "2026-03-11T10:00:10.000Z",
+        payload: {
+          action_type: "retired_hurt",
+          dismissed_player_id: "bat-a",
+          replacement_player_id: "bat-c",
+          post_state: {
+            striker_id: "bat-c",
+            non_striker_id: "bat-b",
+            bowler_id: "bowl-1",
+            needs_next_bowler: false,
+          },
+        },
+      },
+    ],
+  });
+
+  assert.equal(timeline.length, 2);
+  assert.equal(isAdministrativeBall(timeline[1]), true);
+  assert.equal(timeline[1].dismissed_player_id, "bat-a");
+  assert.equal(timeline[1].striker_id, "bat-c");
+  assert.equal(countBattingExitsForPlayer(timeline, "bat-a"), 1);
+  assert.equal(selectCurrentPartnership(timeline), null);
+});
+
+test("retired hurt display state keeps partnerships and batter statuses distinct from normal dismissals", () => {
+  const balls = [
+    {
+      id: "ball-1",
+      source_event_id: "evt-ball-1",
+      over_no: 0,
+      delivery_in_over: 1,
+      striker_id: "bat-a",
+      non_striker_id: "bat-b",
+      bowler_id: "bowl-1",
+      batting_turn: 1,
+      runs_off_bat: 1,
+      extra_runs: 0,
+      extra_type: null,
+      wicket: false,
+      legal_ball: true,
+      created_at: "2026-03-11T10:00:00.000Z",
+    },
+    {
+      id: "ball-2",
+      source_event_id: "evt-ball-2",
+      over_no: 0,
+      delivery_in_over: 2,
+      striker_id: "bat-a",
+      non_striker_id: "bat-b",
+      bowler_id: "bowl-1",
+      batting_turn: 1,
+      runs_off_bat: 0,
+      extra_runs: 0,
+      extra_type: null,
+      wicket: false,
+      legal_ball: true,
+      created_at: "2026-03-11T10:00:20.000Z",
+    },
+    {
+      id: "ball-3",
+      source_event_id: "evt-ball-3",
+      over_no: 0,
+      delivery_in_over: 3,
+      striker_id: "bat-c",
+      non_striker_id: "bat-b",
+      bowler_id: "bowl-1",
+      batting_turn: 1,
+      runs_off_bat: 2,
+      extra_runs: 0,
+      extra_type: null,
+      wicket: false,
+      legal_ball: true,
+      created_at: "2026-03-11T10:00:40.000Z",
+    },
+    {
+      id: "ball-4",
+      source_event_id: "evt-ball-4",
+      over_no: 0,
+      delivery_in_over: 4,
+      striker_id: "bat-a",
+      non_striker_id: "bat-c",
+      bowler_id: "bowl-1",
+      batting_turn: 2,
+      runs_off_bat: 0,
+      extra_runs: 0,
+      extra_type: null,
+      wicket: true,
+      dismissal_kind: "bowled",
+      dismissed_player_id: "bat-a",
+      legal_ball: true,
+      created_at: "2026-03-11T10:01:00.000Z",
+    },
+  ];
+
+  const timeline = materializeAdministrativeStateBalls({
+    balls,
+    sessionEvents: [
+      {
+        event_id: "evt-rh-1",
+        event_type: "administrative_state_changed",
+        created_at: "2026-03-11T10:00:30.000Z",
+        payload: {
+          action_type: "retired_hurt",
+          dismissed_player_id: "bat-a",
+          replacement_player_id: "bat-c",
+          post_state: {
+            striker_id: "bat-c",
+            non_striker_id: "bat-b",
+            bowler_id: "bowl-1",
+            needs_next_bowler: false,
+          },
+        },
+      },
+    ],
+  });
+
+  const partnerships = selectPartnerships(timeline);
+  assert.equal(partnerships.length, 2);
+  assert.equal(partnerships[0].runs, 1);
+  assert.equal(partnerships[0].balls, 2);
+  assert.equal(partnerships[0].endedByRetiredHurt, true);
+  assert.equal(partnerships[0].endedByWicket, false);
+  assert.equal(partnerships[1].endedByWicket, true);
+
+  assert.equal(countBattingExitsForPlayer(timeline, "bat-a"), 2);
+  assert.equal(countDismissalsForPlayer(timeline, "bat-a"), 1);
+
+  assert.deepEqual(
+    selectBatterStatus({ balls: timeline, playerId: "bat-a", turn: 1, isAtCrease: false }),
+    { label: "Retired Hurt", tone: "retired_hurt" }
+  );
+  assert.deepEqual(
+    selectBatterStatus({ balls: timeline, playerId: "bat-a", turn: 2, isAtCrease: false }),
+    { label: "Out", tone: "out" }
+  );
+  const secondTurnStatus = selectBatterStatus({ balls: timeline, playerId: "bat-a", turn: 2, isAtCrease: false }).label;
+  assert.equal(secondTurnStatus, "Out");
+  assert.notEqual(secondTurnStatus, "Out x1");
+  assert.notEqual(secondTurnStatus, "Out x 1");
+});
+
 test("shared innings summary returns totals, wickets, legal balls, and overs text without counting administrative rows", () => {
   const summary = selectInningsSummary([
     {
@@ -525,6 +729,94 @@ test("shared worm series uses deterministic ordering and ignores administrative 
     { x: 2, y: 5 },
     { x: 2, y: 7 },
   ]);
+});
+
+test("broadcast selectors derive last-ball badges and current-over strips from shared ball state", () => {
+  const balls = [
+    { id: "ball-1", over_no: 0, delivery_in_over: 1, runs_off_bat: 1, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+    { id: "ball-2", over_no: 0, delivery_in_over: 2, runs_off_bat: 0, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+    { id: "ball-3", over_no: 0, delivery_in_over: 3, runs_off_bat: 4, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+    { id: "ball-4", over_no: 1, delivery_in_over: 1, runs_off_bat: 0, extra_runs: 2, extra_type: "wide", wicket: false, legal_ball: false },
+    { id: "ball-5", over_no: 1, delivery_in_over: 2, runs_off_bat: 0, extra_runs: 0, extra_type: null, wicket: true, dismissal_kind: "bowled", legal_ball: true },
+  ];
+
+  const over = selectCurrentOverSummary(balls);
+  assert.equal(over.overNo, 1);
+  assert.deepEqual(over.balls.map((ball) => formatBallOutcomeToken(ball)), ["Wd", "W"]);
+  assert.equal(formatOverSummaryText(over), "2 runs • 1 wicket");
+
+  assert.deepEqual(describeBallOutcomeBadge(balls[2]), { label: "FOUR", tone: "boundary" });
+  assert.deepEqual(describeBallOutcomeBadge(balls[3]), { label: "WIDE", tone: "extra" });
+  assert.deepEqual(describeBallOutcomeBadge({ runs_off_bat: 0, extra_runs: 0, wicket: false, extra_type: null }), { label: "DOT", tone: "dot" });
+});
+
+test("automatic match summaries describe defended totals deterministically", () => {
+  const innings1Balls = [
+    { id: "i1-1", over_no: 0, delivery_in_over: 1, striker_id: "bat-a", batting_turn: 1, bowler_id: "bowl-x", runs_off_bat: 4, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+    { id: "i1-2", over_no: 0, delivery_in_over: 2, striker_id: "bat-a", batting_turn: 1, bowler_id: "bowl-x", runs_off_bat: 6, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+    { id: "i1-3", over_no: 0, delivery_in_over: 3, striker_id: "bat-a", batting_turn: 1, bowler_id: "bowl-x", runs_off_bat: 4, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+  ];
+  const innings2Balls = [
+    { id: "i2-1", over_no: 16, delivery_in_over: 1, striker_id: "bat-b", batting_turn: 1, bowler_id: "bowl-y", runs_off_bat: 1, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+    { id: "i2-2", over_no: 16, delivery_in_over: 2, striker_id: "bat-b", batting_turn: 1, bowler_id: "bowl-y", runs_off_bat: 0, extra_runs: 0, extra_type: null, wicket: true, dismissal_kind: "caught", dismissed_player_id: "bat-b", legal_ball: true },
+    { id: "i2-3", over_no: 16, delivery_in_over: 3, striker_id: "bat-c", batting_turn: 1, bowler_id: "bowl-y", runs_off_bat: 0, extra_runs: 0, extra_type: null, wicket: true, dismissal_kind: "bowled", dismissed_player_id: "bat-c", legal_ball: true },
+  ];
+
+  const summary = buildAutomaticMatchSummary({
+    matchStatus: "completed",
+    innings1Team: { name: "Mkuze Dogs" },
+    innings2Team: { name: "Cleveland Steamers" },
+    innings1: { runs: 154, wkts: 4, balls: innings1Balls, completed: true },
+    innings2: { runs: 152, wkts: 7, balls: innings2Balls, completed: true },
+    innings1Balls,
+    innings2Balls,
+    playersById: {
+      "bat-a": { name: "Dylan Skewis" },
+      "bat-b": { name: "Paulo Bandeira" },
+      "bat-c": { name: "Neill Wilson" },
+      "bowl-x": { name: "Jago Church" },
+      "bowl-y": { name: "Jago Church" },
+    },
+    wicketCap: 10,
+  });
+
+  assert.equal(summary.headline, "Mkuze Dogs won by 2 runs.");
+  assert.equal(summary.topBatter, "Top scorer: Dylan Skewis 14 (3)");
+  assert.equal(summary.bestBowler, "Best bowler: Jago Church 2/1");
+  assert.equal(summary.turningPoint, "Turning point: Over 17 went for 1 run and 2 wickets.");
+});
+
+test("automatic match summaries describe completed chases deterministically", () => {
+  const innings1Balls = [
+    { id: "i1-1", over_no: 0, delivery_in_over: 1, striker_id: "bat-a", batting_turn: 1, bowler_id: "bowl-x", runs_off_bat: 2, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+  ];
+  const innings2Balls = [
+    { id: "i2-1", over_no: 17, delivery_in_over: 1, striker_id: "bat-b", batting_turn: 1, bowler_id: "bowl-y", runs_off_bat: 4, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+    { id: "i2-2", over_no: 17, delivery_in_over: 2, striker_id: "bat-b", batting_turn: 1, bowler_id: "bowl-y", runs_off_bat: 6, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+    { id: "i2-3", over_no: 17, delivery_in_over: 3, striker_id: "bat-b", batting_turn: 1, bowler_id: "bowl-y", runs_off_bat: 4, extra_runs: 0, extra_type: null, wicket: false, legal_ball: true },
+  ];
+
+  const summary = buildAutomaticMatchSummary({
+    matchStatus: "completed",
+    innings1Team: { name: "Cape Strikers" },
+    innings2Team: { name: "Lions Blazers" },
+    innings1: { runs: 120, wkts: 6, balls: innings1Balls, completed: true },
+    innings2: { runs: 121, wkts: 3, balls: innings2Balls, completed: true },
+    innings1Balls,
+    innings2Balls,
+    playersById: {
+      "bat-a": { name: "Opener A" },
+      "bat-b": { name: "Karl Marais" },
+      "bowl-x": { name: "Jago Church" },
+      "bowl-y": { name: "Paulo Bandeira" },
+    },
+    wicketCap: 10,
+  });
+
+  assert.equal(summary.headline, "Lions Blazers won by 7 wickets.");
+  assert.equal(summary.topBatter, "Top scorer: Karl Marais 14 (3)");
+  assert.equal(summary.bestBowler, "Best bowler: Jago Church 0/2");
+  assert.equal(summary.turningPoint, "Turning point: Over 18 yielded 14 runs.");
 });
 
 test("shared scorer sorting uses source_event_id as a deterministic same-position tie-breaker", () => {

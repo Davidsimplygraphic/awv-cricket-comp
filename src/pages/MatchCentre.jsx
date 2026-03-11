@@ -1,19 +1,57 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { supabase } from "../lib/supabase";
 
-import Partnerships from "../components/Partnerships";
-import WormGraph from "../components/WormGraph";
-import ScorecardTables from "../components/ScorecardTables";
 import {
+  buildAutomaticMatchSummary,
   buildCompletedResultText,
   buildInningsTotals,
   deriveRosterWicketCap,
   deriveMatchDisplayStatus,
+  materializeAdministrativeStateBalls,
   resolveDisplayWicketCap,
   sortBallsByPosition,
   toInt,
 } from "../lib/scoring";
+
+const Partnerships = lazy(() => import("../components/Partnerships"));
+const WormGraph = lazy(() => import("../components/WormGraph"));
+const ScorecardTables = lazy(() => import("../components/ScorecardTables"));
+
+async function loadAppliedSessionEvents(matchId, inningsId) {
+  if (!matchId || !inningsId) return [];
+
+  const response = await supabase
+    .from("match_session_events")
+    .select("event_id,event_type,created_at,applied_at,payload,result,status,innings_id,match_id")
+    .eq("match_id", matchId)
+    .eq("innings_id", inningsId)
+    .eq("status", "applied")
+    .order("applied_at", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: true });
+
+  if (response.error) return [];
+  return response.data || [];
+}
+
+function MatchCentreSectionFallback({ title = "Loading...", compact = false }) {
+  return (
+    <div
+      style={{
+        borderRadius: compact ? 14 : 16,
+        border: "1px solid #E5E7EB",
+        background: "#F8FAFC",
+        padding: compact ? 12 : 14,
+        color: "#0f172a",
+        display: "grid",
+        gap: 6,
+      }}
+    >
+      <div style={{ fontWeight: 1000 }}>{title}</div>
+      <div style={{ fontSize: 13, color: "#64748B" }}>Preparing match data for this section.</div>
+    </div>
+  );
+}
 
 export default function MatchCentre() {
   const { fixtureId } = useParams();
@@ -26,9 +64,13 @@ export default function MatchCentre() {
   const [fixtureWicketCap, setFixtureWicketCap] = useState(null);
   const [inningsByNo, setInningsByNo] = useState({}); // {1: row, 2: row}
   const [ballsByInnings, setBallsByInnings] = useState({}); // {inningsId: balls[]}
+  const [sessionEventsByInnings, setSessionEventsByInnings] = useState({}); // {inningsId: events[]}
 
   const [activeTab, setActiveTab] = useState("scorecard"); // scorecard | partnership | worm
   const [activeInnings, setActiveInnings] = useState(1); // 1 or 2
+  const [isPhoneViewport, setIsPhoneViewport] = useState(
+    typeof window !== "undefined" ? window.innerWidth <= 720 : false
+  );
 
   // Load players + match + innings + balls
   useEffect(() => {
@@ -110,6 +152,7 @@ export default function MatchCentre() {
       setInningsByNo(map);
 
       const ballsMap = {};
+      const sessionEventMap = {};
       for (const r of inn.data || []) {
         const b = await supabase
           .from("balls")
@@ -125,8 +168,10 @@ export default function MatchCentre() {
           return;
         }
         ballsMap[r.id] = sortBallsByPosition(b.data || []);
+        sessionEventMap[r.id] = await loadAppliedSessionEvents(m.data.id, r.id);
       }
       setBallsByInnings(ballsMap);
+      setSessionEventsByInnings(sessionEventMap);
 
       // Pick active innings based on whether innings 2 has data or match is completed
       const inn2 = map[2] || null;
@@ -168,6 +213,14 @@ export default function MatchCentre() {
             }
           }
         )
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "match_session_events", filter: `innings_id=eq.${inningsId}` },
+          async () => {
+            const events = await loadAppliedSessionEvents(match.id, inningsId);
+            setSessionEventsByInnings((prev) => ({ ...prev, [inningsId]: events }));
+          }
+        )
         .subscribe()
     );
 
@@ -202,6 +255,15 @@ export default function MatchCentre() {
     };
   }, [fixtureId, match?.id]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const onResize = () => setIsPhoneViewport(window.innerWidth <= 720);
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
   // IMPORTANT: ScorecardTables expects an object map (playersById[playerId]).
   // If we pass a Map here, every lookup becomes undefined and the UI shows "Unknown".
   const playersById = useMemo(() => {
@@ -214,8 +276,18 @@ export default function MatchCentre() {
 
   const inn1Row = inningsByNo?.[1] || null;
   const inn2Row = inningsByNo?.[2] || null;
-  const inn1Balls = inn1Row ? ballsByInnings?.[inn1Row.id] || [] : [];
-  const inn2Balls = inn2Row ? ballsByInnings?.[inn2Row.id] || [] : [];
+  const inn1SourceBalls = inn1Row ? ballsByInnings?.[inn1Row.id] || [] : [];
+  const inn2SourceBalls = inn2Row ? ballsByInnings?.[inn2Row.id] || [] : [];
+  const inn1SessionEvents = inn1Row ? sessionEventsByInnings?.[inn1Row.id] || [] : [];
+  const inn2SessionEvents = inn2Row ? sessionEventsByInnings?.[inn2Row.id] || [] : [];
+  const inn1Balls = useMemo(() => materializeAdministrativeStateBalls({
+    balls: inn1SourceBalls,
+    sessionEvents: inn1SessionEvents,
+  }), [inn1SessionEvents, inn1SourceBalls]);
+  const inn2Balls = useMemo(() => materializeAdministrativeStateBalls({
+    balls: inn2SourceBalls,
+    sessionEvents: inn2SessionEvents,
+  }), [inn2SessionEvents, inn2SourceBalls]);
 
   const inn1 = useMemo(() => {
     return inn1Row ? buildInningsTotals(inn1Row, inn1Balls) : null;
@@ -271,6 +343,19 @@ export default function MatchCentre() {
       wicketCap: displayWicketCap,
     });
   }, [derivedStatus, inn1Team, inn2Team, inn1, inn2, displayWicketCap]);
+  const matchSummary = useMemo(() => {
+    return buildAutomaticMatchSummary({
+      matchStatus: derivedStatus,
+      innings1Team: inn1Team,
+      innings2Team: inn2Team,
+      innings1: inn1,
+      innings2: inn2,
+      innings1Balls: inn1Balls,
+      innings2Balls: inn2Balls,
+      playersById,
+      wicketCap: displayWicketCap,
+    });
+  }, [derivedStatus, inn1Team, inn2Team, inn1, inn2, inn1Balls, inn2Balls, playersById, displayWicketCap]);
 
   const activeBalls = useMemo(() => {
     if (activeInnings === 2) return inn2Balls;
@@ -279,16 +364,19 @@ export default function MatchCentre() {
 
   if (loading) {
     return (
-      <div style={{ maxWidth: 980, margin: "0 auto", padding: 16, color: "#64748B" }}>
-        Loading match centre…
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: isPhoneViewport ? 12 : 16, color: "#64748B" }}>
+        <div style={{ padding: isPhoneViewport ? 12 : 14, border: "1px solid #E5E7EB", borderRadius: 16, background: "#F8FAFC", display: "grid", gap: 6 }}>
+          <div style={{ fontWeight: 1000, color: "#0f172a" }}>Loading match centre...</div>
+          <div style={{ fontSize: 13 }}>Preparing scorecards, partnerships, and worm graph.</div>
+        </div>
       </div>
     );
   }
 
   if (err) {
     return (
-      <div style={{ maxWidth: 980, margin: "0 auto", padding: 16 }}>
-        <div style={{ color: "crimson", marginBottom: 12, fontWeight: 800 }}>{err}</div>
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: isPhoneViewport ? 12 : 16 }}>
+        <div style={{ color: "crimson", marginBottom: 12, fontWeight: 800, padding: isPhoneViewport ? 12 : 14, borderRadius: 16, border: "1px solid rgba(220,38,38,0.14)", background: "rgba(254,242,242,0.9)" }}>{err}</div>
         <Link to="/fixtures">Back to fixtures</Link>
       </div>
     );
@@ -296,7 +384,7 @@ export default function MatchCentre() {
 
   if (!match) {
     return (
-      <div style={{ maxWidth: 980, margin: "0 auto", padding: 16 }}>
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: isPhoneViewport ? 12 : 16 }}>
         <div style={{ padding: 12, border: "1px solid #E5E7EB", borderRadius: 12, color: "#475569" }}>
           No match found.
         </div>
@@ -308,10 +396,10 @@ export default function MatchCentre() {
   }
 
   return (
-    <div style={{ maxWidth: 980, margin: "0 auto", padding: 16 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+    <div style={{ maxWidth: 980, margin: "0 auto", padding: isPhoneViewport ? 12 : 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: isPhoneViewport ? "flex-start" : "center", gap: 12, flexWrap: "wrap" }}>
         <div>
-          <div style={{ fontWeight: 1000, fontSize: 18 }}>{matchTitle}</div>
+          <div style={{ fontWeight: 1000, fontSize: isPhoneViewport ? 17 : 18, lineHeight: 1.2 }}>{matchTitle}</div>
           <div style={{ color: "#64748B", fontSize: 13 }}>Match Centre</div>
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
@@ -329,7 +417,7 @@ export default function MatchCentre() {
           background:
             "radial-gradient(1200px 500px at 0% 0%, rgba(255,255,255,0.08), rgba(255,255,255,0)), #0B1220",
           border: "1px solid rgba(255,255,255,0.08)",
-          padding: 16,
+          padding: isPhoneViewport ? 12 : 16,
           color: "white",
         }}
       >
@@ -350,7 +438,7 @@ export default function MatchCentre() {
             </div>
           </div>
 
-          <div style={{ textAlign: "right" }}>
+          <div style={{ textAlign: isPhoneViewport ? "left" : "right" }}>
             <div style={{ fontSize: 12, opacity: 0.75, fontWeight: 900 }}>Status</div>
             <div style={{ fontSize: 14, fontWeight: 1000 }}>{String(derivedStatus || "").toUpperCase()}</div>
           </div>
@@ -360,8 +448,28 @@ export default function MatchCentre() {
           <div style={{ marginTop: 10, fontWeight: 1000, color: "rgba(255,228,176,0.95)" }}>{resultText}</div>
         ) : null}
 
+        {matchSummary ? (
+          <div
+            style={{
+              marginTop: 10,
+              padding: isPhoneViewport ? 10 : 12,
+              borderRadius: 12,
+              border: "1px solid rgba(255,255,255,0.10)",
+              background: "rgba(255,255,255,0.05)",
+              display: "grid",
+              gap: 4,
+            }}
+          >
+            <div style={{ fontSize: 12, opacity: 0.72, fontWeight: 900 }}>Match summary</div>
+            <div style={{ fontWeight: 1000 }}>{matchSummary.headline}</div>
+            {matchSummary.topBatter ? <div style={{ fontSize: 13, opacity: 0.92 }}>{matchSummary.topBatter}</div> : null}
+            {matchSummary.bestBowler ? <div style={{ fontSize: 13, opacity: 0.92 }}>{matchSummary.bestBowler}</div> : null}
+            {matchSummary.turningPoint ? <div style={{ fontSize: 13, opacity: 0.80 }}>{matchSummary.turningPoint}</div> : null}
+          </div>
+        ) : null}
+
         {/* Tabs */}
-        <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+        <div style={{ display: isPhoneViewport ? "grid" : "flex", gridTemplateColumns: isPhoneViewport ? "repeat(3, minmax(0, 1fr))" : undefined, gap: 10, marginTop: 12, flexWrap: "wrap" }}>
           {[
             { key: "scorecard", label: "Scorecard" },
             { key: "partnership", label: "Partnership" },
@@ -372,7 +480,8 @@ export default function MatchCentre() {
               onClick={() => setActiveTab(t.key)}
               style={{
                 borderRadius: 10,
-                padding: "8px 10px",
+                minHeight: isPhoneViewport ? 42 : undefined,
+                padding: isPhoneViewport ? "10px 8px" : "8px 10px",
                 border: "1px solid rgba(255,255,255,0.12)",
                 background: activeTab === t.key ? "rgba(255,255,255,0.16)" : "rgba(255,255,255,0.06)",
                 color: "white",
@@ -389,7 +498,7 @@ export default function MatchCentre() {
 
       {/* Innings toggle for worm/partnership/ball */}
       {activeTab !== "scorecard" ? (
-        <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ marginTop: 12, display: isPhoneViewport ? "grid" : "flex", gridTemplateColumns: isPhoneViewport ? "repeat(2, minmax(0, 1fr))" : undefined, gap: 10, flexWrap: "wrap" }}>
           <button
             onClick={() => setActiveInnings(1)}
             style={{
@@ -426,33 +535,54 @@ export default function MatchCentre() {
       {/* Tab content */}
       <div style={{ marginTop: 12 }}>
         {activeTab === "scorecard" ? (
-          <div style={{ display: "grid", gap: 12 }}>
-            <ScorecardTables theme="light" title={`Innings 1${teamA?.name ? `: ${teamA.name}` : ""}`} balls={inn1Balls} playersById={playersById} />
-            <ScorecardTables theme="light" title={`Innings 2${teamB?.name ? `: ${teamB.name}` : ""}`} balls={inn2Balls} playersById={playersById} />
-          </div>
+          <Suspense
+            fallback={(
+              <div style={{ display: "grid", gap: 12 }}>
+                <MatchCentreSectionFallback title="Loading innings 1 scorecard..." compact={isPhoneViewport} />
+                <MatchCentreSectionFallback title="Loading innings 2 scorecard..." compact={isPhoneViewport} />
+              </div>
+            )}
+          >
+            <div style={{ display: "grid", gap: 12 }}>
+              <ScorecardTables theme="light" title={`Innings 1${teamA?.name ? `: ${teamA.name}` : ""}`} balls={inn1Balls} playersById={playersById} />
+              <ScorecardTables theme="light" title={`Innings 2${teamB?.name ? `: ${teamB.name}` : ""}`} balls={inn2Balls} playersById={playersById} />
+            </div>
+          </Suspense>
         ) : null}
 
         {activeTab === "partnership" ? (
-          <div style={{ borderRadius: 16, border: "1px solid #E5E7EB", overflow: "hidden" }}>
-            <div style={{ padding: 12, background: "#F8FAFC", borderBottom: "1px solid #E5E7EB", fontWeight: 1000 }}>
+          <Suspense fallback={<MatchCentreSectionFallback title="Loading partnerships..." compact={isPhoneViewport} />}>
+            <div style={{ borderRadius: 16, border: "1px solid #E5E7EB", overflow: "hidden" }}>
+              <div style={{ padding: isPhoneViewport ? 10 : 12, background: "#F8FAFC", borderBottom: "1px solid #E5E7EB", fontWeight: 1000 }}>
               Partnerships — {activeInnings === 1 ? teamA?.name : teamB?.name}
             </div>
-            <div style={{ padding: 12 }}>
+              <div style={{ padding: isPhoneViewport ? 10 : 12 }}>
               <Partnerships balls={activeBalls} playersById={playersById} theme="light" />
+              </div>
             </div>
-          </div>
+          </Suspense>
         ) : null}
 
         {activeTab === "worm" ? (
-          <div style={{ borderRadius: 16, border: "1px solid #E5E7EB", overflow: "hidden" }}>
-            <div style={{ padding: 12, background: "#F8FAFC", borderBottom: "1px solid #E5E7EB", fontWeight: 1000 }}>
+          <Suspense fallback={<MatchCentreSectionFallback title="Loading worm graph..." compact={isPhoneViewport} />}>
+            <div style={{ borderRadius: 16, border: "1px solid #E5E7EB", overflow: "hidden" }}>
+              <div style={{ padding: isPhoneViewport ? 10 : 12, background: "#F8FAFC", borderBottom: "1px solid #E5E7EB", fontWeight: 1000 }}>
               Worm — Innings 1 vs Innings 2
             </div>
-            <div style={{ padding: 12 }}>
-              <WormGraph innings1Balls={inn1Balls} innings2Balls={inn2Balls} target={inn1 ? inn1.runs + 1 : null} theme="light" maxOvers={toInt(match?.overs_limit, 20)} />
+              <div style={{ padding: isPhoneViewport ? 10 : 12 }}>
+              <WormGraph
+                innings1Balls={inn1Balls}
+                innings2Balls={inn2Balls}
+                playersById={playersById}
+                target={inn1 ? inn1.runs + 1 : null}
+                theme="light"
+                maxOvers={toInt(match?.overs_limit, 20)}
+              />
+              </div>
             </div>
-          </div>
-        ) : null}</div>
+          </Suspense>
+        ) : null}
+      </div>
     </div>
   );
 }

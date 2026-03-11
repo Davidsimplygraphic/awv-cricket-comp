@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { supabase } from "../lib/supabase";
+import LiveOutcomeBadge from "../components/LiveOutcomeBadge";
 import {
   clearPendingEvents,
   clearScorerState,
@@ -21,22 +22,30 @@ import {
   buildScorerPostState,
   computeNextPosition,
   countLegalBallsBowledBy,
+  describeBallOutcomeBadge,
   DELIVERY_RECORDED_EVENT_TYPE,
   deriveRosterWicketCap,
   reconcileLatestBallEditSelectionState,
   deriveWicketPostState,
   didBatterFaceBall,
+  formatBallOutcomeToken,
+  formatOverSummaryText,
   getOverCounts,
+  isChaseCompleteForScoring,
   isAdministrativeBall,
+  isBattingSideWicket,
   isBowlerCreditedWicket,
   isOverFinished,
   legalBallsCount,
+  materializeAdministrativeStateBalls,
   mergeBallIntoList,
   normalizeDeliveryOutcome,
   oversTextFromLegal,
   resolveDisplayWicketCap,
   resolveWicketCap,
   runsConcededByBowler,
+  selectBatterStatus,
+  selectCurrentOverSummary,
   sortBallsByPosition,
   sumRuns,
   sumWkts,
@@ -46,6 +55,7 @@ import {
 import {
   applyEventOptimistically,
   applyRpcResultToState,
+  canAutoFlushPendingQueue,
   createEventId,
   deriveQueuedScorerState,
   enqueuePendingEvent,
@@ -58,6 +68,10 @@ import {
   removePendingEventsForInnings,
   replayPendingEventsOnState,
 } from "../lib/scoringSync";
+
+const PENDING_SYNC_RETRY_DELAY_MS = 3000;
+const LIVE_OUTCOME_BADGE_DURATION_MS = 1600;
+const SAVE_FEEDBACK_DURATION_MS = 1200;
 
 function isScorerOwnershipError(error) {
   return /Only the assigned scorer can/i.test(String(error?.message || error || ""));
@@ -118,6 +132,22 @@ async function loadSquadPlayers({ fixtureId, teamId }) {
   return { data: p2.data || [], error: null };
 }
 
+async function loadAppliedSessionEvents({ matchId, inningsId }) {
+  if (!matchId || !inningsId) return [];
+
+  const response = await supabase
+    .from("match_session_events")
+    .select("event_id,event_type,created_at,applied_at,payload,result,status,innings_id,match_id")
+    .eq("match_id", matchId)
+    .eq("innings_id", inningsId)
+    .eq("status", "applied")
+    .order("applied_at", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: true });
+
+  if (response.error) return [];
+  return response.data || [];
+}
+
 function ScoreViewLoadingShell() {
   return (
     <div style={{ minHeight: "100vh", background: "linear-gradient(180deg,#0b1220,#060a12)", color: "#e8eefc" }}>
@@ -131,16 +161,16 @@ function ScoreViewLoadingShell() {
           borderBottom: "1px solid rgba(255,255,255,0.08)",
         }}
       >
-        <div style={{ maxWidth: 980, margin: "0 auto", padding: "12px 14px", display: "flex", gap: 12, alignItems: "center" }}>
+        <div style={{ maxWidth: 980, margin: "0 auto", padding: "10px 12px", display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div style={{ color: "#cfe0ff", fontWeight: 700 }}>Scorer</div>
         </div>
       </div>
 
-      <div style={{ maxWidth: 980, margin: "0 auto", padding: "14px" }}>
+      <div style={{ maxWidth: 980, margin: "0 auto", padding: "12px" }}>
         <div
           style={{
             marginTop: 12,
-            padding: 14,
+            padding: 12,
             borderRadius: 16,
             border: "1px solid rgba(255,255,255,0.10)",
             background: "rgba(255,255,255,0.04)",
@@ -152,6 +182,130 @@ function ScoreViewLoadingShell() {
             Preparing match, scorer lock, innings, and recovery state.
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+export function ScorerStickyHeader({
+  visible,
+  score,
+  oversText,
+  context,
+  strikerLabel,
+  bowlerLabel,
+  badges = [],
+  isPhoneViewport = false,
+}) {
+  const displayBadges = badges.slice(0, 2);
+
+  return (
+    <div
+      style={{
+        position: "sticky",
+        top: isPhoneViewport ? 52 : 56,
+        zIndex: 19,
+        height: visible ? (isPhoneViewport ? 82 : 64) : 0,
+        overflow: "hidden",
+        transition: "height 180ms ease",
+        pointerEvents: visible ? "auto" : "none",
+      }}
+    >
+      <div
+        style={{
+          opacity: visible ? 1 : 0,
+          transform: visible ? "translateY(0)" : "translateY(-8px)",
+          transition: "opacity 180ms ease, transform 180ms ease",
+          marginTop: isPhoneViewport ? 6 : 8,
+          borderRadius: 14,
+          border: "1px solid rgba(255,255,255,0.10)",
+          background: "rgba(8,14,26,0.92)",
+          backdropFilter: "blur(12px)",
+          boxShadow: "0 12px 28px rgba(0,0,0,0.28)",
+          padding: isPhoneViewport ? "8px 9px" : "9px 10px",
+          display: "grid",
+          gap: isPhoneViewport ? 5 : 6,
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
+          <div style={{ minWidth: 0, display: "grid", gap: 3 }}>
+            <div style={{ fontSize: isPhoneViewport ? 17 : 18, fontWeight: 1000, color: "#f8fafc" }}>{score}</div>
+            <div
+              style={{
+                minWidth: 0,
+                fontSize: isPhoneViewport ? 10.5 : 11,
+                color: "rgba(232,238,252,0.72)",
+                whiteSpace: isPhoneViewport ? "normal" : "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              {oversText} ov{isPhoneViewport && context ? ` • ${context}` : ""}
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {displayBadges.map((badge) => (
+              <span
+                key={badge}
+                style={{
+                  padding: "2px 7px",
+                  borderRadius: 999,
+                  fontSize: 10,
+                  fontWeight: 900,
+                  border: "1px solid rgba(255,255,255,0.12)",
+                  background: "rgba(255,255,255,0.06)",
+                  color: "#e8eefc",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {badge}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        {isPhoneViewport ? (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 6 }}>
+            {[
+              { label: "Bat", value: strikerLabel },
+              { label: "Bowl", value: bowlerLabel },
+            ].map((item) => (
+              <div
+                key={item.label}
+                style={{
+                  minWidth: 0,
+                  borderRadius: 11,
+                  border: "1px solid rgba(255,255,255,0.10)",
+                  background: "rgba(255,255,255,0.05)",
+                  padding: "6px 8px",
+                }}
+              >
+                <div style={{ fontSize: 10, fontWeight: 900, color: "rgba(232,238,252,0.62)" }}>{item.label}</div>
+                <div
+                  style={{
+                    marginTop: 3,
+                    minWidth: 0,
+                    fontSize: 11,
+                    fontWeight: 900,
+                    color: "#e8eefc",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {item.value}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 10, alignItems: "center" }}>
+            <div style={{ minWidth: 0, fontSize: 11, color: "rgba(232,238,252,0.74)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {strikerLabel} | {bowlerLabel}
+            </div>
+            <div style={{ fontSize: 11, color: "rgba(232,238,252,0.68)", fontWeight: 800 }}>{context}</div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -186,6 +340,7 @@ export default function ScoreView() {
   const [innings2LegalForResult, setInnings2LegalForResult] = useState(0);
 
   const [balls, setBalls] = useState([]);
+  const [sessionEvents, setSessionEvents] = useState([]);
   const [battingPlayers, setBattingPlayers] = useState([]);
   const [bowlingPlayers, setBowlingPlayers] = useState([]);
 
@@ -228,6 +383,7 @@ export default function ScoreView() {
   const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
   const [pendingEvents, setPendingEvents] = useState([]);
   const [isFlushingQueue, setIsFlushingQueue] = useState(false);
+  const [pendingSyncRetryTick, setPendingSyncRetryTick] = useState(0);
   const [lockReady, setLockReady] = useState(false);
   const [scoringLocked, setScoringLocked] = useState(false);
   const [activeScorerSession, setActiveScorerSession] = useState(null);
@@ -236,6 +392,16 @@ export default function ScoreView() {
   const [claimingScorerRole, setClaimingScorerRole] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
   const [ownershipRefreshKey, setOwnershipRefreshKey] = useState(0);
+  const [reopenedForContinuation, setReopenedForContinuation] = useState(false);
+  const [liveOutcomeBadge, setLiveOutcomeBadge] = useState(null);
+  const [saveFeedbackBadge, setSaveFeedbackBadge] = useState(null);
+  const [isCompactViewport, setIsCompactViewport] = useState(
+    typeof window !== "undefined" ? window.innerWidth <= 860 : false
+  );
+  const [isPhoneViewport, setIsPhoneViewport] = useState(
+    typeof window !== "undefined" ? window.innerWidth <= 720 : false
+  );
+  const [showStickyScoreHeader, setShowStickyScoreHeader] = useState(false);
 
   const ballsRef = useRef([]);
   const inningsRef = useRef(null);
@@ -244,9 +410,15 @@ export default function ScoreView() {
   const strikerTurnRef = useRef(1);
   const nonStrikerTurnRef = useRef(1);
   const bowlerIdRef = useRef("");
+  const reopenedForContinuationRef = useRef(false);
   const pendingEventsRef = useRef([]);
   const savingRef = useRef(false);
   const flushingQueueRef = useRef(false);
+  const pendingSyncRetryTimerRef = useRef(null);
+  const latestOutcomeBallKeyRef = useRef("");
+  const liveOutcomeBadgeTimerRef = useRef(null);
+  const saveFeedbackTimerRef = useRef(null);
+  const scoreHeroRef = useRef(null);
   const matchSnapshotScope = fixtureId || canonicalFixtureId || matchId || "unknown";
   const persistenceScope = clientSessionId || "shared";
 
@@ -268,10 +440,74 @@ export default function ScoreView() {
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const handleResize = () => {
+      setIsCompactViewport(window.innerWidth <= 860);
+      setIsPhoneViewport(window.innerWidth <= 720);
+    };
+
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (!isCompactViewport || loading || startupLoading) {
+      setShowStickyScoreHeader(false);
+      return undefined;
+    }
+
+    const heroEl = scoreHeroRef.current;
+    if (!heroEl || typeof window === "undefined") return undefined;
+
+    if ("IntersectionObserver" in window) {
+      const observer = new IntersectionObserver(
+        ([entry]) => {
+          setShowStickyScoreHeader(!entry.isIntersecting);
+        },
+        { threshold: 0.2 }
+      );
+      observer.observe(heroEl);
+      return () => observer.disconnect();
+    }
+
+    const onScroll = () => {
+      const rect = heroEl.getBoundingClientRect();
+      setShowStickyScoreHeader(rect.bottom < 96);
+    };
+
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, [isCompactViewport, loading, startupLoading]);
+
+  const displaySessionEvents = useMemo(() => {
+    const merged = new Map();
+
+    (sessionEvents || []).forEach((event) => {
+      if (event?.event_id) merged.set(event.event_id, event);
+    });
+
+    (pendingEvents || []).forEach((event) => {
+      if (!event?.event_id) return;
+      if (innings?.id && event.innings_id !== innings.id) return;
+      merged.set(event.event_id, event);
+    });
+
+    return [...merged.values()];
+  }, [innings?.id, pendingEvents, sessionEvents]);
+
+  const displayBalls = useMemo(() => materializeAdministrativeStateBalls({
+    balls,
+    sessionEvents: displaySessionEvents,
+  }), [balls, displaySessionEvents]);
+
   // CURRENT innings totals
-  const totalRuns = useMemo(() => sumRuns(balls), [balls]);
-  const wickets = useMemo(() => sumWkts(balls), [balls]);
-  const legalBalls = useMemo(() => legalBallsCount(balls), [balls]);
+  const totalRuns = useMemo(() => sumRuns(displayBalls), [displayBalls]);
+  const wickets = useMemo(() => sumWkts(displayBalls), [displayBalls]);
+  const legalBalls = useMemo(() => legalBallsCount(displayBalls), [displayBalls]);
 
   const oversLimit = useMemo(() => {
     const v = toInt(match?.overs_limit, 20);
@@ -366,10 +602,14 @@ export default function ScoreView() {
   const allOut = useMemo(() => wickets >= wicketCap, [wickets, wicketCap]);
   const oversDone = useMemo(() => legalBalls >= maxLegal, [legalBalls, maxLegal]);
   const chaseComplete = useMemo(() => {
-    if (inningsNo !== 2) return false;
-    if (!(innings1Row?.completed || innings1Legal > 0)) return false;
-    return totalRuns >= (innings1Runs + 1);
-  }, [innings1Legal, innings1Row?.completed, innings1Runs, inningsNo, totalRuns]);
+    return isChaseCompleteForScoring({
+      inningsNo,
+      innings1Ready: !!innings1Row?.completed || innings1Legal > 0,
+      innings1Runs,
+      totalRuns,
+      reopenedForContinuation,
+    });
+  }, [innings1Legal, innings1Row?.completed, innings1Runs, inningsNo, reopenedForContinuation, totalRuns]);
   const inningsCompletedFlag = useMemo(() => !!innings?.completed, [innings]);
   const inningsComplete = useMemo(
     () => oversDone || allOut || chaseComplete || inningsCompletedFlag,
@@ -377,16 +617,36 @@ export default function ScoreView() {
   );
 
   const nextPos = useMemo(() => computeNextPosition(balls), [balls]);
+  const latestCompetitiveBall = useMemo(() => [...displayBalls].reverse().find((ball) => !isAdministrativeBall(ball)) || null, [displayBalls]);
+  const currentOverSummary = useMemo(() => selectCurrentOverSummary(displayBalls), [displayBalls]);
 
   const lastOverBowlerId = useMemo(() => {
-    const competitive = [...balls].reverse().find((b) => !isAdministrativeBall(b));
+    const competitive = [...displayBalls].reverse().find((b) => !isAdministrativeBall(b));
     return competitive?.bowler_id || "";
-  }, [balls]);
+  }, [displayBalls]);
 
   const currentRR = useMemo(() => {
     if (legalBalls <= 0) return "0.00";
     return (totalRuns / (legalBalls / 6)).toFixed(2);
   }, [legalBalls, totalRuns]);
+
+  const ballTokenStyle = (ball) => {
+    const tone = describeBallOutcomeBadge(ball)?.tone;
+
+    if (tone === "wicket") {
+      return { background: "#b91c1c", color: "#fff7f7", border: "1px solid rgba(254,202,202,0.22)" };
+    }
+    if (tone === "boundary") {
+      return { background: "rgba(22,163,74,0.94)", color: "#f0fdf4", border: "1px solid rgba(187,247,208,0.22)" };
+    }
+    if (tone === "extra") {
+      return { background: "rgba(37,99,235,0.94)", color: "#eff6ff", border: "1px solid rgba(191,219,254,0.22)" };
+    }
+    if (tone === "dot") {
+      return { background: "rgba(71,85,105,0.68)", color: "#f8fafc", border: "1px solid rgba(203,213,225,0.18)" };
+    }
+    return { background: "rgba(255,255,255,0.08)", color: "#f8fafc", border: "1px solid rgba(255,255,255,0.12)" };
+  };
 
   const target = useMemo(() => (inningsNo === 2 ? innings1Runs + 1 : null), [inningsNo, innings1Runs]);
   const ballsRemaining = useMemo(() => Math.max(0, maxLegal - legalBalls), [maxLegal, legalBalls]);
@@ -558,9 +818,9 @@ useEffect(() => {
 
 
   // ✅ FIX: dismissal counts MUST use dismissed_player_id (not striker_id)
-const dismissalsByBatter = useMemo(() => {
+const battingExitsByBatter = useMemo(() => {
   const map = new Map();
-  balls.forEach((b) => {
+  displayBalls.forEach((b) => {
     if (b.wicket && b.dismissed_player_id) {
       map.set(
         b.dismissed_player_id,
@@ -569,12 +829,23 @@ const dismissalsByBatter = useMemo(() => {
     }
   });
   return map;
-}, [balls]);
+}, [displayBalls]);
 
-  
-// Bat-twice rule helper:
-// batting_turn is tracked per STRIKER appearance in balls.batting_turn (1 = first time batting in this innings, 2 = second, etc.)
-const getTurnFor = (playerId) => (playerId ? (dismissalsByBatter.get(playerId) || 0) + 1 : 1);
+const dismissalsByBatter = useMemo(() => {
+  const map = new Map();
+  displayBalls.forEach((b) => {
+    if (!isBattingSideWicket(b) || !b.dismissed_player_id) return;
+    map.set(
+      b.dismissed_player_id,
+      (map.get(b.dismissed_player_id) || 0) + 1
+    );
+  });
+  return map;
+}, [displayBalls]);
+
+// batting_turn is tracked per appearance. Retired hurt advances the next stint
+// if a batter returns later, but should not render as a dismissal.
+const getTurnFor = (playerId) => (playerId ? (battingExitsByBatter.get(playerId) || 0) + 1 : 1);
 
 const setStrikerSelection = (playerId) => {
   setStrikerId(playerId || "");
@@ -664,30 +935,40 @@ const applyStoredScorerState = (state) => {
 
 const loadCanonicalRecoveryState = async (resolvedMatchId, resolvedInningsId) => {
   if (!resolvedMatchId || !resolvedInningsId || !isOnline) {
-    return { recoveryState: null, stateInvalidated: false, missing: false };
+    return { recoveryState: null, stateInvalidated: false, reopenedForContinuation: false, missing: false };
   }
 
-  const { data, error } = await supabase.rpc("get_innings_recovery_state", {
-    p_match_id: resolvedMatchId,
-    p_innings_id: resolvedInningsId,
-  });
+  const [{ data, error }, { data: reopenData, error: reopenError }] = await Promise.all([
+    supabase.rpc("get_innings_recovery_state", {
+      p_match_id: resolvedMatchId,
+      p_innings_id: resolvedInningsId,
+    }),
+    supabase.rpc("get_innings_reopen_status", {
+      p_match_id: resolvedMatchId,
+      p_innings_id: resolvedInningsId,
+    }),
+  ]);
 
   if (error) {
     if (isMissingRpcError(error)) {
-      return { recoveryState: null, stateInvalidated: false, missing: true };
+      return { recoveryState: null, stateInvalidated: false, reopenedForContinuation: false, missing: true };
     }
 
     if (isNetworkLikeError(error)) {
-      return { recoveryState: null, stateInvalidated: false, missing: false };
+      return { recoveryState: null, stateInvalidated: false, reopenedForContinuation: false, missing: false };
     }
 
     setErr(`Recovery state error: ${error.message}`);
-    return { recoveryState: null, stateInvalidated: false, missing: false };
+    return { recoveryState: null, stateInvalidated: false, reopenedForContinuation: false, missing: false };
   }
+
+  const reopenedForContinuation =
+    !reopenError && reopenData?.reopened_for_continuation === true;
 
   return {
     recoveryState: data?.recovery_state && typeof data.recovery_state === "object" ? data.recovery_state : null,
     stateInvalidated: data?.state_invalidated === true,
+    reopenedForContinuation,
     missing: false,
   };
 };
@@ -769,6 +1050,7 @@ const restoreSnapshot = (snapshot) => {
   setNeedsNextBowler(!!snapshot.needsNextBowler);
   setLockReady(!!snapshot.lockReady);
   setLockFeatureAvailable(snapshot.lockFeatureAvailable !== false);
+  setReopenedForContinuation(!!snapshot.reopenedForContinuation);
   setPendingEvents(Array.isArray(snapshot.pendingEvents) ? snapshot.pendingEvents : readStoredPendingQueue(snapshot.matchId));
   setInfo("Offline snapshot restored. Pending scoring changes will sync when the connection returns.");
   return true;
@@ -793,7 +1075,7 @@ const reconcileLatestEditSelections = ({
   return resolution;
 };
 
-const applyOptimisticEventState = (event) => {
+  const applyOptimisticEventState = (event) => {
   const nextState = applyEventOptimistically({
     balls: ballsRef.current,
     innings: inningsRef.current,
@@ -809,6 +1091,61 @@ const applyOptimisticEventState = (event) => {
   inningsRef.current = nextState.innings;
 
   return nextState;
+};
+
+const clearPendingSyncRetry = () => {
+  if (pendingSyncRetryTimerRef.current) {
+    window.clearTimeout(pendingSyncRetryTimerRef.current);
+    pendingSyncRetryTimerRef.current = null;
+  }
+};
+
+const schedulePendingSyncRetry = () => {
+  if (pendingSyncRetryTimerRef.current || !pendingEventsRef.current.length) return;
+
+  pendingSyncRetryTimerRef.current = window.setTimeout(() => {
+    pendingSyncRetryTimerRef.current = null;
+    setPendingSyncRetryTick((value) => value + 1);
+  }, PENDING_SYNC_RETRY_DELAY_MS);
+};
+
+const clearLiveOutcomeBadge = () => {
+  if (liveOutcomeBadgeTimerRef.current) {
+    window.clearTimeout(liveOutcomeBadgeTimerRef.current);
+    liveOutcomeBadgeTimerRef.current = null;
+  }
+};
+
+const showLiveOutcomeBadge = (outcome) => {
+  if (!outcome) return;
+  clearLiveOutcomeBadge();
+  setLiveOutcomeBadge(outcome);
+  liveOutcomeBadgeTimerRef.current = window.setTimeout(() => {
+    liveOutcomeBadgeTimerRef.current = null;
+    setLiveOutcomeBadge(null);
+  }, LIVE_OUTCOME_BADGE_DURATION_MS);
+};
+
+const clearSaveFeedbackBadge = () => {
+  if (saveFeedbackTimerRef.current) {
+    window.clearTimeout(saveFeedbackTimerRef.current);
+    saveFeedbackTimerRef.current = null;
+  }
+};
+
+const showSaveFeedbackBadge = (badge) => {
+  if (!badge) return;
+  clearSaveFeedbackBadge();
+  setSaveFeedbackBadge(badge);
+
+  if (badge.tone === "success" && typeof navigator !== "undefined" && typeof navigator.vibrate === "function") {
+    navigator.vibrate(12);
+  }
+
+  saveFeedbackTimerRef.current = window.setTimeout(() => {
+    saveFeedbackTimerRef.current = null;
+    setSaveFeedbackBadge(null);
+  }, SAVE_FEEDBACK_DURATION_MS);
 };
 
 const applyServerEventState = (event, result) => {
@@ -927,9 +1264,20 @@ const applySessionEvent = async (
 };
 
 const flushPendingQueue = async () => {
-  if (!matchId || !isOnline || !pendingEventsRef.current.length || flushingQueueRef.current) return;
-  if (lockFeatureAvailable && scoringLocked) return;
+  if (
+    !canAutoFlushPendingQueue({
+      matchId,
+      isOnline,
+      pendingCount: pendingEventsRef.current.length,
+      lockFeatureAvailable,
+      scoringLocked,
+      isFlushing: flushingQueueRef.current,
+    })
+  ) {
+    return;
+  }
 
+  clearPendingSyncRetry();
   flushingQueueRef.current = true;
   setIsFlushingQueue(true);
 
@@ -945,7 +1293,10 @@ const flushPendingQueue = async () => {
       });
 
       if (error) {
-        if (isNetworkLikeError(error)) break;
+        if (isNetworkLikeError(error)) {
+          schedulePendingSyncRetry();
+          break;
+        }
         if (isLockConflictError(error)) {
           setScoringLocked(true);
           setErr("Pending scoring changes could not sync because another scorer session now holds the match lock.");
@@ -958,11 +1309,13 @@ const flushPendingQueue = async () => {
 
         const message = String(error?.message || error || "");
         if (isAuthoritativeScoringRejection(error)) {
+          clearPendingSyncRetry();
           const nextQueue = removePendingEventsForInnings(pendingEventsRef.current, event.innings_id);
           setPendingEvents(nextQueue);
           await reloadCurrentInningsState(event.innings_id);
           if (event.innings_id === inningsRef.current?.id) {
             const recovery = await loadCanonicalRecoveryState(matchId, event.innings_id);
+            setReopenedForContinuation(!!recovery.reopenedForContinuation);
             const scorerState = restorePreferredScorerState({
               inningsId: event.innings_id,
               recoveryState: recovery.recoveryState,
@@ -981,6 +1334,7 @@ const flushPendingQueue = async () => {
           break;
         }
 
+        clearPendingSyncRetry();
         setErr(`Pending sync failed: ${message}`);
         break;
       }
@@ -1168,6 +1522,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       setLoading(true);
       setErr("");
       setInfo("");
+      setSessionEvents([]);
 
       const m = await supabase
         .from("matches")
@@ -1392,6 +1747,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
 
           setInnings(restoredState.innings || storedSnapshot.innings || inn.data);
           setBalls(restoredState.balls);
+          setSessionEvents([]);
           setInfo("Offline snapshot restored for this innings. Pending events will sync when the network returns.");
           setStartupLoading(false);
           setLoading(false);
@@ -1413,8 +1769,12 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       const sorted = sortBallsByPosition(restoredState.balls || []);
       setInnings(restoredState.innings || inn.data);
       setBalls(sorted);
+      const appliedEvents = await loadAppliedSessionEvents({ matchId, inningsId: inn.data.id });
+      if (!alive) return;
+      setSessionEvents(appliedEvents);
       const recovery = await loadCanonicalRecoveryState(matchId, inn.data.id);
       if (!alive) return;
+      setReopenedForContinuation(!!recovery.reopenedForContinuation);
 
       /* Do not reopen innings implicitly from the client.
       if (inn.data?.completed && sorted.length === 0) {
@@ -1470,6 +1830,15 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
             setBalls((prev) => mergeBallIntoList(prev, payload.new));
           }
         )
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "match_session_events", filter: `innings_id=eq.${inn.data.id}` },
+          async () => {
+            const nextEvents = await loadAppliedSessionEvents({ matchId, inningsId: inn.data.id });
+            if (!alive) return;
+            setSessionEvents(nextEvents);
+          }
+        )
         .subscribe();
 
       setStartupLoading(false);
@@ -1485,9 +1854,9 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
   useEffect(() => {
     if (!innings) return;
 
-    const runs = sumRuns(balls);
-    const wkts = sumWkts(balls);
-    const legal = legalBallsCount(balls);
+    const runs = sumRuns(displayBalls);
+    const wkts = sumWkts(displayBalls);
+    const legal = legalBallsCount(displayBalls);
 
     if (innings.innings_no === 1) {
       setInnings1Row(innings);
@@ -1503,7 +1872,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       setInnings2WktsForResult(wkts);
       setInnings2LegalForResult(legal);
     }
-  }, [balls, innings]);
+  }, [displayBalls, innings]);
 
   useEffect(() => {
     ballsRef.current = balls;
@@ -1512,6 +1881,16 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
   useEffect(() => {
     inningsRef.current = innings;
   }, [innings]);
+
+  useEffect(() => {
+    if (innings?.innings_no !== 2 || innings?.completed) {
+      setReopenedForContinuation(false);
+    }
+  }, [innings?.completed, innings?.innings_no, matchId]);
+
+  useEffect(() => {
+    reopenedForContinuationRef.current = reopenedForContinuation;
+  }, [reopenedForContinuation]);
 
   useEffect(() => {
     strikerIdRef.current = strikerId;
@@ -1523,6 +1902,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
 
   useEffect(() => {
     pendingEventsRef.current = pendingEvents;
+    if (!pendingEvents.length) clearPendingSyncRetry();
     if (matchId) {
       writePendingEvents(matchId, pendingEvents, persistenceScope);
     }
@@ -1534,7 +1914,10 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
+    const handleOffline = () => {
+      clearPendingSyncRetry();
+      setIsOnline(false);
+    };
 
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
@@ -1574,6 +1957,7 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
       lockReady,
       lockFeatureAvailable,
       pendingEvents,
+      reopenedForContinuation,
     }, persistenceScope);
   }, [
     balls,
@@ -1601,9 +1985,39 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
     lockFeatureAvailable,
     lockReady,
     pendingEvents,
+    reopenedForContinuation,
     strikerId,
     strikerTurn,
   ]);
+
+  useEffect(() => {
+    return () => {
+      clearPendingSyncRetry();
+      clearLiveOutcomeBadge();
+      clearSaveFeedbackBadge();
+    };
+  }, []);
+
+  useEffect(() => {
+    const nextKey = latestCompetitiveBall
+      ? String(latestCompetitiveBall.id || latestCompetitiveBall.source_event_id || latestCompetitiveBall.local_temp_id || `${latestCompetitiveBall.over_no}.${latestCompetitiveBall.delivery_in_over}`)
+      : "";
+
+    if (!nextKey) {
+      latestOutcomeBallKeyRef.current = "";
+      return;
+    }
+
+    if (!latestOutcomeBallKeyRef.current) {
+      latestOutcomeBallKeyRef.current = nextKey;
+      return;
+    }
+
+    if (latestOutcomeBallKeyRef.current === nextKey) return;
+
+    latestOutcomeBallKeyRef.current = nextKey;
+    showLiveOutcomeBadge(describeBallOutcomeBadge(latestCompetitiveBall));
+  }, [latestCompetitiveBall]);
 
   useEffect(() => {
     if (!matchId || !lockFeatureAvailable || !isOnline) return;
@@ -1648,9 +2062,20 @@ const clearLocalMatchState = (resolvedMatchId = matchId) => {
   }, [clientSessionId, lockFeatureAvailable, lockReady, matchId]);
 
   useEffect(() => {
-    if (!isOnline || !pendingEvents.length) return;
+    if (
+      !canAutoFlushPendingQueue({
+        matchId,
+        isOnline,
+        pendingCount: pendingEvents.length,
+        lockFeatureAvailable,
+        scoringLocked,
+        isFlushing: isFlushingQueue,
+      })
+    ) {
+      return;
+    }
     flushPendingQueue();
-  }, [isOnline, pendingEvents.length, matchId, lockFeatureAvailable, lockReady, scoringLocked]);
+  }, [isFlushingQueue, isOnline, lockFeatureAvailable, lockReady, matchId, pendingEvents.length, pendingSyncRetryTick, scoringLocked]);
 
   useEffect(() => {
     if (!matchId || !innings?.id) return;
@@ -1716,10 +2141,16 @@ const battingScorecardRows = useMemo(() => {
   };
 
   // Preserve natural order from balls + current crease.
-  balls.forEach((b) => {
+  const exitsSeen = new Map();
+  displayBalls.forEach((b) => {
     pushAppearance(b.striker_id, b.batting_turn || 1);
-    // Note: non-striker turn is not stored on the ball; we'll infer their current turn from dismissals map if needed.
-    pushAppearance(b.non_striker_id, (dismissalsByBatter.get(b.non_striker_id) || 0) + 1);
+    pushAppearance(b.non_striker_id, (exitsSeen.get(b.non_striker_id) || 0) + 1);
+
+    if (b.wicket && b.dismissed_player_id) {
+      const nextExit = (exitsSeen.get(b.dismissed_player_id) || 0) + 1;
+      exitsSeen.set(b.dismissed_player_id, nextExit);
+      pushAppearance(b.dismissed_player_id, nextExit);
+    }
   });
 
   // Ensure current crease stints are always included.
@@ -1730,7 +2161,7 @@ const battingScorecardRows = useMemo(() => {
     const p = battingPlayers.find((x) => x.id === ap.playerId);
     if (!p) continue;
 
-    const facedAsStriker = balls.filter((b) => b.striker_id === ap.playerId && toInt(b.batting_turn, 1) === ap.turn);
+    const facedAsStriker = displayBalls.filter((b) => b.striker_id === ap.playerId && toInt(b.batting_turn, 1) === ap.turn);
     const ballsFaced = facedAsStriker.filter((b) => didBatterFaceBall(b)).length;
     const runs = facedAsStriker.reduce((acc, b) => acc + (b.runs_off_bat || 0), 0);
     const fours = facedAsStriker.filter((b) => (b.runs_off_bat || 0) === 4).length;
@@ -1741,15 +2172,14 @@ const battingScorecardRows = useMemo(() => {
       (ap.playerId === strikerId && ap.turn === strikerTurn) || (ap.playerId === nonStrikerId && ap.turn === nonStrikerTurn);
 
     const dismissals = dismissalsByBatter.get(ap.playerId) || 0;
-    const stintOut = dismissals >= ap.turn && !atCreaseThisStint;
+    const batterStatus = selectBatterStatus({
+      balls: displayBalls,
+      playerId: ap.playerId,
+      turn: ap.turn,
+      isAtCrease: atCreaseThisStint,
+    });
 
-    const status = atCreaseThisStint
-      ? "Not out"
-      : stintOut
-        ? "Out x1"
-        : ballsFaced > 0
-          ? "Not out"
-          : "—";
+    const status = batterStatus.label;
 
     rows.push({
       key: `${ap.playerId}:${ap.turn}`,
@@ -1764,12 +2194,13 @@ const battingScorecardRows = useMemo(() => {
       isAtCrease: atCreaseThisStint,
       dismissals,
       status,
+      statusTone: batterStatus.tone,
     });
   }
 
   // Only show stints that have started or are currently at the crease.
   return rows.filter((r) => r.isAtCrease || r.balls > 0);
-}, [battingPlayers, balls, strikerId, nonStrikerId, strikerTurn, nonStrikerTurn, dismissalsByBatter]);
+}, [battingPlayers, displayBalls, strikerId, nonStrikerId, strikerTurn, nonStrikerTurn, dismissalsByBatter]);
 
   const canScoreLegacy = () => {
     if (!innings?.id) return { ok: false, msg: "Innings not loaded." };
@@ -1811,9 +2242,13 @@ const battingScorecardRows = useMemo(() => {
     const currentNextPos = computeNextPosition(currentBalls);
     const currentLastOverBowlerId = currentBalls[currentBalls.length - 1]?.bowler_id || "";
     const currentChaseComplete =
-      currentInnings?.innings_no === 2 &&
-      !!innings1Row?.completed &&
-      sumRuns(currentBalls) >= (toInt(innings1Runs, 0) + 1);
+      isChaseCompleteForScoring({
+        inningsNo: currentInnings?.innings_no || 1,
+        innings1Ready: !!innings1Row?.completed,
+        innings1Runs,
+        totalRuns: sumRuns(currentBalls),
+        reopenedForContinuation: reopenedForContinuationRef.current,
+      });
     const currentInningsComplete =
       legalBallsCount(currentBalls) >= maxLegal
       || sumWkts(currentBalls) >= wicketCap
@@ -1908,10 +2343,7 @@ const battingScorecardRows = useMemo(() => {
         }
       }
 
-      const prevDismissals = currentStrikerId
-        ? currentBalls.filter((ball) => ball.wicket && ball.dismissed_player_id === currentStrikerId).length
-        : 0;
-      const batting_turn = prevDismissals + 1;
+      const batting_turn = getTurnFor(currentStrikerId);
 
       const payload = {
         match_id: matchId,
@@ -1962,9 +2394,13 @@ const battingScorecardRows = useMemo(() => {
       const projectedWickets = sumWkts(nextBalls);
       const projectedLegalBalls = legalBallsCount(nextBalls);
       const projectedChaseComplete =
-        currentInnings?.innings_no === 2 &&
-        !!innings1Row?.completed &&
-        projectedRuns >= (toInt(innings1Runs, 0) + 1);
+        isChaseCompleteForScoring({
+          inningsNo: currentInnings?.innings_no || 1,
+          innings1Ready: !!innings1Row?.completed,
+          innings1Runs,
+          totalRuns: projectedRuns,
+          reopenedForContinuation: reopenedForContinuationRef.current,
+        });
       const projectedInningsComplete =
         projectedLegalBalls >= maxLegal ||
         projectedWickets >= wicketCap ||
@@ -2000,10 +2436,16 @@ const battingScorecardRows = useMemo(() => {
         },
       };
 
-      await applySessionEvent(event, {
+      const saveResult = await applySessionEvent(event, {
         failurePrefix: "Ball save",
         successInfo: "Saved.",
       });
+
+      showSaveFeedbackBadge(
+        saveResult.queued
+          ? { label: "Queued offline", tone: "queued" }
+          : { label: "Saved", tone: "success" }
+      );
 
       if (!payload.wicket) {
         setStrikerSelection(postState.striker_id || "");
@@ -2201,9 +2643,13 @@ const battingScorecardRows = useMemo(() => {
     const projectedWickets = sumWkts(nextBalls);
     const projectedRuns = sumRuns(nextBalls);
     const projectedChaseComplete =
-      currentInnings?.innings_no === 2 &&
-      !!innings1Row?.completed &&
-      projectedRuns >= (toInt(innings1Runs, 0) + 1);
+      isChaseCompleteForScoring({
+        inningsNo: currentInnings?.innings_no || 1,
+        innings1Ready: !!innings1Row?.completed,
+        innings1Runs,
+        totalRuns: projectedRuns,
+        reopenedForContinuation: reopenedForContinuationRef.current,
+      });
     const projectedInningsComplete =
       projectedLegalBalls >= maxLegal ||
       projectedWickets >= wicketCap ||
@@ -2296,6 +2742,7 @@ const battingScorecardRows = useMemo(() => {
         }
       );
       setInfo("Innings ended ✅");
+      setReopenedForContinuation(false);
       if (inningsNo === 1) {
         setInningsNo(2);
       }
@@ -2334,6 +2781,7 @@ const battingScorecardRows = useMemo(() => {
         }
       );
       setInfo("Innings reopened ✅");
+      setReopenedForContinuation(innings?.innings_no === 2);
     } catch {
       return;
     } finally {
@@ -2446,13 +2894,53 @@ You can then start scoring again from ball 1.`
     return bowlingOverviewRows.find((r) => r.id === bowlerId) || null;
   }, [bowlingOverviewRows, bowlerId]);
 
+  const currentStrikerRow = useMemo(
+    () => battingScorecardRows.find((row) => row.id === strikerId && row.turn === strikerTurn) || null,
+    [battingScorecardRows, strikerId, strikerTurn]
+  );
+  const currentNonStrikerRow = useMemo(
+    () => battingScorecardRows.find((row) => row.id === nonStrikerId && row.turn === nonStrikerTurn) || null,
+    [battingScorecardRows, nonStrikerId, nonStrikerTurn]
+  );
+  const scorerQuickBadges = useMemo(() => {
+    const badges = [];
+
+    if (!isOnline) {
+      badges.push("Offline");
+    } else if (isFlushingQueue) {
+      badges.push("Syncing");
+    } else if (pendingEvents.length) {
+      badges.push(`${pendingEvents.length} queued`);
+    } else {
+      badges.push("Ready");
+    }
+
+    if (scoringLocked) badges.push("Locked");
+    if (innings?.completed) badges.push("Completed");
+
+    return badges;
+  }, [innings?.completed, isFlushingQueue, isOnline, pendingEvents.length, scoringLocked]);
+  const quickContextText = useMemo(() => {
+    if (inningsNo === 2) {
+      return `Need ${runsRemaining ?? 0} off ${ballsRemaining}`;
+    }
+    return `Innings ${inningsNo}`;
+  }, [ballsRemaining, inningsNo, runsRemaining]);
+  const primaryStrikerLabel = currentStrikerRow?.name || "Select striker";
+  const primaryBowlerLabel = currentBowlerRow?.name || "Select bowler";
+  const bottomDockReserve = isPhoneViewport
+    ? (keypadTab === "extras" ? 344 : 300)
+    : 288;
+
   const keyBtnStyle = {
-    padding: "14px 10px",
+    minHeight: isPhoneViewport ? 52 : 48,
+    padding: isPhoneViewport ? "14px 10px" : "12px 10px",
     borderRadius: 16,
     border: "1px solid rgba(255,255,255,0.14)",
     background: "rgba(255,255,255,0.06)",
     color: "#e8eefc",
     fontWeight: 900,
+    fontSize: isPhoneViewport ? 15 : 14,
     cursor: "pointer",
   };
 
@@ -2469,6 +2957,7 @@ You can then start scoring again from ball 1.`
 
   const selectStyle = {
     width: "100%",
+    minHeight: isPhoneViewport ? 46 : undefined,
     padding: 10,
     borderRadius: 12,
     background: "rgba(255,255,255,0.06)",
@@ -2487,6 +2976,7 @@ You can then start scoring again from ball 1.`
   };
 
   const modalBtnGhost = {
+    minHeight: 44,
     padding: "10px 12px",
     borderRadius: 12,
     background: "rgba(255,255,255,0.06)",
@@ -2497,6 +2987,7 @@ You can then start scoring again from ball 1.`
   };
 
   const modalBtnPrimary = {
+    minHeight: 44,
     padding: "10px 12px",
     borderRadius: 12,
     background: "rgba(255,255,255,0.10)",
@@ -2521,7 +3012,7 @@ You can then start scoring again from ball 1.`
           borderBottom: "1px solid rgba(255,255,255,0.08)",
         }}
       >
-        <div style={{ maxWidth: 980, margin: "0 auto", padding: "12px 14px", display: "flex", gap: 12, alignItems: "center" }}>
+        <div style={{ maxWidth: 980, margin: "0 auto", padding: isPhoneViewport ? "10px 12px" : "12px 14px", display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <Link to="/score" style={{ color: "#cfe0ff", textDecoration: "none", fontWeight: 700 }}>
             ← Scoring Home
           </Link>
@@ -2544,7 +3035,25 @@ You can then start scoring again from ball 1.`
         </div>
       </div>
 
-      <div style={{ maxWidth: 980, margin: "0 auto", padding: "14px 14px calc(260px + env(safe-area-inset-bottom))" }}>
+      <div
+        style={{
+          maxWidth: 980,
+          margin: "0 auto",
+          padding: `14px 14px calc(${bottomDockReserve}px + env(safe-area-inset-bottom))`,
+          scrollPaddingBottom: `calc(${bottomDockReserve}px + env(safe-area-inset-bottom))`,
+        }}
+      >
+        <ScorerStickyHeader
+          visible={showStickyScoreHeader}
+          score={`${totalRuns}/${wickets}`}
+          oversText={oversText}
+          context={quickContextText}
+          strikerLabel={primaryStrikerLabel}
+          bowlerLabel={primaryBowlerLabel}
+          badges={scorerQuickBadges}
+          isPhoneViewport={isPhoneViewport}
+        />
+
         {err && (
           <div
             style={{
@@ -2579,18 +3088,18 @@ You can then start scoring again from ball 1.`
           <div
             style={{
               marginTop: 10,
-              padding: 12,
+              padding: isPhoneViewport ? 11 : 12,
               borderRadius: 12,
               background: scorerStatusBanner.tone.background,
               border: scorerStatusBanner.tone.border,
               color: scorerStatusBanner.tone.color,
-              display: "flex",
+              display: isPhoneViewport ? "grid" : "flex",
               gap: 12,
               alignItems: "flex-start",
               flexWrap: "wrap",
             }}
           >
-            <div style={{ minWidth: 160 }}>
+            <div style={{ minWidth: isPhoneViewport ? 0 : 160 }}>
               <div style={{ fontWeight: 900 }}>{scorerStatusBanner.title}</div>
               <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
                 {scorerStatusBanner.badges.map((badge) => (
@@ -2622,17 +3131,17 @@ You can then start scoring again from ball 1.`
               ) : null}
             </div>
             {scorerAssignmentState === "unassigned" ? (
-              <button onClick={assignSelfAsScorer} disabled={claimingScorerRole || !isOnline} style={modalBtnGhost}>
+              <button onClick={assignSelfAsScorer} disabled={claimingScorerRole || !isOnline} style={{ ...modalBtnGhost, width: isPhoneViewport ? "100%" : undefined }}>
                 {claimingScorerRole ? "Assigning..." : "Assign myself"}
               </button>
             ) : null}
             {scorerAssignmentState === "assigned_elsewhere" ? (
-              <button onClick={takeOverScorerRole} disabled={claimingScorerRole || !isOnline} style={modalBtnGhost}>
+              <button onClick={takeOverScorerRole} disabled={claimingScorerRole || !isOnline} style={{ ...modalBtnGhost, width: isPhoneViewport ? "100%" : undefined }}>
                 {claimingScorerRole ? "Taking over..." : "Take over scoring"}
               </button>
             ) : null}
             {scorerAssignmentState === "mine" && scoringLocked ? (
-              <button onClick={takeScorerControl} disabled={takingControl || !isOnline} style={modalBtnGhost}>
+              <button onClick={takeScorerControl} disabled={takingControl || !isOnline} style={{ ...modalBtnGhost, width: isPhoneViewport ? "100%" : undefined }}>
                 {takingControl ? "Taking control..." : "Take control"}
               </button>
             ) : null}
@@ -2641,19 +3150,34 @@ You can then start scoring again from ball 1.`
 
         {/* Score header */}
         <div
+          ref={scoreHeroRef}
           style={{
             marginTop: 12,
-            padding: 14,
+            padding: isPhoneViewport ? 12 : 14,
             borderRadius: 16,
             border: "1px solid rgba(255,255,255,0.10)",
             background: "rgba(255,255,255,0.04)",
             boxShadow: "0 10px 30px rgba(0,0,0,0.25)",
+            position: "relative",
+            overflow: "hidden",
           }}
         >
+          {isPhoneViewport ? (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: liveOutcomeBadge || saveFeedbackBadge ? 10 : 0 }}>
+              <LiveOutcomeBadge outcome={liveOutcomeBadge} visible={!!liveOutcomeBadge} />
+              <LiveOutcomeBadge outcome={saveFeedbackBadge} visible={!!saveFeedbackBadge} style={{ minHeight: 30, fontSize: 11, letterSpacing: 0.3 }} />
+            </div>
+          ) : (
+            <div style={{ position: "absolute", top: 12, right: 12, display: "grid", gap: 8, justifyItems: "end", pointerEvents: "none" }}>
+              <LiveOutcomeBadge outcome={liveOutcomeBadge} visible={!!liveOutcomeBadge} />
+              <LiveOutcomeBadge outcome={saveFeedbackBadge} visible={!!saveFeedbackBadge} style={{ minHeight: 30, fontSize: 11, letterSpacing: 0.3 }} />
+            </div>
+          )}
+
           <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-            <div style={{ fontSize: 34, fontWeight: 900, letterSpacing: -0.5 }}>
+            <div style={{ fontSize: isPhoneViewport ? 38 : 34, fontWeight: 900, letterSpacing: -0.5, lineHeight: 1 }}>
               {totalRuns}/{wickets}
-              <span style={{ fontSize: 14, fontWeight: 700, marginLeft: 10, color: "rgba(232,238,252,0.75)" }}>
+              <span style={{ display: isPhoneViewport ? "block" : "inline", fontSize: 14, fontWeight: 700, marginLeft: isPhoneViewport ? 0 : 10, marginTop: isPhoneViewport ? 8 : 0, color: "rgba(232,238,252,0.75)" }}>
                 ({oversText} / {oversLimit} ov) • 7-ball overs rule • Wicket cap {displayWicketCap}
               </span>
             </div>
@@ -2689,7 +3213,41 @@ You can then start scoring again from ball 1.`
             </div>
           ) : null}
 
-          <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          {currentOverSummary?.balls?.length ? (
+            <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", fontSize: 12, color: "rgba(232,238,252,0.72)", fontWeight: 900 }}>
+                <span>This over</span>
+                <span>{formatOverSummaryText(currentOverSummary)}</span>
+              </div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {currentOverSummary.balls.map((ball) => {
+                  const toneStyle = ballTokenStyle(ball);
+                  return (
+                    <div
+                      key={ball.id || ball.source_event_id || ball.local_temp_id || `${ball.over_no}.${ball.delivery_in_over}`}
+                      style={{
+                        minWidth: isPhoneViewport ? 38 : 34,
+                        height: isPhoneViewport ? 38 : 34,
+                        padding: "0 10px",
+                        borderRadius: 999,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        fontWeight: 1000,
+                        fontSize: isPhoneViewport ? 14 : 13,
+                        ...toneStyle,
+                      }}
+                    >
+                      {formatBallOutcomeToken(ball)}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
+          <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
             <div style={{ fontWeight: 900, color: "rgba(232,238,252,0.75)" }}>Innings</div>
             <select
               value={inningsNo}
@@ -2712,12 +3270,14 @@ You can then start scoring again from ball 1.`
             ) : (
               <span style={{ fontWeight: 700, color: "rgba(232,238,252,0.65)" }}>Live scoring</span>
             )}
+            </div>
 
-            <div style={{ marginLeft: "auto", display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <div style={{ display: "grid", gridTemplateColumns: isPhoneViewport ? "repeat(2, minmax(0, 1fr))" : "repeat(2, max-content)", gap: 10, justifyContent: isPhoneViewport ? "stretch" : "end" }}>
               <button
                 onClick={resetMatchData}
                 disabled={saving}
                 style={{
+                  minHeight: 44,
                   padding: "10px 12px",
                   borderRadius: 12,
                   background: "rgba(239, 68, 68, 0.14)",
@@ -2732,7 +3292,7 @@ You can then start scoring again from ball 1.`
               </button>
 
               {innings?.completed ? (
-                <button onClick={reopenInnings} disabled={saving} style={modalBtnGhost}>
+                <button onClick={reopenInnings} disabled={saving} style={{ ...modalBtnGhost, width: "100%" }}>
                   Reopen innings
                 </button>
               ) : (
@@ -2740,6 +3300,7 @@ You can then start scoring again from ball 1.`
                   onClick={endInnings}
                   disabled={saving}
                   style={{
+                    minHeight: 44,
                     padding: "10px 12px",
                     borderRadius: 12,
                     background: "rgba(255, 204, 102, 0.14)",
@@ -2788,7 +3349,7 @@ You can then start scoring again from ball 1.`
 
                 return (
                   <div key={strike ? "striker" : "non"} style={{ padding: 12, borderRadius: 16, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(10,16,28,0.55)" }}>
-                    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "auto minmax(0, 1fr) auto", gap: 10, alignItems: "start" }}>
                       <div
                         title={strike ? "On strike" : ""}
                         style={{
@@ -2799,19 +3360,34 @@ You can then start scoring again from ball 1.`
                           boxShadow: strike ? "0 0 0 3px rgba(255,209,102,0.18)" : "none",
                         }}
                       />
-                      <div style={{ fontWeight: 900, fontSize: 16 }}>{name}</div>
-                      {id ? (
-                        <div style={{ marginLeft: 10, fontSize: 12, color: "rgba(232,238,252,0.70)", fontWeight: 900 }}>
-                          Turn {turn || 1}
+                      <div style={{ minWidth: 0, display: "grid", gap: 4 }}>
+                        <div
+                          style={{
+                            fontWeight: 900,
+                            fontSize: 16,
+                            minWidth: 0,
+                            display: "-webkit-box",
+                            WebkitLineClamp: isPhoneViewport ? 2 : 1,
+                            WebkitBoxOrient: "vertical",
+                            overflow: "hidden",
+                            lineHeight: 1.2,
+                          }}
+                        >
+                          {name}
                         </div>
-                      ) : null}
-                      <div style={{ marginLeft: "auto", fontWeight: 900, fontSize: 18 }}>
+                        {id ? (
+                          <div style={{ fontSize: 12, color: "rgba(232,238,252,0.70)", fontWeight: 900 }}>
+                            Turn {turn || 1}
+                          </div>
+                        ) : null}
+                      </div>
+                      <div style={{ textAlign: "right", fontWeight: 900, fontSize: 18 }}>
                         {runs}
                         <span style={{ fontSize: 12, color: "rgba(232,238,252,0.70)", marginLeft: 6 }}>({ballsF})</span>
                       </div>
                     </div>
 
-                    <div style={{ marginTop: 10, display: "flex", gap: 14, flexWrap: "wrap", color: "rgba(232,238,252,0.75)", fontSize: 12 }}>
+                    <div style={{ marginTop: 10, display: "flex", gap: isPhoneViewport ? 10 : 14, flexWrap: "wrap", color: "rgba(232,238,252,0.75)", fontSize: 12 }}>
                       <div>
                         SR <span style={{ fontWeight: 900, color: "#e8eefc" }}>{sr}</span>
                       </div>
@@ -2861,8 +3437,22 @@ You can then start scoring again from ball 1.`
 
             <div style={{ padding: 12, paddingTop: 0, display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 10 }}>
               <div style={{ padding: 12, borderRadius: 16, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(10,16,28,0.55)" }}>
-                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <div style={{ fontWeight: 900, fontSize: 16 }}>{currentBowlerRow?.name || "Select bowler"}</div>
+                <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                  <div
+                    style={{
+                      fontWeight: 900,
+                      fontSize: 16,
+                      minWidth: 0,
+                      flex: 1,
+                      display: "-webkit-box",
+                      WebkitLineClamp: isPhoneViewport ? 2 : 1,
+                      WebkitBoxOrient: "vertical",
+                      overflow: "hidden",
+                      lineHeight: 1.2,
+                    }}
+                  >
+                    {currentBowlerRow?.name || "Select bowler"}
+                  </div>
                   <div style={{ marginLeft: "auto", fontWeight: 900, fontSize: 14, color: "rgba(232,238,252,0.75)" }}>
                     {currentBowlerRow ? `${currentBowlerRow.oversText} ov` : ""}
                   </div>
@@ -2923,7 +3513,7 @@ You can then start scoring again from ball 1.`
                           setEditDismissedPlayerId(b.dismissed_player_id || "");
                           setEditOpen(true);
                         }}
-                        style={modalBtnGhost}
+                        style={{ ...modalBtnGhost, width: isPhoneViewport ? "100%" : undefined }}
                       >
                         Edit last
                       </button>
@@ -2945,7 +3535,7 @@ You can then start scoring again from ball 1.`
               Ball-by-ball
             </summary>
             <div style={{ padding: 12, paddingTop: 0 }}>
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(72px, 1fr))", gap: 10 }}>
                 {balls.slice(-18).reverse().map((b) => {
                   const label = isAdministrativeBall(b)
                     ? "RH"
@@ -2963,7 +3553,7 @@ You can then start scoring again from ball 1.`
                       key={b.id || b.local_temp_id}
                       title={`Over ${b.over_no}.${b.delivery_in_over}`}
                       style={{
-                        width: 76,
+                        width: "100%",
                         padding: "10px 8px",
                         borderRadius: 14,
                         textAlign: "center",
@@ -3003,9 +3593,75 @@ You can then start scoring again from ball 1.`
           background: "rgba(10,16,28,0.92)",
           borderTop: "1px solid rgba(255,255,255,0.10)",
           backdropFilter: "blur(10px)",
+          boxShadow: "0 -16px 32px rgba(0,0,0,0.28)",
         }}
       >
-        <div style={{ maxWidth: 980, margin: "0 auto", padding: "10px 12px" }}>
+        <div style={{ maxWidth: 980, margin: "0 auto", padding: "8px 10px calc(10px + env(safe-area-inset-bottom))", maxHeight: isPhoneViewport ? "58vh" : "none", overflowY: "auto" }}>
+          <div style={{ display: "grid", gap: 8, marginBottom: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start", flexWrap: "wrap" }}>
+              <div style={{ minWidth: 0, display: "grid", gap: 4 }}>
+                <div style={{ fontSize: isPhoneViewport ? 17 : 18, fontWeight: 1000, color: "#f8fafc" }}>
+                  {totalRuns}/{wickets}
+                  <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 800, color: "rgba(232,238,252,0.72)" }}>
+                    {oversText} ov
+                  </span>
+                </div>
+                <div style={{ fontSize: 11, color: "rgba(232,238,252,0.68)" }}>{quickContextText}</div>
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                {scorerQuickBadges.map((badge) => (
+                  <span
+                    key={badge}
+                    style={{
+                      padding: "3px 8px",
+                      borderRadius: 999,
+                      fontSize: 11,
+                      fontWeight: 900,
+                      border: "1px solid rgba(255,255,255,0.12)",
+                      background: "rgba(255,255,255,0.06)",
+                      color: "#e8eefc",
+                    }}
+                  >
+                    {badge}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <div style={{ display: isPhoneViewport ? "grid" : "flex", gridTemplateColumns: isPhoneViewport ? "repeat(2, minmax(0, 1fr))" : undefined, gap: 8, flexWrap: "wrap" }}>
+              {[
+                { label: "Striker", value: primaryStrikerLabel },
+                { label: "Bowler", value: primaryBowlerLabel },
+              ].map((item) => (
+                <div
+                  key={item.label}
+                  style={{
+                    minWidth: 0,
+                    borderRadius: 12,
+                    border: "1px solid rgba(255,255,255,0.10)",
+                    background: "rgba(255,255,255,0.04)",
+                    padding: "7px 9px",
+                  }}
+                >
+                  <div style={{ fontSize: 10, fontWeight: 900, color: "rgba(232,238,252,0.62)" }}>{item.label}</div>
+                  <div
+                    style={{
+                      marginTop: 3,
+                      fontSize: 12,
+                      fontWeight: 900,
+                      color: "#e8eefc",
+                      minWidth: 0,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {item.value}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
           <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
             {[
               ["runs", "RUNS"],
@@ -3017,6 +3673,7 @@ You can then start scoring again from ball 1.`
                 onClick={() => setKeypadTab(k)}
                 style={{
                   flex: 1,
+                  minHeight: 46,
                   padding: "10px 12px",
                   borderRadius: 14,
                   border: "1px solid rgba(255,255,255,0.14)",
@@ -3039,6 +3696,7 @@ You can then start scoring again from ball 1.`
                   onClick={() => addRun(n)}
                   disabled={saving || inningsComplete}
                   style={{
+                    minHeight: isPhoneViewport ? 56 : 50,
                     padding: "14px 10px",
                     borderRadius: 16,
                     border: "1px solid rgba(255,255,255,0.14)",
@@ -3058,7 +3716,7 @@ You can then start scoring again from ball 1.`
           {keypadTab === "extras" ? (
             <div style={{ display: "grid", gap: 12 }}>
               <div style={{ fontWeight: 900, opacity: 0.9 }}>WIDES (team only) • base = 2</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 10 }}>
+              <div style={{ display: "grid", gridTemplateColumns: isPhoneViewport ? "repeat(3,1fr)" : "repeat(5,1fr)", gap: 10 }}>
                 {[2, 3, 4, 5, 6].map((n) => (
                   <button key={`wd${n}`} onClick={() => addWide(n)} disabled={saving || inningsComplete} style={keyBtnStyle}>
                     {n}wd
@@ -3067,7 +3725,7 @@ You can then start scoring again from ball 1.`
               </div>
 
               <div style={{ fontWeight: 900, opacity: 0.9 }}>NO BALLS (1 run penalty + bat runs)</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(6,1fr)", gap: 10 }}>
+              <div style={{ display: "grid", gridTemplateColumns: isPhoneViewport ? "repeat(3,1fr)" : "repeat(6,1fr)", gap: 10 }}>
                 {[0, 1, 2, 3, 4, 6].map((n) => (
                   <button key={`nb${n}`} onClick={() => addNoBall(n)} disabled={saving || inningsComplete} style={keyBtnStyle}>
                     NB+{n}
@@ -3076,7 +3734,7 @@ You can then start scoring again from ball 1.`
               </div>
 
               <div style={{ fontWeight: 900, opacity: 0.9 }}>BYES (team only)</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 10 }}>
+              <div style={{ display: "grid", gridTemplateColumns: isPhoneViewport ? "repeat(3,1fr)" : "repeat(5,1fr)", gap: 10 }}>
                 {[1, 2, 3, 4, 5].map((n) => (
                   <button key={`b${n}`} onClick={() => addBye(n)} disabled={saving || inningsComplete} style={keyBtnStyle}>
                     {n}b
@@ -3085,7 +3743,7 @@ You can then start scoring again from ball 1.`
               </div>
 
               <div style={{ fontWeight: 900, opacity: 0.9 }}>LEG BYES (team only)</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 10 }}>
+              <div style={{ display: "grid", gridTemplateColumns: isPhoneViewport ? "repeat(3,1fr)" : "repeat(5,1fr)", gap: 10 }}>
                 {[1, 2, 3, 4, 5].map((n) => (
                   <button key={`lb${n}`} onClick={() => addLegBye(n)} disabled={saving || inningsComplete} style={keyBtnStyle}>
                     {n}lb
@@ -3101,6 +3759,7 @@ You can then start scoring again from ball 1.`
                 onClick={addWicket}
                 disabled={saving || inningsComplete}
                 style={{
+                  minHeight: 56,
                   padding: "16px 12px",
                   borderRadius: 18,
                   border: "1px solid rgba(255,120,120,0.40)",
@@ -3132,9 +3791,10 @@ You can then start scoring again from ball 1.`
             zIndex: 90,
             background: "rgba(0,0,0,0.55)",
             display: "flex",
-            alignItems: "center",
+            alignItems: isPhoneViewport ? "flex-end" : "center",
             justifyContent: "center",
-            padding: 14,
+            padding: isPhoneViewport ? "12px 12px calc(12px + env(safe-area-inset-bottom))" : 14,
+            overflowY: "auto",
           }}
         >
           <div
@@ -3142,10 +3802,12 @@ You can then start scoring again from ball 1.`
             style={{
               width: "100%",
               maxWidth: 520,
-              borderRadius: 18,
+              maxHeight: isPhoneViewport ? "min(78vh, calc(100vh - 24px - env(safe-area-inset-bottom)))" : "min(88vh, 760px)",
+              overflowY: "auto",
+              borderRadius: isPhoneViewport ? 20 : 18,
               border: "1px solid rgba(255,255,255,0.14)",
               background: "rgba(10,16,28,0.98)",
-              padding: 14,
+              padding: isPhoneViewport ? 12 : 14,
               boxShadow: "0 20px 60px rgba(0,0,0,0.50)",
             }}
           >
@@ -3198,7 +3860,7 @@ You can then start scoring again from ball 1.`
                     </select>
                   </div>
 
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: isPhoneViewport ? "1fr" : "1fr 1fr", gap: 10 }}>
                     <div>
                       <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Bat runs</div>
                       <input
@@ -3276,9 +3938,10 @@ You can then start scoring again from ball 1.`
             zIndex: 80,
             background: "rgba(0,0,0,0.55)",
             display: "flex",
-            alignItems: "center",
+            alignItems: isPhoneViewport ? "flex-end" : "center",
             justifyContent: "center",
-            padding: 14,
+            padding: isPhoneViewport ? "12px 12px calc(12px + env(safe-area-inset-bottom))" : 14,
+            overflowY: "auto",
           }}
         >
           <div
@@ -3286,10 +3949,12 @@ You can then start scoring again from ball 1.`
             style={{
               width: "100%",
               maxWidth: 520,
-              borderRadius: 18,
+              maxHeight: isPhoneViewport ? "min(78vh, calc(100vh - 24px - env(safe-area-inset-bottom)))" : "min(88vh, 760px)",
+              overflowY: "auto",
+              borderRadius: isPhoneViewport ? 20 : 18,
               border: "1px solid rgba(255,255,255,0.14)",
               background: "rgba(10,16,28,0.98)",
-              padding: 14,
+              padding: isPhoneViewport ? 12 : 14,
               boxShadow: "0 20px 60px rgba(0,0,0,0.50)",
             }}
           >
@@ -3300,7 +3965,7 @@ You can then start scoring again from ball 1.`
               </div>
             </div>
 
-            <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: isPhoneViewport ? "1fr" : "1fr 1fr", gap: 10 }}>
               <div>
                 <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Type</div>
                 <select value={editExtraType || ""} onChange={(e) => setEditExtraType(e.target.value || null)} style={modalSelectStyle}>

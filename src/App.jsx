@@ -1,17 +1,46 @@
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import { Routes, Route, Link, useNavigate } from "react-router-dom";
 import { supabase } from "./lib/supabase";
 
 import Home from "./pages/Home";
-import Teams from "./pages/Teams";
-import TeamRoster from "./pages/TeamRoster";
-import Fixtures from "./pages/Fixtures";
-import Leaderboards from "./pages/Leaderboards";
-import ScoreHome from "./pages/ScoreHome";
-import ScoreView from "./pages/ScoreView";
-import SpectatorView from "./views/SpectatorView";
-import Login from "./pages/Login";
-import MatchCentre from "./pages/MatchCentre";
+
+const Teams = lazy(() => import("./pages/Teams"));
+const TeamRoster = lazy(() => import("./pages/TeamRoster"));
+const Fixtures = lazy(() => import("./pages/Fixtures"));
+const Leaderboards = lazy(() => import("./pages/Leaderboards"));
+const ScoreHome = lazy(() => import("./pages/ScoreHome"));
+const ScoreView = lazy(() => import("./pages/ScoreView"));
+const SpectatorView = lazy(() => import("./views/SpectatorView"));
+const Login = lazy(() => import("./pages/Login"));
+const MatchCentre = lazy(() => import("./pages/MatchCentre"));
+
+function RouteLoadingFallback({ label = "Loading..." }) {
+  return (
+    <div
+      style={{
+        padding: "14px 16px",
+        borderRadius: 16,
+        border: "1px solid rgba(15,23,42,0.10)",
+        background: "linear-gradient(180deg, rgba(248,250,252,0.96), rgba(241,245,249,0.94))",
+        color: "#0f172a",
+        boxShadow: "0 10px 24px rgba(15,23,42,0.06)",
+      }}
+    >
+      <div style={{ fontSize: 14, fontWeight: 900 }}>{label}</div>
+      <div style={{ marginTop: 6, fontSize: 13, color: "rgba(15,23,42,0.65)" }}>
+        Preparing this view for mobile.
+      </div>
+    </div>
+  );
+}
+
+function renderLazyPage(element, label) {
+  return (
+    <Suspense fallback={<RouteLoadingFallback label={label} />}>
+      {element}
+    </Suspense>
+  );
+}
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -104,27 +133,27 @@ export default function App() {
 
       <Routes>
         <Route path="/" element={<Home />} />
-        <Route path="/fixtures" element={<Fixtures />} />
-        <Route path="/leaderboards" element={<Leaderboards />} />
-        <Route path="/teams" element={<Teams />} />
+        <Route path="/fixtures" element={renderLazyPage(<Fixtures />, "Loading fixtures...")} />
+        <Route path="/leaderboards" element={renderLazyPage(<Leaderboards />, "Loading leaderboards...")} />
+        <Route path="/teams" element={renderLazyPage(<Teams />, "Loading teams...")} />
         <Route
           path="/teams/:teamId"
           element={
             <RequireAuth>
-              <TeamRoster />
+              {renderLazyPage(<TeamRoster />, "Loading squad...")}
             </RequireAuth>
           }
         />
-        <Route path="/login" element={<Login />} />
+        <Route path="/login" element={renderLazyPage(<Login />, "Loading login...")} />
 
         {/* Fixture-level match centre */}
-        <Route path="/match-centre/:fixtureId" element={<MatchCentre />} />
+        <Route path="/match-centre/:fixtureId" element={renderLazyPage(<MatchCentre />, "Loading match centre...")} />
 
         <Route
           path="/score"
           element={
             <RequireAuth>
-              <ScoreHome />
+              {renderLazyPage(<ScoreHome />, "Loading scorer home...")}
             </RequireAuth>
           }
         />
@@ -132,12 +161,12 @@ export default function App() {
           path="/score/:fixtureId"
           element={
             <RequireAuth>
-              <ScoreView />
+              {renderLazyPage(<ScoreView />, "Loading scorer...")}
             </RequireAuth>
           }
         />
 
-        <Route path="/match/:fixtureId" element={<SpectatorView />} />
+        <Route path="/match/:fixtureId" element={renderLazyPage(<SpectatorView />, "Loading live match...")} />
       </Routes>
     </div>
   );

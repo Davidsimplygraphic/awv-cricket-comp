@@ -86,6 +86,22 @@ export function sortPendingEvents(queue) {
     });
 }
 
+export function canAutoFlushPendingQueue({
+  matchId = null,
+  isOnline = true,
+  pendingCount = 0,
+  lockFeatureAvailable = true,
+  scoringLocked = false,
+  isFlushing = false,
+} = {}) {
+  if (!matchId) return false;
+  if (!isOnline) return false;
+  if (!pendingCount) return false;
+  if (isFlushing) return false;
+  if (lockFeatureAvailable && scoringLocked) return false;
+  return true;
+}
+
 export function isAuthoritativeScoringRejection(error) {
   const message = String(error?.message || error || "");
   return /balls_unique_position|Cannot add a ball to a completed innings|Cannot apply an administrative state change to a completed innings|Only the latest ball in an innings can be edited safely|Target ball not found for edit event|Use administrative_state_changed for retired hurt events|Only run out deliveries can|Only run out and stumped deliveries can|Stumped deliveries cannot include|Administrative state changes require a current canonical scorer state|Unsupported administrative_state_changed action_type/i.test(

@@ -49,8 +49,25 @@ export function resolveDisplayWicketCap({
   return resolveWicketCap(preferred, rosterWicketCap ?? fallback);
 }
 
+export function isChaseCompleteForScoring({
+  inningsNo = 1,
+  innings1Ready = false,
+  innings1Runs = 0,
+  totalRuns = 0,
+  reopenedForContinuation = false,
+} = {}) {
+  if (inningsNo !== 2) return false;
+  if (!innings1Ready) return false;
+  if (reopenedForContinuation) return false;
+  return toInt(totalRuns, 0) >= (toInt(innings1Runs, 0) + 1);
+}
+
 export function isAdministrativeBall(ball) {
   return ball?.extra_type === ADMIN_EXTRA_TYPE_RETIRED_HURT || ball?.dismissal_kind === "retired hurt";
+}
+
+export function isRetiredHurtBall(ball) {
+  return isAdministrativeBall(ball) && String(ball?.dismissal_kind || "").trim().toLowerCase() === "retired hurt";
 }
 
 export function isBattingSideWicket(ball) {
@@ -61,6 +78,10 @@ export function isBattingSideWicket(ball) {
   if (dismissalKind === "retired hurt") return false;
 
   return true;
+}
+
+export function isPartnershipBreak(ball) {
+  return isBattingSideWicket(ball) || isRetiredHurtBall(ball);
 }
 
 export function isBowlerCreditedDismissalKind(kind) {
@@ -698,6 +719,184 @@ export function countLegalBallsBowledBy(balls, bowlerId) {
     .length;
 }
 
+export function countDismissalsForPlayer(balls, playerId) {
+  if (!playerId) return 0;
+
+  return sortBallsByPosition(balls).reduce((total, ball) => {
+    if (!isBattingSideWicket(ball)) return total;
+    return total + (ball?.dismissed_player_id === playerId ? 1 : 0);
+  }, 0);
+}
+
+export function countBattingExitsForPlayer(balls, playerId) {
+  if (!playerId) return 0;
+
+  return sortBallsByPosition(balls).reduce((total, ball) => {
+    if (!ball?.wicket || ball?.dismissed_player_id !== playerId) return total;
+    return total + 1;
+  }, 0);
+}
+
+export function selectBatterStatus({
+  balls = [],
+  playerId = "",
+  turn = 1,
+  isAtCrease = false,
+} = {}) {
+  if (!playerId) return { label: "", tone: "idle" };
+  if (isAtCrease) return { label: "Not out", tone: "not_out" };
+
+  const exitEvents = sortBallsByPosition(balls).filter((ball) => (
+    ball?.wicket && ball?.dismissed_player_id === playerId
+  ));
+  const exitEvent = exitEvents[Math.max(0, toInt(turn, 1) - 1)] || null;
+
+  if (!exitEvent) return { label: "Not out", tone: "not_out" };
+  if (isRetiredHurtBall(exitEvent)) return { label: "Retired Hurt", tone: "retired_hurt" };
+  return { label: "Out", tone: "out" };
+}
+
+export function materializeAdministrativeStateBalls({
+  balls = [],
+  sessionEvents = [],
+} = {}) {
+  const competitiveBalls = sortBallsByPosition(balls);
+  const adminEvents = [...(sessionEvents || [])]
+    .filter((event, index, list) => {
+      if (!event?.event_id) return false;
+      return list.findIndex((candidate) => candidate?.event_id === event.event_id) === index;
+    })
+    .filter((event) => event?.event_type === ADMINISTRATIVE_STATE_CHANGED_EVENT_TYPE)
+    .sort((a, b) => {
+      const appliedDiff = new Date(a?.applied_at || a?.created_at || 0).getTime()
+        - new Date(b?.applied_at || b?.created_at || 0).getTime();
+      if (appliedDiff !== 0) return appliedDiff;
+      return String(a?.event_id || "").localeCompare(String(b?.event_id || ""));
+    });
+
+  if (!adminEvents.length) return competitiveBalls;
+
+  let ballCursor = 0;
+  let anchorBall = competitiveBalls[0] || null;
+  const adminBalls = [];
+
+  for (const event of adminEvents) {
+    const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+    const result = event?.result && typeof event.result === "object" ? event.result : {};
+    const actionType = String(
+      payload?.action_type
+      || result?.administrative_state?.action_type
+      || ""
+    ).trim().toLowerCase();
+
+    if (actionType !== "retired_hurt") continue;
+
+    const eventTime = new Date(event?.applied_at || event?.created_at || 0).getTime();
+    while (ballCursor < competitiveBalls.length) {
+      const candidate = competitiveBalls[ballCursor];
+      const candidateTime = new Date(candidate?.created_at || 0).getTime();
+      if (candidateTime > eventTime) break;
+      anchorBall = candidate;
+      ballCursor += 1;
+    }
+
+    if (!anchorBall) continue;
+
+    const postState = result?.post_state || payload?.post_state || {};
+    adminBalls.push({
+      id: null,
+      source_event_id: event.event_id,
+      local_temp_id: event.event_id,
+      created_at: event?.applied_at || event?.created_at || new Date().toISOString(),
+      over_no: anchorBall.over_no,
+      delivery_in_over: anchorBall.delivery_in_over,
+      striker_id: postState?.striker_id || null,
+      non_striker_id: postState?.non_striker_id || null,
+      bowler_id: postState?.bowler_id || anchorBall.bowler_id || null,
+      batting_turn: null,
+      wicket: true,
+      dismissal_kind: "retired hurt",
+      dismissed_player_id: payload?.dismissed_player_id
+        || result?.administrative_state?.dismissed_player_id
+        || null,
+      extra_type: ADMIN_EXTRA_TYPE_RETIRED_HURT,
+      extra_runs: 0,
+      runs_off_bat: 0,
+      legal_ball: false,
+    });
+  }
+
+  return sortBallsByPosition([...competitiveBalls, ...adminBalls]);
+}
+
+export function selectPartnerships(balls = []) {
+  const sorted = sortBallsByPosition(balls);
+  const partnerships = [];
+  let startBall = null;
+  let lastCompetitiveBall = null;
+  let pair = null;
+  let standBalls = [];
+
+  const overText = (ball) => {
+    const over = toInt(ball?.over_no, 0) + 1;
+    const delivery = toInt(ball?.delivery_in_over, 0);
+    return `${over}.${delivery}`;
+  };
+
+  const flushStand = ({ endBall, endedByWicket = false, endedByRetiredHurt = false, current = false } = {}) => {
+    if (!startBall || !standBalls.length || !endBall) return;
+
+    partnerships.push({
+      runs: sumRuns(standBalls),
+      balls: legalBallsCount(standBalls),
+      startOver: overText(startBall),
+      endOver: overText(endBall),
+      endedByWicket,
+      endedByRetiredHurt,
+      current,
+      ...pair,
+    });
+  };
+
+  for (const ball of sorted) {
+    if (!isAdministrativeBall(ball)) {
+      if (!startBall) startBall = ball;
+      if (!pair) {
+        pair = {
+          strikerId: ball.striker_id || null,
+          nonStrikerId: ball.non_striker_id || null,
+        };
+      }
+
+      standBalls.push(ball);
+      lastCompetitiveBall = ball;
+    }
+
+    if (!startBall || !isPartnershipBreak(ball)) continue;
+
+    flushStand({
+      endBall: ball,
+      endedByWicket: isBattingSideWicket(ball),
+      endedByRetiredHurt: isRetiredHurtBall(ball),
+      current: false,
+    });
+
+    startBall = null;
+    lastCompetitiveBall = null;
+    pair = null;
+    standBalls = [];
+  }
+
+  flushStand({ endBall: lastCompetitiveBall, current: true });
+  return partnerships;
+}
+
+export function selectCurrentPartnership(balls = []) {
+  const partnerships = selectPartnerships(balls);
+  const current = partnerships.at(-1);
+  return current?.current ? current : null;
+}
+
 export function buildInningsTotals(inningsRow, balls) {
   const legal = legalBallsCount(balls);
   return {
@@ -709,6 +908,79 @@ export function buildInningsTotals(inningsRow, balls) {
     overs: oversTextFromLegal(legal),
     balls: balls || [],
   };
+}
+
+export function formatBallOutcomeToken(ball) {
+  if (!ball || isAdministrativeBall(ball)) return "";
+  if (ball.wicket) return "W";
+
+  const totalRuns = toInt(ball?.runs_off_bat, 0) + toInt(ball?.extra_runs, 0);
+  const extraType = String(ball?.extra_type || "").toLowerCase();
+
+  if (extraType === "wide") return totalRuns > 2 ? `Wd${totalRuns}` : "Wd";
+  if (extraType === "noball") {
+    const batRuns = toInt(ball?.runs_off_bat, 0);
+    return batRuns > 0 ? `Nb+${batRuns}` : "Nb";
+  }
+  if (extraType === "bye") return `B${Math.max(1, toInt(ball?.extra_runs, 0))}`;
+  if (extraType === "legbye") return `Lb${Math.max(1, toInt(ball?.extra_runs, 0))}`;
+
+  return String(totalRuns);
+}
+
+export function describeBallOutcomeBadge(ball) {
+  if (!ball || isAdministrativeBall(ball)) return null;
+
+  const totalRuns = toInt(ball?.runs_off_bat, 0) + toInt(ball?.extra_runs, 0);
+  const extraType = String(ball?.extra_type || "").toLowerCase();
+
+  if (ball.wicket) return { label: "WICKET", tone: "wicket" };
+  if (extraType === "wide") return { label: "WIDE", tone: "extra" };
+  if (extraType === "noball") return { label: "NO BALL", tone: "extra" };
+  if (extraType === "bye") return { label: "BYE", tone: "extra" };
+  if (extraType === "legbye") return { label: "LEG BYE", tone: "extra" };
+  if (toInt(ball?.runs_off_bat, 0) === 6) return { label: "SIX", tone: "boundary" };
+  if (toInt(ball?.runs_off_bat, 0) === 4) return { label: "FOUR", tone: "boundary" };
+  if (totalRuns === 0) return { label: "DOT", tone: "dot" };
+  return { label: `${totalRuns} RUN${totalRuns === 1 ? "" : "S"}`, tone: "runs" };
+}
+
+export function selectOverSummaries(balls) {
+  const sorted = sortBallsByPosition((balls || []).filter((ball) => !isAdministrativeBall(ball)));
+  const overMap = new Map();
+  const overs = [];
+
+  for (const ball of sorted) {
+    const overNo = toInt(ball?.over_no, 0);
+    if (!overMap.has(overNo)) {
+      const summary = {
+        overNo,
+        balls: [],
+      };
+      overMap.set(overNo, summary);
+      overs.push(summary);
+    }
+    overMap.get(overNo).balls.push(ball);
+  }
+
+  return overs.map((summary) => ({
+    ...summary,
+    runs: sumRuns(summary.balls),
+    wickets: sumWkts(summary.balls),
+    legalBalls: legalBallsCount(summary.balls),
+  }));
+}
+
+export function selectCurrentOverSummary(balls) {
+  const overs = selectOverSummaries(balls);
+  return overs.length ? overs[overs.length - 1] : null;
+}
+
+export function formatOverSummaryText(summary) {
+  if (!summary) return "";
+  return summary.wickets
+    ? `${summary.runs} runs • ${summary.wickets} wicket${summary.wickets === 1 ? "" : "s"}`
+    : `${summary.runs} runs`;
 }
 
 export function selectInningsSummary(balls) {
@@ -734,6 +1006,43 @@ export function selectWormSeries(balls) {
   }
 
   return points;
+}
+
+export function selectWormWicketPoints(balls) {
+  const sorted = sortBallsByPosition(balls);
+  let cumulativeRuns = 0;
+  let cumulativeLegalBalls = 0;
+  const points = [];
+
+  for (const ball of sorted) {
+    cumulativeRuns += sumRuns([ball]);
+    cumulativeLegalBalls += legalBallsCount([ball]);
+
+    if (!isBattingSideWicket(ball)) continue;
+
+    points.push({
+      key: ball?.id || ball?.source_event_id || ball?.local_temp_id || `${toInt(ball?.over_no, 0)}-${toInt(ball?.delivery_in_over, 0)}`,
+      x: cumulativeLegalBalls,
+      y: cumulativeRuns,
+      overNo: toInt(ball?.over_no, 0),
+      deliveryInOver: toInt(ball?.delivery_in_over, 0),
+      dismissedPlayerId: ball?.dismissed_player_id || null,
+      dismissalKind: ball?.dismissal_kind || null,
+    });
+  }
+
+  return points;
+}
+
+export function selectOverBoundaryTicks({ balls = [], maxOvers = null } = {}) {
+  const observedOvers = sortBallsByPosition(balls).reduce((highest, ball) => {
+    if (isAdministrativeBall(ball)) return highest;
+    return Math.max(highest, toInt(ball?.over_no, 0) + 1);
+  }, 0);
+  const configuredOvers = Math.max(0, toInt(maxOvers, 0));
+  const resolvedOvers = Math.max(observedOvers, configuredOvers);
+
+  return Array.from({ length: resolvedOvers }, (_, index) => index + 1);
 }
 
 export function deriveMatchDisplayStatus({
@@ -784,4 +1093,140 @@ export function buildCompletedResultText({ matchStatus, innings1Team, innings2Te
   const margin = Math.abs(innings2.runs - innings1.runs);
   const name = innings1Team?.name || innings1Team?.short_name || "Winning team";
   return `${name} won by ${margin} run${margin === 1 ? "" : "s"}`;
+}
+
+function selectTopBattingAppearance(balls, playersById = {}) {
+  const byAppearance = new Map();
+
+  for (const ball of sortBallsByPosition((balls || []).filter((entry) => !isAdministrativeBall(entry)))) {
+    const batterId = ball?.striker_id || null;
+    if (!batterId) continue;
+
+    const battingTurn = toInt(ball?.batting_turn, 1) || 1;
+    const key = `${batterId}:${battingTurn}`;
+    if (!byAppearance.has(key)) {
+      byAppearance.set(key, {
+        playerId: batterId,
+        turn: battingTurn,
+        runs: 0,
+        balls: 0,
+        name: playersById?.[batterId]?.name || "Batter",
+      });
+    }
+
+    const row = byAppearance.get(key);
+    row.runs += toInt(ball?.runs_off_bat, 0);
+    if (didBatterFaceBall(ball)) row.balls += 1;
+  }
+
+  return [...byAppearance.values()]
+    .sort((a, b) => (
+      b.runs - a.runs
+      || a.balls - b.balls
+      || String(a.name).localeCompare(String(b.name))
+    ))[0] || null;
+}
+
+function selectBestBowlerSummary(balls, playersById = {}) {
+  const byBowler = new Map();
+
+  for (const ball of sortBallsByPosition((balls || []).filter((entry) => !isAdministrativeBall(entry)))) {
+    const bowlerId = ball?.bowler_id || null;
+    if (!bowlerId) continue;
+
+    if (!byBowler.has(bowlerId)) {
+      byBowler.set(bowlerId, {
+        playerId: bowlerId,
+        name: playersById?.[bowlerId]?.name || "Bowler",
+        wickets: 0,
+        runs: 0,
+        legalBalls: 0,
+      });
+    }
+
+    const row = byBowler.get(bowlerId);
+    row.runs += runsConcededByBowler(ball);
+    if (ball?.legal_ball !== false) row.legalBalls += 1;
+    if (isBowlerCreditedWicket(ball)) row.wickets += 1;
+  }
+
+  return [...byBowler.values()]
+    .sort((a, b) => (
+      b.wickets - a.wickets
+      || a.runs - b.runs
+      || a.legalBalls - b.legalBalls
+      || String(a.name).localeCompare(String(b.name))
+    ))[0] || null;
+}
+
+function selectTurningPointSummary({ innings1, innings2, innings2Balls }) {
+  if (!innings1 || !innings2) return null;
+  const overs = selectOverSummaries(innings2Balls);
+  if (!overs.length) return null;
+
+  const chaseWon = toInt(innings2.runs, 0) > toInt(innings1.runs, 0);
+  const ranked = [...overs].sort((a, b) => {
+    if (chaseWon) {
+      return b.runs - a.runs || b.wickets - a.wickets || b.overNo - a.overNo;
+    }
+    return b.wickets - a.wickets || a.runs - b.runs || b.overNo - a.overNo;
+  });
+
+  const selected = ranked[0];
+  if (!selected) return null;
+
+  let text;
+  if (selected.wickets > 0) {
+    text = `Turning point: Over ${selected.overNo + 1} went for ${selected.runs} run${selected.runs === 1 ? "" : "s"} and ${selected.wickets} wicket${selected.wickets === 1 ? "" : "s"}.`;
+  } else if (chaseWon) {
+    text = `Turning point: Over ${selected.overNo + 1} yielded ${selected.runs} run${selected.runs === 1 ? "" : "s"}.`;
+  } else {
+    text = `Turning point: Over ${selected.overNo + 1} went for ${selected.runs} run${selected.runs === 1 ? "" : "s"}.`;
+  }
+
+  return {
+    overNo: selected.overNo,
+    runs: selected.runs,
+    wickets: selected.wickets,
+    text,
+  };
+}
+
+export function buildAutomaticMatchSummary({
+  matchStatus,
+  innings1Team,
+  innings2Team,
+  innings1,
+  innings2,
+  innings1Balls = [],
+  innings2Balls = [],
+  playersById = {},
+  wicketCap,
+} = {}) {
+  const headline = buildCompletedResultText({
+    matchStatus,
+    innings1Team,
+    innings2Team,
+    innings1,
+    innings2,
+    wicketCap,
+  });
+
+  if (!headline) return null;
+
+  const allBalls = [...(innings1Balls || []), ...(innings2Balls || [])];
+  const topBatter = selectTopBattingAppearance(allBalls, playersById);
+  const bestBowler = selectBestBowlerSummary(allBalls, playersById);
+  const turningPoint = selectTurningPointSummary({ innings1, innings2, innings2Balls });
+
+  return {
+    headline: `${headline}.`,
+    topBatter: topBatter
+      ? `Top scorer: ${topBatter.name} ${topBatter.runs} (${topBatter.balls})`
+      : "",
+    bestBowler: bestBowler
+      ? `Best bowler: ${bestBowler.name} ${bestBowler.wickets}/${bestBowler.runs}`
+      : "",
+    turningPoint: turningPoint?.text || "",
+  };
 }
