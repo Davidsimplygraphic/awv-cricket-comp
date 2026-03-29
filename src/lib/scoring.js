@@ -570,7 +570,10 @@ export function reconcileLatestBallEditSelectionState({
     ? ""
     : (editedBall.bowler_id || originalBall.bowler_id || preEditPostState?.bowler_id || "");
   const needsNextBowler = !inningsCompleted && overFinishedAfter;
-  const totalRunsOnBall = toInt(editedBall.runs_off_bat, 0) + toInt(editedBall.extra_runs, 0);
+  // No ball penalty run (extra_runs=1) doesn't represent physical running, exclude from rotation.
+  const totalRunsOnBall = editedBall.extra_type === "noball"
+    ? toInt(editedBall.runs_off_bat, 0)
+    : toInt(editedBall.runs_off_bat, 0) + toInt(editedBall.extra_runs, 0);
 
   const resolved = {
     strikerId: "",

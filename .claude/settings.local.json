@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Users/Admin/Documents/GitHub/awv-cricket-comp/test /c/Users/Admin/Documents/GitHub/awv-cricket-comp/tests -type f -name *.js -o -name *.jsx -o -name *.ts -o -name *.tsx)",
+      "Bash(npm test:*)",
+      "Bash(python -c \"import sys,json; lines=[l for l in sys.stdin if l.strip\\(\\)]; last=lines[-1] if lines else ''''{}''''; d=json.loads\\(last\\); print\\(d.get\\(''''message'''',{}\\).get\\(''''stop_reason'''',''''running''''\\)\\)\")",
+      "Bash(grep -n \"service.*worker\\\\|sw\\\\.js\\\\|navigator\\\\.serviceWorker\" /c/Users/Admin/Documents/GitHub/awv-cricket-comp/src/**/*.jsx)"
+    ]
+  }
+}

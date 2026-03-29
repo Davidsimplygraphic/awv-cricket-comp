@@ -24,7 +24,12 @@ export function createEventId(prefix = "event") {
 
 export function isNetworkLikeError(error) {
   const message = String(error?.message || error || "");
-  return /network|fetch|offline|failed to fetch|load failed|timeout/i.test(message);
+  if (/network|fetch|offline|failed to fetch|load failed|timeout/i.test(message)) return true;
+  // Supabase HTTP-level failures (503, 504, 502) come back with a numeric status code on the error object.
+  const status = Number(error?.status ?? error?.code ?? 0);
+  if (status === 503 || status === 504 || status === 502) return true;
+  if (/service.?unavailable|bad.?gateway|gateway.?timeout/i.test(message)) return true;
+  return false;
 }
 
 export function isMissingRpcError(error) {

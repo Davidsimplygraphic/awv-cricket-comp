@@ -80,8 +80,10 @@ function batterStats(balls, batterId, turn = 1) {
   const facedAsStriker = (balls || []).filter((b) => b.striker_id === batterId && toInt(b.batting_turn, 1) === t);
   const ballsFaced = facedAsStriker.filter((b) => didBatterFaceBall(b)).length;
   const runs = facedAsStriker.reduce((acc, b) => acc + toInt(b.runs_off_bat, 0), 0);
+  const fours = facedAsStriker.filter((b) => toInt(b.runs_off_bat, 0) === 4).length;
+  const sixes = facedAsStriker.filter((b) => toInt(b.runs_off_bat, 0) === 6).length;
   const sr = ballsFaced > 0 ? (runs / ballsFaced) * 100 : 0;
-  return { r: runs, b: ballsFaced, sr };
+  return { r: runs, b: ballsFaced, sr, fours, sixes };
 }
 
 function bowlerStats(balls, bowlerId) {
@@ -873,26 +875,55 @@ export default function SpectatorView() {
             </div>
           )}
 
-          <div style={{ display: "grid", gap: 8 }}>
-            <div style={{ fontSize: isPhoneViewport ? 12 : 13, fontWeight: 900, color: subText }}>
-              {String(derivedStatus || "live").toUpperCase()}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+            <div style={{ display: "grid", gap: 8, flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: isPhoneViewport ? 12 : 13, fontWeight: 900, color: subText }}>
+                {String(derivedStatus || "live").toUpperCase()}
+              </div>
+              <div style={{ fontSize: "clamp(3.2rem, 9vw, 5rem)", lineHeight: 0.96, fontWeight: 1100, letterSpacing: -1.5 }}>
+                {liveTotals.runs} <span style={{ opacity: 0.82 }}>/</span> {liveTotals.wkts}
+              </div>
+              <div style={{ fontSize: "clamp(1rem, 2.8vw, 1.45rem)", fontWeight: 900 }}>{liveOversText} overs</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", fontSize: isPhoneViewport ? 12 : 14 }}>
+                CRR {formatRate(crr, 2)} • Wicket cap {wicketCap}
+              </div>
             </div>
-            <div style={{ fontSize: "clamp(3.6rem, 10vw, 5rem)", lineHeight: 0.96, fontWeight: 1100, letterSpacing: -1.5 }}>
-              {liveTotals.runs} <span style={{ opacity: 0.82 }}>/</span> {liveTotals.wkts}
-            </div>
-            <div style={{ fontSize: "clamp(1.1rem, 3vw, 1.45rem)", fontWeight: 900 }}>{liveOversText} overs</div>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              CRR {formatRate(crr, 2)} • Wicket cap {wicketCap}
-            </div>
-          </div>
 
-          {liveInnings === 2 ? (
-            <div style={{ marginTop: 14, display: "grid", gap: 4, fontSize: 15 }}>
-              <div><span style={{ color: subText }}>Target</span> <strong>{target}</strong></div>
-              <div><span style={{ color: subText }}>Need</span> <strong>{runsNeeded} from {ballsRemaining}</strong></div>
-              <div><span style={{ color: subText }}>RRR</span> <strong>{formatRate(rrr, 2)}</strong></div>
-            </div>
-          ) : null}
+            {liveInnings === 2 ? (
+              <div
+                style={{
+                  flexShrink: 0,
+                  display: "grid",
+                  gap: 0,
+                  borderRadius: 16,
+                  overflow: "hidden",
+                  background: "rgba(255,255,255,0.055)",
+                  border: "1px solid rgba(255,255,255,0.11)",
+                  minWidth: isPhoneViewport ? 76 : 90,
+                  textAlign: "center",
+                }}
+              >
+                {[
+                  { label: "Target", value: target, valueStyle: { fontSize: isPhoneViewport ? 20 : 24, fontWeight: 1100, lineHeight: 1.1 } },
+                  { label: "Need", value: <>{runsNeeded} <span style={{ fontSize: isPhoneViewport ? 10 : 11, fontWeight: 700, opacity: 0.65 }}>/ {ballsRemaining}</span></>, valueStyle: { fontSize: isPhoneViewport ? 15 : 17, fontWeight: 1000, lineHeight: 1.1 } },
+                  { label: "RRR", value: formatRate(rrr, 2), valueStyle: { fontSize: isPhoneViewport ? 15 : 17, fontWeight: 1000, lineHeight: 1.1 } },
+                ].map(({ label, value, valueStyle }, i) => (
+                  <div
+                    key={label}
+                    style={{
+                      padding: isPhoneViewport ? "8px 10px" : "10px 14px",
+                      borderTop: i > 0 ? "1px solid rgba(255,255,255,0.08)" : "none",
+                    }}
+                  >
+                    <div style={{ fontSize: 9, fontWeight: 900, color: subText, textTransform: "uppercase", letterSpacing: "0.10em", marginBottom: 3 }}>
+                      {label}
+                    </div>
+                    <div style={valueStyle}>{value}</div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
 
           <div style={{ marginTop: 14 }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12, color: subText, marginBottom: 6, flexWrap: "wrap" }}>
@@ -967,7 +998,7 @@ export default function SpectatorView() {
           ))}
         </div>
 
-        {(activeTab === "commentary" || activeTab === "stats") ? (
+        {(activeTab === "commentary" || activeTab === "stats" || activeTab === "scorecard") ? (
           <div
             style={{
               display: isPhoneViewport ? "grid" : "flex",
@@ -1059,8 +1090,8 @@ export default function SpectatorView() {
                           </div>
                         </div>
                         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                          <div style={infoPillStyle}>Runs {batter.stats ? batter.stats.r : 0}</div>
-                          <div style={infoPillStyle}>Balls {batter.stats ? batter.stats.b : 0}</div>
+                          <div style={infoPillStyle}>4s {batter.stats ? batter.stats.fours : 0}</div>
+                          <div style={infoPillStyle}>6s {batter.stats ? batter.stats.sixes : 0}</div>
                         </div>
                       </div>
                     ))}
@@ -1156,33 +1187,27 @@ export default function SpectatorView() {
 
           {activeTab === "scorecard" ? (
             <Suspense
-              fallback={(
-                <div style={{ display: "grid", gap: 12 }}>
-                  <TabSectionFallback title="Loading scorecard..." detail="Preparing innings cards." dark compact={isPhoneViewport} />
-                  {inn2Row ? <TabSectionFallback title="Loading scorecard..." detail="Preparing innings cards." dark compact={isPhoneViewport} /> : null}
-                </div>
-              )}
+              fallback={<TabSectionFallback title="Loading scorecard..." detail={`Preparing innings ${activeInnings} scorecard.`} dark compact={isPhoneViewport} />}
             >
-              <div style={{ display: "grid", gap: 12 }}>
-                {(liveInnings === 2
-                  ? [
-                      { inningsNo: 2, team: innings2Team, balls: inn2Balls },
-                      { inningsNo: 1, team: innings1Team, balls: inn1Balls },
-                    ]
-                  : [
-                      { inningsNo: 1, team: innings1Team, balls: inn1Balls },
-                      { inningsNo: 2, team: innings2Team, balls: inn2Balls },
-                    ]
-                ).filter((entry) => entry.inningsNo === 1 || inn2Row).map((entry) => (
+              {activeInnings === 1 ? (
+                <ScorecardTables
+                  key="scorecard-1"
+                  theme="dark"
+                  title={`Innings 1${innings1Team?.name ? `: ${innings1Team.name}` : ""}`}
+                  balls={inn1Balls}
+                  playersById={playersById}
+                />
+              ) : (
+                inn2Row ? (
                   <ScorecardTables
-                    key={`scorecard-${entry.inningsNo}`}
+                    key="scorecard-2"
                     theme="dark"
-                    title={`Innings ${entry.inningsNo}${entry.team?.name ? `: ${entry.team.name}` : ""}`}
-                    balls={entry.balls}
+                    title={`Innings 2${innings2Team?.name ? `: ${innings2Team.name}` : ""}`}
+                    balls={inn2Balls}
                     playersById={playersById}
                   />
-                ))}
-              </div>
+                ) : null
+              )}
             </Suspense>
           ) : null}
 

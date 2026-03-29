@@ -265,6 +265,79 @@ test("run out post-state follows completed runs before replacing the dismissed b
   assert.equal(postState.non_striker_id, "bat-3");
 });
 
+test("no ball penalty run does not rotate the batting pair when zero bat runs are scored", () => {
+  // A no ball with 0 bat runs: extra_runs=1 (penalty) should not cause a rotation.
+  const originalBall = {
+    id: "ball-nb1",
+    over_no: 0,
+    delivery_in_over: 1,
+    legal_ball: false,
+    runs_off_bat: 0,
+    extra_type: "noball",
+    extra_runs: 1,
+    wicket: false,
+    striker_id: "bat-1",
+    non_striker_id: "bat-2",
+    bowler_id: "bowl-1",
+    batting_turn: 1,
+  };
+
+  const resolution = reconcileLatestBallEditSelectionState({
+    originalBall,
+    editedBall: originalBall,
+    ballsAfterEdit: [originalBall],
+    preEditPostState: {
+      striker_id: "bat-1",
+      non_striker_id: "bat-2",
+      bowler_id: "bowl-1",
+      needs_next_bowler: false,
+    },
+    inningsCompleted: false,
+  });
+
+  assert.equal(resolution.battingAmbiguous, false);
+  // Striker should NOT change — penalty run is not a run between the wickets.
+  assert.equal(resolution.strikerId, "bat-1");
+  assert.equal(resolution.nonStrikerId, "bat-2");
+});
+
+test("no ball with one bat run rotates the batting pair correctly", () => {
+  // A no ball with 1 bat run: runs_off_bat=1 (odd) should cause rotation.
+  // total stored = runs_off_bat=1 + extra_runs=1 = 2, but rotation must use runs_off_bat only.
+  const originalBall = {
+    id: "ball-nb2",
+    over_no: 0,
+    delivery_in_over: 1,
+    legal_ball: false,
+    runs_off_bat: 1,
+    extra_type: "noball",
+    extra_runs: 1,
+    wicket: false,
+    striker_id: "bat-1",
+    non_striker_id: "bat-2",
+    bowler_id: "bowl-1",
+    batting_turn: 1,
+  };
+
+  const resolution = reconcileLatestBallEditSelectionState({
+    originalBall,
+    editedBall: originalBall,
+    ballsAfterEdit: [originalBall],
+    preEditPostState: {
+      striker_id: "bat-2",
+      non_striker_id: "bat-1",
+      bowler_id: "bowl-1",
+      needs_next_bowler: false,
+    },
+    inningsCompleted: false,
+  });
+
+  assert.equal(resolution.battingAmbiguous, false);
+  // Batsmen ran 1 between the wickets — they should have swapped.
+  assert.equal(resolution.strikerId, "bat-2");
+  assert.equal(resolution.nonStrikerId, "bat-1");
+});
+
 test("latest-ball edits preserve actor state when the updated outcome is fully deterministic", () => {
   const originalBall = {
     id: "ball-1",

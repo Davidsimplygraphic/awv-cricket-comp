@@ -2380,11 +2380,15 @@ const battingScorecardRows = useMemo(() => {
         event: previewEvent,
       }).balls;
 
-      const totalRunsOnBall = (payload.runs_off_bat || 0) + (payload.extra_runs || 0);
+      // No ball penalty run (extra_runs=1) is awarded automatically and doesn't
+      // represent physical running between the wickets, so exclude it from rotation.
+      const runsForRotation = payload.extra_type === "noball"
+        ? (payload.runs_off_bat || 0)
+        : (payload.runs_off_bat || 0) + (payload.extra_runs || 0);
       let nextStrikerId = currentStrikerId;
       let nextNonStrikerId = currentNonStrikerId;
 
-      if (!payload.wicket && totalRunsOnBall % 2 === 1) {
+      if (!payload.wicket && runsForRotation % 2 === 1) {
         [nextStrikerId, nextNonStrikerId] = [nextNonStrikerId, nextStrikerId];
       }
 
@@ -2671,7 +2675,9 @@ const battingScorecardRows = useMemo(() => {
         incomingBatterId,
         dismissedPlayerId,
         dismissalKind: wicketInput.dismissalKind,
-        totalRunsOnBall: normalizedDelivery.runsOffBat + normalizedDelivery.extraRuns,
+        totalRunsOnBall: normalizedDelivery.extraType === "noball"
+          ? normalizedDelivery.runsOffBat
+          : normalizedDelivery.runsOffBat + normalizedDelivery.extraRuns,
         crossed: wicketCrossed,
         overFinishedAfter,
         inningsComplete: projectedInningsComplete,
@@ -3420,6 +3426,37 @@ You can then start scoring again from ball 1.`
                 );
               })}
             </div>
+
+            {strikerId && nonStrikerId ? (
+              <div style={{ padding: "0 12px 12px" }}>
+                <button
+                  onClick={() => {
+                    const prevStrikerId = strikerId;
+                    const prevStrikerTurn = strikerTurn;
+                    setStrikerId(nonStrikerId);
+                    setStrikerTurn(nonStrikerTurn);
+                    setNonStrikerId(prevStrikerId);
+                    setNonStrikerTurn(prevStrikerTurn);
+                  }}
+                  disabled={saving || innings?.completed}
+                  style={{
+                    width: "100%",
+                    minHeight: 40,
+                    padding: "8px 12px",
+                    borderRadius: 12,
+                    background: "rgba(56,189,248,0.10)",
+                    border: "1px solid rgba(56,189,248,0.28)",
+                    color: "#7dd3fc",
+                    fontWeight: 900,
+                    fontSize: 13,
+                    cursor: saving || innings?.completed ? "not-allowed" : "pointer",
+                    letterSpacing: "0.02em",
+                  }}
+                >
+                  ⇄ Swap strike
+                </button>
+              </div>
+            ) : null}
           </details>
 
           <details
@@ -3816,7 +3853,19 @@ You can then start scoring again from ball 1.`
             <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
               <div>
                 <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Dismissal</div>
-                <select value={dismissalKind} onChange={(e) => setDismissalKind(e.target.value)} style={modalSelectStyle}>
+                <select
+                  value={dismissalKind}
+                  onChange={(e) => {
+                    const nextKind = e.target.value;
+                    setDismissalKind(nextKind);
+                    // Stumped only supports no extras or a base wide — clear incompatible extra selections.
+                    if (nextKind === "stumped" && wicketExtraType !== null && wicketExtraType !== "wide") {
+                      setWicketExtraType(null);
+                      setWicketExtraRuns(0);
+                    }
+                  }}
+                  style={modalSelectStyle}
+                >
                   <option value="bowled">Bowled</option>
                   <option value="caught">Caught</option>
                   <option value="lbw">LBW</option>
@@ -3851,12 +3900,22 @@ You can then start scoring again from ball 1.`
                 <>
                   <div>
                     <div style={{ fontSize: 12, color: "rgba(232,238,252,0.65)", marginBottom: 6 }}>Extra type</div>
-                    <select value={wicketExtraType || ""} onChange={(e) => setWicketExtraType(e.target.value || null)} style={modalSelectStyle}>
+                    <select
+                      value={wicketExtraType || ""}
+                      onChange={(e) => {
+                        const next = e.target.value || null;
+                        setWicketExtraType(next);
+                        // A stumped wide must have exactly 2 extra runs (base wide only).
+                        if (dismissalKind === "stumped" && next === "wide") setWicketExtraRuns(2);
+                        if (!next) setWicketExtraRuns(0);
+                      }}
+                      style={modalSelectStyle}
+                    >
                       <option value="">None</option>
                       <option value="wide">Wide</option>
-                      <option value="noball">No ball</option>
-                      <option value="bye">Bye</option>
-                      <option value="legbye">Leg bye</option>
+                      {dismissalKind === "run out" && <option value="noball">No ball</option>}
+                      {dismissalKind === "run out" && <option value="bye">Bye</option>}
+                      {dismissalKind === "run out" && <option value="legbye">Leg bye</option>}
                     </select>
                   </div>
 
@@ -3881,6 +3940,7 @@ You can then start scoring again from ball 1.`
                         min="0"
                         value={wicketExtraRuns}
                         onChange={(e) => setWicketExtraRuns(toInt(e.target.value, 0))}
+                        disabled={dismissalKind === "stumped" && wicketExtraType === "wide"}
                         style={modalInputStyle}
                       />
                     </div>
